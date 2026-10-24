@@ -1,6 +1,7 @@
 import operator
 from typing import Annotated, Any, TypedDict
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -30,14 +31,15 @@ class RunState(TypedDict, total=False):
 
 
 RunGraph = CompiledStateGraph[RunState, None, RunState, RunState]
+RunStateGraph = StateGraph[RunState, None, RunState, RunState]
 
 
 def _error_payload(exc: LLMError) -> dict[str, Any]:
     return RunError(code=exc.code, message=exc.message).model_dump()
 
 
-def build_graph(llm: LLMPort, limits: RunLimits | None = None) -> RunGraph:
-    """Compile the Planner <-> Architect -> Approval graph for a given LLMPort.
+def build_state_graph(llm: LLMPort, limits: RunLimits | None = None) -> RunStateGraph:
+    """Assemble (not compile) the Planner <-> Architect -> Approval graph.
 
     Flow:
       START -> planner -> architect -> approval -> END
@@ -141,4 +143,18 @@ def build_graph(llm: LLMPort, limits: RunLimits | None = None) -> RunGraph:
         {"planner": "planner", "approval": "approval", END: END},
     )
     builder.add_edge("approval", END)
-    return builder.compile(checkpointer=InMemorySaver())
+    return builder
+
+
+def build_graph(
+    llm: LLMPort,
+    limits: RunLimits | None = None,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
+) -> RunGraph:
+    """Compile the run graph against a checkpointer.
+
+    ``InMemorySaver`` by default (unit tests, demos). Production injects the
+    ``AsyncPostgresSaver`` opened in lifespan; the orchestrator only depends
+    on the ``BaseCheckpointSaver`` interface, never on a concrete backend.
+    """
+    return build_state_graph(llm, limits).compile(checkpointer=checkpointer or InMemorySaver())

@@ -2,11 +2,25 @@
 
 This is the only place that knows how ``RunState`` keys and snapshot
 metadata map to ``RunStatus``; the HTTP layer never inspects the graph.
+
+Status rules, in order. Terminal states need *positive* evidence: a recorded
+error or the approval node's ``approved`` value. "Nothing left to run" is not
+evidence of completion: between two supersteps LangGraph briefly exposes a
+snapshot whose tasks are all done but whose next checkpoint does not exist
+yet, and a concurrent reader must see that as work in progress.
+
+1. ``error`` in the state, or a task that raised -> ``failed``.
+2. ``approved`` written by the approval node -> ``approved`` / ``rejected``.
+3. A pending ``interrupt()`` -> ``waiting_approval`` (a real pause).
+4. Anything else -> ``running`` while a live lease says someone is driving
+   the graph, else ``interrupted``: the process that was driving it went away.
+   Such a run is recoverable from its last checkpoint.
 """
 
 from langgraph.types import StateSnapshot
 
-from app.contracts.execution import RunError, RunResponse, RunStatus
+from app.contracts.execution import RunError, RunResponse
+from app.contracts.lifecycle import RunLifecycleStatus
 from app.contracts.planning import ArchitectureReview, DevelopmentPlan
 
 INTERNAL_ERROR_CODE = "internal_error"
@@ -24,21 +38,38 @@ def derive_error(snapshot: StateSnapshot) -> RunError | None:
     return None
 
 
-def derive_status(snapshot: StateSnapshot) -> RunStatus:
+def has_pending_interrupt(snapshot: StateSnapshot) -> bool:
+    return bool(snapshot.interrupts) or any(task.interrupts for task in snapshot.tasks)
+
+
+def derive_status(snapshot: StateSnapshot, *, in_flight: bool = False) -> RunLifecycleStatus:
     if derive_error(snapshot) is not None:
-        return "failed"
-    if snapshot.next:
-        return "waiting_approval"
-    return "approved" if snapshot.values.get("approved") is True else "rejected"
+        return RunLifecycleStatus.FAILED
+    approved = snapshot.values.get("approved")
+    if approved is True:
+        return RunLifecycleStatus.APPROVED
+    if approved is False:
+        return RunLifecycleStatus.REJECTED
+    if has_pending_interrupt(snapshot):
+        return RunLifecycleStatus.WAITING_APPROVAL
+    return RunLifecycleStatus.RUNNING if in_flight else RunLifecycleStatus.INTERRUPTED
 
 
-def run_response_from_snapshot(run_id: str, snapshot: StateSnapshot) -> RunResponse:
+def checkpoint_id_of(snapshot: StateSnapshot) -> str | None:
+    configurable = snapshot.config.get("configurable", {}) if snapshot.config else {}
+    value = configurable.get("checkpoint_id")
+    return str(value) if value is not None else None
+
+
+def run_response_from_snapshot(
+    run_id: str, snapshot: StateSnapshot, *, in_flight: bool = False
+) -> RunResponse:
     values = snapshot.values
     plan = values.get("plan")
     architecture = values.get("architecture")
     return RunResponse(
         run_id=run_id,
-        status=derive_status(snapshot),
+        status=derive_status(snapshot, in_flight=in_flight),
         revision=values.get("revision", 0),
         llm_calls=values.get("llm_calls", 0),
         architect_approved=values.get("architect_approved"),

@@ -19,3 +19,9 @@ class NotFoundError(DomainError):
 
 class ConflictError(DomainError):
     code = "conflict"
+
+
+class UnavailableError(DomainError):
+    """The service cannot serve the request right now; the client should retry."""
+
+    code = "unavailable"
