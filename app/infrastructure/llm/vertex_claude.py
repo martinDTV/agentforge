@@ -4,7 +4,7 @@ from typing import TypeVar
 from anthropic import AnthropicVertex
 from pydantic import BaseModel, ValidationError
 
-from app.settings import settings
+from app.settings import get_settings
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -25,6 +25,7 @@ class VertexClaudeAdapter:
     """
 
     def __init__(self) -> None:
+        settings = get_settings()
         self.client = AnthropicVertex(
             project_id=settings.anthropic_vertex_project_id,
             region=settings.cloud_ml_region,

@@ -1,9 +1,10 @@
 from anthropic import AnthropicVertex
 
-from app.settings import settings
+from app.settings import get_settings
 
 
 def main() -> None:
+    settings = get_settings()
     client = AnthropicVertex(
         project_id=settings.anthropic_vertex_project_id,
         region=settings.cloud_ml_region,

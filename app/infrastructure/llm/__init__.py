@@ -1,5 +1,5 @@
 from app.contracts.planning import ArchitectureReview, DevelopmentPlan, DevelopmentTask
-from app.settings import settings
+from app.settings import get_settings
 
 from .fake import FakeLLMAdapter
 from .port import LLMPort
@@ -49,6 +49,6 @@ def _default_fake_adapter() -> FakeLLMAdapter:
 
 
 def build_llm() -> LLMPort:
-    if settings.use_fake_model:
+    if get_settings().use_fake_model:
         return _default_fake_adapter()
     return VertexClaudeAdapter()

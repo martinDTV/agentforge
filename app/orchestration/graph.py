@@ -1,4 +1,4 @@
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -13,12 +13,12 @@ from app.infrastructure.llm.port import LLMPort
 
 class RunState(TypedDict, total=False):
     task: str
-    plan: dict
-    architecture: dict
+    plan: dict[str, Any]
+    architecture: dict[str, Any]
     approved: bool
 
 
-def build_graph(llm: LLMPort) -> CompiledStateGraph:
+def build_graph(llm: LLMPort) -> CompiledStateGraph[RunState, None, RunState, RunState]:
     """Compile the Planner -> Architect -> Approval graph for a given LLMPort.
 
     Injecting the port here (instead of each agent importing a concrete
@@ -28,16 +28,16 @@ def build_graph(llm: LLMPort) -> CompiledStateGraph:
     planner = PlannerAgent(llm)
     architect = ArchitectAgent(llm)
 
-    def planner_node(state: RunState) -> dict:
+    def planner_node(state: RunState) -> dict[str, Any]:
         plan: DevelopmentPlan = planner.execute(state["task"])
         return {"plan": plan.model_dump()}
 
-    def architect_node(state: RunState) -> dict:
+    def architect_node(state: RunState) -> dict[str, Any]:
         plan = DevelopmentPlan.model_validate(state["plan"])
         review: ArchitectureReview = architect.execute(task=state["task"], plan=plan)
         return {"architecture": review.model_dump()}
 
-    def approval_node(state: RunState) -> dict:
+    def approval_node(state: RunState) -> dict[str, Any]:
         response = interrupt(
             {
                 "kind": "approve_plan",

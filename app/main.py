@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 
 from app.contracts import Approval, ArchitectureReview, CreateRun, DevelopmentPlan, RunResponse
@@ -20,7 +21,7 @@ def create_app(llm: LLMPort | None = None) -> FastAPI:
     app = FastAPI(title="Multiagent Starter", version="0.1.0")
     graph = build_graph(llm or build_llm())
 
-    def config(run_id: str) -> dict:
+    def config(run_id: str) -> RunnableConfig:
         return {"configurable": {"thread_id": run_id}}
 
     def read_run(run_id: str) -> RunResponse:
