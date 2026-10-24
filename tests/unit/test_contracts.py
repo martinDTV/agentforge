@@ -84,7 +84,7 @@ def test_run_response_rejects_unknown_status():
     from app.contracts.execution import RunResponse
 
     with pytest.raises(ValidationError):
-        RunResponse(run_id="r1", status="running")  # type: ignore[arg-type]
+        RunResponse(run_id="r1", status="paused")  # type: ignore[arg-type]
 
 
 def test_run_response_rejects_negative_counters():

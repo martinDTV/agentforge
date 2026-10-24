@@ -1,4 +1,10 @@
 from .execution import Approval, CreateRun, RunError, RunResponse, RunStatus
+from .lifecycle import (
+    TERMINAL_STATUSES,
+    RunEventKind,
+    RunLifecycleStatus,
+    can_transition,
+)
 from .planning import (
     ArchitectureDecision,
     ArchitectureReview,
@@ -7,6 +13,7 @@ from .planning import (
 )
 
 __all__ = [
+    "TERMINAL_STATUSES",
     "Approval",
     "ArchitectureDecision",
     "ArchitectureReview",
@@ -14,6 +21,9 @@ __all__ = [
     "DevelopmentPlan",
     "DevelopmentTask",
     "RunError",
+    "RunEventKind",
+    "RunLifecycleStatus",
     "RunResponse",
     "RunStatus",
+    "can_transition",
 ]

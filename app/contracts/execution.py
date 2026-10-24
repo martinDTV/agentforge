@@ -1,10 +1,10 @@
-from typing import Literal
-
 from pydantic import BaseModel, Field
 
+from .lifecycle import RunLifecycleStatus
 from .planning import ArchitectureReview, DevelopmentPlan
 
-RunStatus = Literal["waiting_approval", "approved", "rejected", "failed"]
+# One definition of the run states for API, orchestration and persistence.
+RunStatus = RunLifecycleStatus
 
 
 class CreateRun(BaseModel):

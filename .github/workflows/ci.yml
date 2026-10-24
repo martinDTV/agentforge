@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Test-only values: no real credentials exist in CI and no model is ever called
+  # (the suites inject FakeLLMAdapter and block AnthropicVertex at import time).
+  ANTHROPIC_VERTEX_PROJECT_ID: ci-not-a-real-project
+  USE_FAKE_MODEL: "true"
+  ENVIRONMENT: test
+  DATABASE_URL: postgresql+psycopg://agentforge:agentforge-ci@127.0.0.1:5432/agentforge_ci
+  TEST_DATABASE_ADMIN_URL: postgresql+psycopg://agentforge:agentforge-ci@127.0.0.1:5432/postgres
+
+jobs:
+  verify:
+    name: lint, types, unit, migrations, integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        # Same major/minor as the maintainer's local server (PostgreSQL 16.10).
+        image: postgres:16.10-alpine
+        env:
+          POSTGRES_USER: agentforge
+          POSTGRES_PASSWORD: agentforge-ci
+          POSTGRES_DB: agentforge_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentforge -d agentforge_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv (pinned) and Python 3.13
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.28"
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies from the lockfile
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Types (strict)
+        run: uv run mypy app
+
+      - name: Unit tests (no external services)
+        run: uv run pytest -q
+
+      - name: Apply migrations to the CI database (deploy step, never at startup)
+        run: |
+          uv run alembic upgrade head
+          uv run alembic check
+          uv run alembic current
+
+      - name: Create the LangGraph checkpoint tables (deploy step)
+        run: |
+          uv run python -m scripts.setup_checkpoints
+          uv run python -m scripts.setup_checkpoints --check
+
+      - name: Integration tests against PostgreSQL (isolated temporary databases)
+        run: uv run pytest tests/integration -q
+
+      - name: Round trip of the migrations on a clean database
+        env:
+          DATABASE_URL: postgresql+psycopg://agentforge:agentforge-ci@127.0.0.1:5432/agentforge_roundtrip
+        run: |
+          PGPASSWORD=agentforge-ci psql -h 127.0.0.1 -U agentforge -d postgres -c 'CREATE DATABASE agentforge_roundtrip'
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+          uv run alembic check

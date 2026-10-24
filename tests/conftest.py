@@ -1,7 +1,31 @@
+"""Fixtures shared by the unit and the integration suites.
+
+The unit suite (``tests/unit``, the default ``pytest`` target) needs no
+external service. The integration suite (``tests/integration``) needs
+PostgreSQL and is run explicitly. Neither may ever reach Vertex AI: the
+autouse guard below makes constructing the real client fail loudly.
+"""
+
+import anthropic
 import pytest
 
 from app.contracts.planning import ArchitectureReview, DevelopmentPlan, DevelopmentTask
 from app.infrastructure.llm.fake import FakeLLMAdapter
+
+
+@pytest.fixture(autouse=True)
+def _block_vertex_ai(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _blocked(self: object, *args: object, **kwargs: object) -> None:
+        raise RuntimeError(
+            "Vertex AI está bloqueado durante pytest: inyecta FakeLLMAdapter o un cliente stub"
+        )
+
+    monkeypatch.setattr(anthropic.AnthropicVertex, "__init__", _blocked)
+
+
+@pytest.fixture(scope="session")
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 @pytest.fixture

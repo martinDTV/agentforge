@@ -20,8 +20,9 @@ El proyecto avanza fase por fase, con aprobación explícita antes de iniciar ca
 
 ## Pruebas
 
-- `pytest` solo escanea `tests/` (`testpaths` en `pyproject.toml`). Los scripts de demostración viven en `scripts/`, protegidos con `if __name__ == "__main__":`.
-- Ningún test automatizado debe llamar a Vertex AI ni a ningún proveedor LLM real. Usar `FakeLLMAdapter` inyectado explícitamente.
+- `pytest` sin argumentos ejecuta solo `tests/unit` (`testpaths` en `pyproject.toml`): esa suite no puede depender de ningún servicio externo. Las pruebas que necesitan PostgreSQL viven en `tests/integration`, se ejecutan explícitamente y deben **fallar** con mensaje claro si no hay servidor, nunca saltarse. Los scripts de demostración viven en `scripts/`, protegidos con `if __name__ == "__main__":`.
+- Ningún test automatizado debe llamar a Vertex AI ni a ningún proveedor LLM real. Usar `FakeLLMAdapter` inyectado explícitamente; `tests/conftest.py` bloquea la construcción del cliente real durante todo pytest.
+- Migraciones de Alembic y `setup()` del checkpointer son pasos de despliegue: nunca se ejecutan en el arranque de FastAPI.
 
 ## Verificación obligatoria antes de reportar una tarea como completa
 
@@ -30,7 +31,10 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy app
 uv run pytest -q
+uv run pytest tests/integration -q   # requiere PostgreSQL accesible
 ```
+
+La CI (`.github/workflows/ci.yml`) ejecuta exactamente estos comandos contra un servicio PostgreSQL; un cambio que no pase localmente no debe publicarse.
 
 ## Git
 

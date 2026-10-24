@@ -59,6 +59,7 @@ def make_adapter(
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         anthropic_vertex_project_id="test-project",
+        database_url="postgresql+psycopg://localhost:5432/agentforge",
         claude_model="claude-test",
         llm_max_repair_attempts=repair_attempts,
     )

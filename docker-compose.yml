@@ -1,0 +1,23 @@
+# Local PostgreSQL for contributors who use Docker (the maintainer runs Homebrew
+# PostgreSQL instead; both work). The port is bound to 127.0.0.1 only: the
+# database is never exposed on the network. Credentials come from .env; there
+# are no defaults for the password on purpose.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?define POSTGRES_USER en .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: ${POSTGRES_DB:-agentforge}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - agentforge-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  agentforge-pgdata:
