@@ -1,9 +1,33 @@
+import os
+
 import pytest
 from pydantic import ValidationError
 
 from app.settings import Settings
 
 DB_URL = "postgresql+psycopg://user:s3cret@localhost:5432/agentforge"
+_PREFIXES = (
+    "ENVIRONMENT",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+    "CLAUDE_MODEL",
+    "USE_FAKE_MODEL",
+    "LLM_",
+    "MAX_",
+    "DATABASE_",
+    "CHECKPOINT_",
+    "SHUTDOWN_",
+    "RUN_",
+    "RECOVERY_",
+)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Settings tests must not depend on the shell or the CI job environment."""
+    for name in list(os.environ):
+        if name.startswith(_PREFIXES):
+            monkeypatch.delenv(name, raising=False)
 
 
 def make(**overrides: object) -> Settings:
@@ -52,14 +76,12 @@ def test_invalid_values_are_rejected(overrides: dict[str, object]):
         make(**overrides)
 
 
-def test_project_id_is_required(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+def test_project_id_is_required():
     with pytest.raises(ValidationError, match="anthropic_vertex_project_id"):
         Settings(_env_file=None, database_url=DB_URL)  # type: ignore[call-arg]
 
 
-def test_database_url_is_required(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+def test_database_url_is_required():
     with pytest.raises(ValidationError, match="database_url"):
         Settings(_env_file=None, anthropic_vertex_project_id="p")  # type: ignore[call-arg]
 
