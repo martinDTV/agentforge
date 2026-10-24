@@ -1,7 +1,7 @@
 [project]
 name = "agentforge"
-version = "0.2.0"
-description = "Fase 2: FastAPI + LangGraph + Claude (Vertex AI) + orquestador robusto + aprobación humana"
+version = "0.3.0"
+description = "Fase 3: FastAPI + LangGraph + Claude (Vertex AI) + persistencia PostgreSQL con checkpoints, auditoría, leases y recuperación"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
@@ -10,12 +10,22 @@ dependencies = [
     "langchain-core>=1.0,<2",
     "pydantic-settings>=2.0",
     "anthropic[vertex]>=2.3.0",
+    "sqlalchemy[asyncio]>=2.0,<2.2",
+    "psycopg[binary,pool]>=3.2",
+    "alembic>=1.14",
+    "langgraph-checkpoint-postgres>=3.2,<4",
+    "pycryptodome>=3.20",
 ]
 [dependency-groups]
 dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.8", "mypy>=1.13"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["tests"]
+# Default run = unit suite only (no external services).
+# Integration suite (needs PostgreSQL): uv run pytest tests/integration -q
+testpaths = ["tests/unit"]
+markers = [
+    "integration: requiere PostgreSQL; se ejecuta explícitamente con tests/integration",
+]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
