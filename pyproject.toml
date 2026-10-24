@@ -1,7 +1,7 @@
 [project]
 name = "agentforge"
-version = "0.1.0"
-description = "Fase 1: FastAPI + LangGraph + Claude (Vertex AI) + aprobación humana"
+version = "0.2.0"
+description = "Fase 2: FastAPI + LangGraph + Claude (Vertex AI) + orquestador robusto + aprobación humana"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",

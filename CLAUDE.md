@@ -4,11 +4,11 @@ Reglas permanentes de este repositorio. Mantener conciso; reflejar solo lo que e
 
 ## Arquitectura FastAPI
 
-Antes de implementar o modificar cualquier componente de FastAPI (routers, schemas, dependencias, configuración, persistencia, testing, seguridad), consultar la skill `/fastapi-architect:fastapi-architect` si está disponible en la sesión. Es la referencia principal de estándares técnicos para este proyecto.
+Antes de implementar o modificar cualquier componente de FastAPI (routers, schemas, dependencias, configuración, persistencia, testing, seguridad), consultar la skill `/fastapi-architect:fastapi-architect` si está disponible en la sesión. Es la referencia principal de estándares técnicos para este proyecto, y sus estándares se aplican siempre, no se difieren como deuda: códigos HTTP correctos, excepciones de dominio mapeadas a Problem Details en `app/api/errors.py`, prefijo `/api/v1`, dependencias tipadas con `Annotated`, recursos creados en `lifespan` y `def` plano en endpoints bloqueantes.
 
 - No reorganizar carpetas ni reescribir componentes solo para igualar visualmente la skill.
 - Toda desviación intencional respecto a la skill debe documentarse como ADR en `docs/adr/`.
-- Ver `docs/adr/0001-layout-por-capa-tecnica.md` para la decisión sobre por qué `app/` está organizado por capa técnica (`agents/`, `contracts/`, `infrastructure/`, `orchestration/`) y no por módulo de negocio.
+- Ver `docs/adr/0001-layout-por-capa-tecnica.md` para la decisión sobre por qué `app/` está organizado por capa técnica (`agents/`, `contracts/`, `infrastructure/`, `orchestration/`, `api/`) y no por módulo de negocio. Ver `docs/adr/0002-politica-de-errores-reintentos-y-presupuesto-llm.md` para la política de errores LLM, reintentos y presupuesto por run.
 
 ## Proveedor LLM
 
