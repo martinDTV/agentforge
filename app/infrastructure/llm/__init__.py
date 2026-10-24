@@ -1,13 +1,25 @@
 from app.contracts.planning import ArchitectureReview, DevelopmentPlan, DevelopmentTask
-from app.settings import get_settings
+from app.settings import Settings, get_settings
 
+from .errors import (
+    LLMError,
+    LLMMalformedOutputError,
+    LLMRequestRejectedError,
+    LLMTimeoutError,
+    LLMUnavailableError,
+)
 from .fake import FakeLLMAdapter
 from .port import LLMPort
 from .vertex_claude import StructuredOutputError, VertexClaudeAdapter
 
 __all__ = [
     "FakeLLMAdapter",
+    "LLMError",
+    "LLMMalformedOutputError",
     "LLMPort",
+    "LLMRequestRejectedError",
+    "LLMTimeoutError",
+    "LLMUnavailableError",
     "StructuredOutputError",
     "VertexClaudeAdapter",
     "build_llm",
@@ -48,7 +60,8 @@ def _default_fake_adapter() -> FakeLLMAdapter:
     return adapter
 
 
-def build_llm() -> LLMPort:
-    if get_settings().use_fake_model:
+def build_llm(settings: Settings | None = None) -> LLMPort:
+    settings = settings or get_settings()
+    if settings.use_fake_model:
         return _default_fake_adapter()
-    return VertexClaudeAdapter()
+    return VertexClaudeAdapter(settings)
