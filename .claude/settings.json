@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "frontend-design@anthropic-plugin-directory": true,
+    "fastapi-architect@fastapi-architect": true
+  }
+}

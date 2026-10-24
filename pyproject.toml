@@ -1,0 +1,22 @@
+[project]
+name = "agentforge"
+version = "0.1.0"
+description = "Fase 1: FastAPI + LangGraph + Claude (Vertex AI) + aprobación humana"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "langgraph>=1.0,<2",
+    "pydantic-settings>=2.0",
+    "anthropic[vertex]>=2.3.0",
+]
+[dependency-groups]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.8"]
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

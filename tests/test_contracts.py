@@ -1,0 +1,68 @@
+import pytest
+from pydantic import ValidationError
+
+from app.contracts.planning import ArchitectureReview, DevelopmentPlan, DevelopmentTask
+
+
+def test_development_plan_accepts_valid_dependencies():
+    plan = DevelopmentPlan(
+        summary="s",
+        tasks=[
+            DevelopmentTask(id="t1", title="a", description="d", acceptance_criteria=["ok"]),
+            DevelopmentTask(
+                id="t2",
+                title="b",
+                description="d",
+                dependencies=["t1"],
+                acceptance_criteria=["ok"],
+            ),
+        ],
+    )
+    assert plan.tasks[1].dependencies == ["t1"]
+
+
+def test_development_plan_rejects_unknown_dependency():
+    with pytest.raises(ValidationError, match="ids inexistentes"):
+        DevelopmentPlan(
+            summary="s",
+            tasks=[
+                DevelopmentTask(
+                    id="t1",
+                    title="a",
+                    description="d",
+                    dependencies=["missing"],
+                    acceptance_criteria=["ok"],
+                ),
+            ],
+        )
+
+
+def test_development_plan_rejects_self_dependency():
+    with pytest.raises(ValidationError, match="depender de sí misma"):
+        DevelopmentPlan(
+            summary="s",
+            tasks=[
+                DevelopmentTask(
+                    id="t1",
+                    title="a",
+                    description="d",
+                    dependencies=["t1"],
+                    acceptance_criteria=["ok"],
+                ),
+            ],
+        )
+
+
+def test_development_plan_requires_at_least_one_task():
+    with pytest.raises(ValidationError):
+        DevelopmentPlan(summary="s", tasks=[])
+
+
+def test_development_task_requires_acceptance_criteria():
+    with pytest.raises(ValidationError):
+        DevelopmentTask(id="t1", title="a", description="d", acceptance_criteria=[])
+
+
+def test_architecture_review_defaults():
+    review = ArchitectureReview(summary="s", decisions=[], approved=False)
+    assert review.issues == []
