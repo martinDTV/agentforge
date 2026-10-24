@@ -1,63 +1,43 @@
-from uuid import uuid4
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
-from langgraph.types import Command
+from fastapi import FastAPI
 
-from app.contracts import Approval, ArchitectureReview, CreateRun, DevelopmentPlan, RunResponse
+from app.api import api_router
+from app.api.errors import register_exception_handlers
 from app.infrastructure.llm import build_llm
 from app.infrastructure.llm.port import LLMPort
 from app.orchestration.graph import build_graph
+from app.orchestration.limits import RunLimits
+from app.orchestration.runs import RunService
+from app.settings import get_settings
 
 
-def create_app(llm: LLMPort | None = None) -> FastAPI:
-    """Build the FastAPI app with a graph bound to the given LLMPort.
+def create_app(llm: LLMPort | None = None, limits: RunLimits | None = None) -> FastAPI:
+    """Build the FastAPI app.
 
-    The graph (and its in-memory checkpointer) must be a singleton for the
-    lifetime of the app: it is what lets /runs and /runs/{id}/approve share
-    state across requests for the same run_id. Tests call this factory with
-    a FakeLLMAdapter to get an isolated app/graph pair with no network calls.
+    Wiring happens in ``lifespan`` (not at import time) and lands on
+    ``app.state.run_service``. With no arguments everything comes from
+    ``Settings`` (production). Tests pass a ``FakeLLMAdapter`` and explicit
+    ``RunLimits`` so they never touch Settings or the network.
     """
-    app = FastAPI(title="Multiagent Starter", version="0.1.0")
-    graph = build_graph(llm or build_llm())
 
-    def config(run_id: str) -> dict:
-        return {"configurable": {"thread_id": run_id}}
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        port, run_limits = llm, limits
+        if port is None:
+            settings = get_settings()
+            port = build_llm(settings)
+            run_limits = run_limits or RunLimits(
+                max_revisions=settings.max_plan_revisions,
+                max_llm_calls=settings.max_llm_calls_per_run,
+            )
+        app.state.run_service = RunService(build_graph(port, run_limits or RunLimits()))
+        yield
 
-    def read_run(run_id: str) -> RunResponse:
-        snapshot = graph.get_state(config(run_id))
-        values = snapshot.values
-        if not values or "plan" not in values:
-            raise HTTPException(404, "Ejecución no encontrada")
-        if snapshot.next:
-            status = "waiting_approval"
-        else:
-            status = "approved" if values.get("approved") is True else "rejected"
-        architecture = values.get("architecture")
-        return RunResponse(
-            run_id=run_id,
-            status=status,
-            plan=DevelopmentPlan.model_validate(values["plan"]),
-            architecture=ArchitectureReview.model_validate(architecture) if architecture else None,
-        )
-
-    @app.post("/runs", response_model=RunResponse, status_code=201)
-    def create_run(body: CreateRun) -> RunResponse:
-        run_id = str(uuid4())
-        graph.invoke({"task": body.task}, config(run_id))
-        return read_run(run_id)
-
-    @app.get("/runs/{run_id}", response_model=RunResponse)
-    def get_run(run_id: str) -> RunResponse:
-        return read_run(run_id)
-
-    @app.post("/runs/{run_id}/approve", response_model=RunResponse)
-    def approve_run(run_id: str, body: Approval) -> RunResponse:
-        current = read_run(run_id)
-        if current.status != "waiting_approval":
-            raise HTTPException(409, "La ejecución ya fue decidida")
-        graph.invoke(Command(resume={"approved": body.approved}), config(run_id))
-        return read_run(run_id)
-
+    app = FastAPI(title="AgentForge", version="0.2.0", lifespan=lifespan)
+    register_exception_handlers(app)
+    app.include_router(api_router)
     return app
 
 

@@ -1,4 +1,4 @@
-from .execution import Approval, CreateRun, RunResponse
+from .execution import Approval, CreateRun, RunError, RunResponse, RunStatus
 from .planning import (
     ArchitectureDecision,
     ArchitectureReview,
@@ -13,5 +13,7 @@ __all__ = [
     "CreateRun",
     "DevelopmentPlan",
     "DevelopmentTask",
+    "RunError",
     "RunResponse",
+    "RunStatus",
 ]

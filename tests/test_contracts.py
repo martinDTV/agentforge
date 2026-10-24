@@ -66,3 +66,29 @@ def test_development_task_requires_acceptance_criteria():
 def test_architecture_review_defaults():
     review = ArchitectureReview(summary="s", decisions=[], approved=False)
     assert review.issues == []
+
+
+def test_run_response_failed_without_plan():
+    from app.contracts.execution import RunError, RunResponse
+
+    response = RunResponse(
+        run_id="r1", status="failed", error=RunError(code="llm_timeout", message="sin respuesta")
+    )
+    assert response.plan is None
+    assert response.architecture is None
+    assert response.architect_approved is None
+    assert response.model_dump()["error"] == {"code": "llm_timeout", "message": "sin respuesta"}
+
+
+def test_run_response_rejects_unknown_status():
+    from app.contracts.execution import RunResponse
+
+    with pytest.raises(ValidationError):
+        RunResponse(run_id="r1", status="running")  # type: ignore[arg-type]
+
+
+def test_run_response_rejects_negative_counters():
+    from app.contracts.execution import RunResponse
+
+    with pytest.raises(ValidationError):
+        RunResponse(run_id="r1", status="failed", llm_calls=-1)
