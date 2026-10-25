@@ -17,7 +17,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from app.infrastructure.db.errors import DatabaseUnavailableError
-from app.settings import Settings
+from app.settings import DatabaseSettings
 
 from .errors import CheckpointSchemaError
 from .serde import build_serializer
@@ -84,7 +84,7 @@ class PostgresCheckpointer:
         self._saver: AsyncPostgresSaver | None = None
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "PostgresCheckpointer":
+    def from_settings(cls, settings: DatabaseSettings) -> "PostgresCheckpointer":
         return cls(
             settings.database_dsn.get_secret_value(),
             pool_size=settings.checkpoint_pool_size,

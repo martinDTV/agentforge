@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -29,20 +30,13 @@ class EnvironmentSettings(BaseSettings):
         return self.environment in ("staging", "production")
 
 
-class Settings(EnvironmentSettings):
-    anthropic_vertex_project_id: str
-    cloud_ml_region: str = "global"
-    claude_model: str = "claude-sonnet-4-6"
-    use_fake_model: bool = False
+class DatabaseSettings(EnvironmentSettings):
+    """Everything the deploy steps need and nothing else.
 
-    # LLM call resilience (applied inside VertexClaudeAdapter).
-    llm_timeout_seconds: float = Field(default=60.0, gt=0)
-    llm_max_retries: int = Field(default=2, ge=0)
-    llm_max_repair_attempts: int = Field(default=1, ge=0)
-
-    # Per-run orchestration limits (mapped to RunLimits in create_app).
-    max_plan_revisions: int = Field(default=2, ge=0)
-    max_llm_calls_per_run: int = Field(default=8, ge=1)
+    ``alembic upgrade head`` and ``scripts/setup_checkpoints.py`` read this
+    class, so migrating a database never requires LLM or authentication
+    configuration. The application reads ``Settings``, which extends it.
+    """
 
     # PostgreSQL (business tables; the LangGraph checkpointer reuses the same DSN).
     database_url: SecretStr
@@ -58,21 +52,6 @@ class Settings(EnvironmentSettings):
     checkpoint_pool_size: int = Field(default=5, ge=1)
     # 16, 24 or 32 bytes => AES-EAX at rest on top of the strict serializer. None = plaintext.
     checkpoint_encryption_key: SecretStr | None = None
-    # How long shutdown waits for in-flight runs before closing pools.
-    shutdown_grace_seconds: float = Field(default=30.0, ge=0)
-
-    # Execution leases and recovery (ADR 0004).
-    run_lease_ttl_seconds: float = Field(default=60.0, gt=0)
-    # None = a third of the TTL.
-    run_heartbeat_seconds: float | None = Field(default=None, gt=0)
-    # 0 disables the periodic sweep; the startup sweep always runs.
-    recovery_sweep_seconds: float = Field(default=60.0, ge=0)
-    recovery_batch_size: int = Field(default=20, ge=1)
-    # Re-drive interrupted runs from their last checkpoint automatically (costs LLM calls).
-    recovery_auto_resume: bool = False
-    max_run_attempts: int = Field(default=3, ge=1)
-
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -105,17 +84,6 @@ class Settings(EnvironmentSettings):
             return None
         return self.checkpoint_encryption_key.get_secret_value().encode()
 
-    @model_validator(mode="after")
-    def _heartbeat_fits_in_lease(self) -> "Settings":
-        if (
-            self.run_heartbeat_seconds is not None
-            and self.run_heartbeat_seconds * 2 > self.run_lease_ttl_seconds
-        ):
-            raise ValueError(
-                "RUN_HEARTBEAT_SECONDS debe ser como mucho la mitad de RUN_LEASE_TTL_SECONDS"
-            )
-        return self
-
     @property
     def database_ssl(self) -> bool:
         if self.database_ssl_required is not None:
@@ -129,9 +97,120 @@ class Settings(EnvironmentSettings):
         return SecretStr(LIBPQ_SCHEME + url[len(SQLALCHEMY_SCHEME) :])
 
 
+class Settings(DatabaseSettings):
+    anthropic_vertex_project_id: str
+    cloud_ml_region: str = "global"
+    claude_model: str = "claude-sonnet-4-6"
+    use_fake_model: bool = False
+
+    # LLM call resilience (applied inside VertexClaudeAdapter).
+    llm_timeout_seconds: float = Field(default=60.0, gt=0)
+    llm_max_retries: int = Field(default=2, ge=0)
+    llm_max_repair_attempts: int = Field(default=1, ge=0)
+
+    # Per-run orchestration limits (mapped to RunLimits in create_app).
+    max_plan_revisions: int = Field(default=2, ge=0)
+    max_llm_calls_per_run: int = Field(default=8, ge=1)
+
+    # How long shutdown waits for in-flight runs before closing pools.
+    shutdown_grace_seconds: float = Field(default=30.0, ge=0)
+
+    # Authentication (ADR 0005). The API verifies OIDC access tokens; it never
+    # issues credentials. "disabled" is a local/test convenience only.
+    auth_mode: Literal["oidc", "disabled"] = "oidc"
+    oidc_issuer: str | None = None
+    oidc_audience: str | None = None
+    # Exactly one of the two key sources when auth_mode == "oidc".
+    oidc_jwks_url: str | None = None
+    oidc_jwks_file: Path | None = None  # static JWKS: local/test only
+    oidc_algorithms: list[str] = Field(default_factory=lambda: ["RS256", "ES256"])
+    oidc_leeway_seconds: int = Field(default=30, ge=0, le=300)
+    oidc_jwks_cache_seconds: int = Field(default=300, ge=0)
+    # Claim paths (dotted for nested claims, e.g. "realm_access.roles").
+    oidc_roles_claim: str = "roles"
+    oidc_projects_claim: str = "projects"
+    oidc_kind_claim: str = "kind"
+
+    # Authorization: may the creator of a run approve it? None = forbidden in
+    # staging/production, allowed in local/test (personal use, development).
+    authz_separation_of_duties: bool | None = None
+
+    # Execution leases and recovery (ADR 0004).
+    run_lease_ttl_seconds: float = Field(default=60.0, gt=0)
+    # None = a third of the TTL.
+    run_heartbeat_seconds: float | None = Field(default=None, gt=0)
+    # 0 disables the periodic sweep; the startup sweep always runs.
+    recovery_sweep_seconds: float = Field(default=60.0, ge=0)
+    recovery_batch_size: int = Field(default=20, ge=1)
+    # Re-drive interrupted runs from their last checkpoint automatically (costs LLM calls).
+    recovery_auto_resume: bool = False
+    max_run_attempts: int = Field(default=3, ge=1)
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @property
+    def separation_of_duties(self) -> bool:
+        if self.authz_separation_of_duties is not None:
+            return self.authz_separation_of_duties
+        return self.is_production_like
+
+    @field_validator("oidc_algorithms")
+    @classmethod
+    def _only_asymmetric_algorithms(cls, value: list[str]) -> list[str]:
+        allowed = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512"}
+        bad = [alg for alg in value if alg not in allowed]
+        if bad or not value:
+            raise ValueError(
+                "OIDC_ALGORITHMS solo admite algoritmos asimétricos (RS*/ES*/PS*); "
+                f"rechazados: {bad or 'lista vacía'}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _authentication_is_coherent(self) -> "Settings":
+        if self.auth_mode == "disabled":
+            if self.is_production_like:
+                raise ValueError("AUTH_MODE=disabled está prohibido en staging y production")
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("OIDC_ISSUER", self.oidc_issuer),
+                ("OIDC_AUDIENCE", self.oidc_audience),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(f"AUTH_MODE=oidc requiere {', '.join(missing)}")
+        if bool(self.oidc_jwks_url) == bool(self.oidc_jwks_file):
+            raise ValueError(
+                "Define exactamente una fuente de claves: OIDC_JWKS_URL u OIDC_JWKS_FILE"
+            )
+        if self.oidc_jwks_file is not None and self.is_production_like:
+            raise ValueError("OIDC_JWKS_FILE solo se admite en local y test; usa OIDC_JWKS_URL")
+        return self
+
+    @model_validator(mode="after")
+    def _heartbeat_fits_in_lease(self) -> "Settings":
+        if (
+            self.run_heartbeat_seconds is not None
+            and self.run_heartbeat_seconds * 2 > self.run_lease_ttl_seconds
+        ):
+            raise ValueError(
+                "RUN_HEARTBEAT_SECONDS debe ser como mucho la mitad de RUN_LEASE_TTL_SECONDS"
+            )
+        return self
+
+
 @lru_cache
 def get_environment() -> EnvironmentSettings:
     return EnvironmentSettings()
+
+
+@lru_cache
+def get_database_settings() -> DatabaseSettings:
+    """For deploy steps (migrations, checkpoint setup): database only."""
+    return DatabaseSettings()
 
 
 @lru_cache

@@ -36,6 +36,7 @@ async def test_from_settings_wires_pool_and_ssl_policy(migrated_database_url: st
         database_pool_size=2,
         database_max_overflow=1,
         environment="local",
+        auth_mode="disabled",
     )
     database = Database.from_settings(settings)
     try:

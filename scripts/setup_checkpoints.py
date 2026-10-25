@@ -7,7 +7,8 @@ applies the library migrations not yet recorded in ``checkpoint_migrations``.
     uv run python -m scripts.setup_checkpoints          # apply
     uv run python -m scripts.setup_checkpoints --check  # exit 0 only if up to date
 
-Reads ``DATABASE_URL`` (and the rest of Settings) from the environment/.env.
+Reads only the database settings (``DATABASE_URL`` and pool/encryption knobs)
+from the environment/.env: no LLM or authentication configuration is needed.
 Never prints the DSN.
 """
 
@@ -16,11 +17,11 @@ import asyncio
 import sys
 
 from app.infrastructure.checkpoints import PostgresCheckpointer, expected_migration_version
-from app.settings import get_settings
+from app.settings import get_database_settings
 
 
 async def run(check_only: bool) -> int:
-    settings = get_settings()
+    settings = get_database_settings()
     checkpointer = PostgresCheckpointer.from_settings(settings)
     await checkpointer.open(wait=True)
     try:

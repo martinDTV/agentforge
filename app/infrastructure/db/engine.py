@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.settings import Settings
+from app.settings import DatabaseSettings
 
 from .errors import DatabaseUnavailableError, safe_db_error
 
@@ -58,7 +58,7 @@ class Database:
         )
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "Database":
+    def from_settings(cls, settings: DatabaseSettings) -> "Database":
         return cls(
             settings.database_url.get_secret_value(),
             pool_size=settings.database_pool_size,
