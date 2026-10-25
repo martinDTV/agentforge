@@ -1,3 +1,4 @@
+from .automation import AGENT_ROLE, AUTOMATION_ISSUER, AutomationIdentity
 from .errors import (
     AuthenticationError,
     PermissionDeniedError,
@@ -24,14 +25,27 @@ from .tokens import (
     TokenVerifier,
     VerificationRules,
 )
+from .tools import (
+    DEFAULT_AGENT_GRANTS,
+    ENABLED_RISK_CLASSES,
+    AgentGrant,
+    ToolAuthorizationPolicy,
+    ToolDecision,
+)
 
 __all__ = [
+    "AGENT_ROLE",
+    "AUTOMATION_ISSUER",
+    "DEFAULT_AGENT_GRANTS",
     "DEFAULT_ROLE_PERMISSIONS",
+    "ENABLED_RISK_CLASSES",
     "LEGACY_OWNER",
     "LEGACY_PROJECT",
     "AccessScope",
+    "AgentGrant",
     "AuthenticationError",
     "AuthorizationPolicy",
+    "AutomationIdentity",
     "ClaimMapping",
     "Decision",
     "JwksFileKeys",
@@ -46,5 +60,7 @@ __all__ = [
     "SelfApprovalForbiddenError",
     "SigningKeys",
     "TokenVerifier",
+    "ToolAuthorizationPolicy",
+    "ToolDecision",
     "VerificationRules",
 ]

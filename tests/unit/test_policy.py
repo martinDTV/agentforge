@@ -138,11 +138,13 @@ def test_project_resolution_for_create():
         )  # global scope still needs an explicit project
 
 
-def test_reserved_permissions_for_future_agents_exist_but_no_default_role_grants_tools():
+def test_only_the_agent_role_grants_tools_and_nobody_grants_repo_writes():
     policy = AuthorizationPolicy()
     for role in Role:
-        assert P.TOOLS_EXECUTE not in policy.permissions_of(who("u", {role}))
-        assert P.REPOS_WRITE not in policy.permissions_of(who("u", {role}))
+        granted = policy.permissions_of(who("u", {role}))
+        assert (P.TOOLS_EXECUTE in granted) == (role is Role.AGENT)
+        assert P.REPOS_WRITE not in granted  # reserved for the Git adapter of a later step
+    assert policy.permissions_of(who("u", {Role.AGENT})) == {P.TOOLS_EXECUTE}
 
 
 def test_listing_scope_mirrors_visibility():

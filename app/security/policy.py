@@ -33,8 +33,9 @@ class Permission(StrEnum):
     RECOVERY_SWEEP = "recovery:sweep"
     # Crosses project boundaries. Granted only by an explicit global role.
     PROJECTS_ALL = "projects:all"
-    # Reserved for the Developer / QA / Security agents of later phases.
+    # Held only by the automation identity's agents (Fase 5, ``app/security/tools.py``).
     TOOLS_EXECUTE = "tools:execute"
+    # Reserved for the Git adapter of a later step; no role grants it yet.
     REPOS_WRITE = "repos:write"
 
 
@@ -44,6 +45,7 @@ class Role(StrEnum):
     APPROVER = "approver"
     ADMIN = "admin"  # every run permission, but only inside the token's projects
     PLATFORM_ADMIN = "platform_admin"  # admin + projects:all
+    AGENT = "agent"  # the automation identity: tools only, never runs
 
 
 _P = Permission
@@ -64,6 +66,7 @@ DEFAULT_ROLE_PERMISSIONS: Mapping[str, frozenset[Permission]] = {
     Role.APPROVER: frozenset({_P.RUNS_READ, _P.RUNS_AUDIT_READ, _P.RUNS_APPROVE}),
     Role.ADMIN: _PROJECT_ADMIN,
     Role.PLATFORM_ADMIN: _PROJECT_ADMIN | {_P.PROJECTS_ALL},
+    Role.AGENT: frozenset({_P.TOOLS_EXECUTE}),
 }
 
 # Rows that pre-date authentication live here (migration 0003). No token can

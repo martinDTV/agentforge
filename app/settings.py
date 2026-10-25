@@ -146,6 +146,24 @@ class Settings(DatabaseSettings):
     recovery_auto_resume: bool = False
     max_run_attempts: int = Field(default=3, ge=1)
 
+    # Tool Gateway (Fase 5, ADR 0006): bounds for the read-only workspace tools.
+    tool_max_read_bytes: int = Field(default=64_000, ge=1_024)
+    tool_max_entries: int = Field(default=500, ge=1)
+    tool_max_output_bytes: int = Field(default=256_000, ge=1_024)
+    tool_timeout_seconds: float = Field(default=10.0, gt=0)
+
+    # Managed Git repositories and per-run worktrees (Fase 5, Paso 2). All
+    # optional: without GIT_REPOSITORIES_FILE no Git tool is registered.
+    git_binary: str | None = None
+    git_timeout_seconds: float = Field(default=30.0, gt=0)
+    git_repositories_root: Path | None = None  # every registered repository lives under it
+    git_repositories_file: Path | None = None  # JSON: {"repositories": [...]}
+    worktrees_root: Path | None = None
+    worktree_retention_seconds: float = Field(default=3600.0, ge=0)
+    worktree_interrupted_retention_seconds: float = Field(default=7 * 24 * 3600.0, ge=0)
+    worktree_max_per_project: int = Field(default=20, ge=1)
+    worktree_min_free_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -188,6 +206,25 @@ class Settings(DatabaseSettings):
             )
         if self.oidc_jwks_file is not None and self.is_production_like:
             raise ValueError("OIDC_JWKS_FILE solo se admite en local y test; usa OIDC_JWKS_URL")
+        return self
+
+    @model_validator(mode="after")
+    def _git_storage_is_coherent(self) -> "Settings":
+        if self.git_repositories_file is None:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("GIT_REPOSITORIES_ROOT", self.git_repositories_root),
+                ("WORKTREES_ROOT", self.worktrees_root),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(f"GIT_REPOSITORIES_FILE requiere {', '.join(missing)}")
+        paths = (self.git_repositories_root, self.git_repositories_file, self.worktrees_root)
+        if any(path is not None and not path.is_absolute() for path in paths):
+            raise ValueError("Las rutas de repositorios y worktrees deben ser absolutas")
         return self
 
     @model_validator(mode="after")
