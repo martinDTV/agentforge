@@ -1,0 +1,83 @@
+# Real isolation validation of the AgentForge Runner with Podman rootless on Linux.
+#
+# Runs on pull requests that touch the runner (read-only token, no secrets,
+# no deploy) and manually once it exists on the default branch. It builds the
+# python-3.13 profile image, pins it by digest, runs the runner's own
+# preflight (including the in-container probe) and then tests/runner_integration,
+# which fail loudly when rootless Podman, cgroups v2 or the image are missing.
+# Until this workflow has a green run, the isolation is NOT proven: the unit
+# suite only exercises the service around a simulated backend.
+name: runner-podman
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "runner/**"
+      - "tests/runner_integration/**"
+      - ".github/workflows/runner-podman.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-podman-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  podman-rootless:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+
+      - name: Install uv (pinned) and Python 3.13
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2 (Node 24)
+        with:
+          version: "0.11.28"
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies from the lockfile
+        run: uv sync --frozen
+
+      - name: Rootless cgroup delegation for the job user
+        # Resource limits in rootless Podman need the user's systemd manager
+        # with the controllers delegated; the hosted runner does not ship it.
+        run: |
+          set -euxo pipefail
+          id
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+          sudo systemctl daemon-reload
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+
+      - name: Podman rootless facts
+        run: |
+          podman --version
+          podman info --format 'rootless={{.Host.Security.Rootless}} cgroups={{.Host.CgroupVersion}} manager={{.Host.CgroupManager}} controllers={{.Host.CgroupControllers}} runtime={{.Host.OCIRuntime.Name}}'
+          grep -E "^$(id -un):" /etc/subuid /etc/subgid || echo "sin subuid/subgid para $(id -un)"
+
+      - name: Build and pin the python-3.13 profile image
+        id: image
+        run: |
+          set -euo pipefail
+          podman build -t localhost/agentforge/python-3.13 -f runner/deploy/Containerfile.python-3.13 runner/deploy
+          digest=$(podman image inspect --format '{{.Digest}}' localhost/agentforge/python-3.13)
+          echo "reference=localhost/agentforge/python-3.13@${digest}" >> "$GITHUB_OUTPUT"
+          echo "imagen fijada: localhost/agentforge/python-3.13@${digest}"
+
+      - name: Runner preflight (real Podman, in-container probe)
+        env:
+          RUNNER_RUNNER_ID: ci-runner
+          RUNNER_TOKEN_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
+          RUNNER_IMAGES: '{"python-3.13":"${{ steps.image.outputs.reference }}"}'
+        run: uv run agentforge-runner preflight
+
+      - name: Real isolation tests (Podman rootless)
+        env:
+          RUNNER_TEST_IMAGE: ${{ steps.image.outputs.reference }}
+        run: uv run pytest tests/runner_integration -v --tb=short -p no:cacheprovider
