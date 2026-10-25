@@ -44,6 +44,10 @@ class RunRecord(Base):
 
     # Also the LangGraph thread_id: one run == one thread, by construction.
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    # Ownership and isolation (ADR 0005). Rows older than authentication carry
+    # the sentinels "legacy:unowned" / "legacy" set by migration 0003.
+    owner_subject: Mapped[str] = mapped_column(String(255))
+    project_id: Mapped[str] = mapped_column(String(64))
     idempotency_key: Mapped[str | None] = mapped_column(String(128))
     task: Mapped[str] = mapped_column(Text)
     status: Mapped[RunLifecycleStatus] = mapped_column(
@@ -82,16 +86,23 @@ class RunRecord(Base):
     )
 
     __table_args__ = (
-        # Idempotent POST /runs: at most one run per client-supplied key.
+        # Idempotent POST /runs: one run per (project, principal, key). A key
+        # reused by another principal or project is simply a different run.
         Index(
-            "ix_runs_idempotency_key",
+            "ix_runs_idempotency_scope",
+            "project_id",
+            "owner_subject",
             "idempotency_key",
             unique=True,
             postgresql_where=text("idempotency_key IS NOT NULL"),
         ),
+        Index("ix_runs_project_id_created_at", "project_id", "created_at"),
+        Index("ix_runs_owner_subject_created_at", "owner_subject", "created_at"),
         Index("ix_runs_status_created_at", "status", "created_at"),
         # Sweeper: expired leases for in-flight statuses.
         Index("ix_runs_status_lease_expires_at", "status", "lease_expires_at"),
+        CheckConstraint("length(owner_subject) > 0", name="owner_subject_not_blank"),
+        CheckConstraint("length(project_id) > 0", name="project_id_not_blank"),
         CheckConstraint("revision >= 0", name="revision_non_negative"),
         CheckConstraint("llm_calls >= 0", name="llm_calls_non_negative"),
         CheckConstraint("attempt >= 0", name="attempt_non_negative"),
@@ -121,6 +132,9 @@ class RunApprovalRecord(Base):
         Uuid, ForeignKey("runs.id", ondelete="CASCADE"), unique=True
     )
     approved: Mapped[bool] = mapped_column(Boolean)
+    # The principal who decided (human or service). NULL only for approvals
+    # recorded before authentication existed.
+    decided_by: Mapped[str | None] = mapped_column(String(255))
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -152,6 +166,9 @@ class RunEventRecord(Base):
     ordinal: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
     checkpoint_id: Mapped[str | None] = mapped_column(String(64))
+    # Who caused the event: a principal's subject for human actions (creation,
+    # approval), NULL for agent/node and system (recovery) events.
+    actor_subject: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (

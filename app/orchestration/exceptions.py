@@ -44,3 +44,17 @@ class ShuttingDownError(UnavailableError):
 
     def __init__(self) -> None:
         super().__init__("El servicio se está apagando; reintenta en otra instancia.")
+
+
+class SweepInProgressError(ConflictError):
+    code = "sweep_in_progress"
+
+    def __init__(self) -> None:
+        super().__init__("Ya hay un barrido de recuperación en curso en esta instancia.")
+
+
+class RunNotResumableError(ConflictError):
+    code = "run_not_resumable"
+
+    def __init__(self, run_id: str, reason: str) -> None:
+        super().__init__(f"La ejecución '{run_id}' no se puede reanudar: {reason}.")

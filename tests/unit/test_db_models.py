@@ -49,11 +49,20 @@ def test_status_and_kind_columns_store_enum_values_not_names():
     assert status_type.create_constraint is True
 
 
-def test_idempotency_key_index_is_partial_and_unique():
-    index = next(i for i in runs.indexes if i.name == "ix_runs_idempotency_key")
+def test_idempotency_index_is_scoped_to_project_and_principal():
+    index = next(i for i in runs.indexes if i.name == "ix_runs_idempotency_scope")
     assert index.unique is True
-    assert [c.name for c in index.columns] == ["idempotency_key"]
+    assert [c.name for c in index.columns] == ["project_id", "owner_subject", "idempotency_key"]
     assert index.dialect_options["postgresql"]["where"] is not None
+    assert not any(i.name == "ix_runs_idempotency_key" for i in runs.indexes)
+
+
+def test_ownership_columns_and_actor_columns_exist():
+    assert runs.c.owner_subject.nullable is False and runs.c.project_id.nullable is False
+    assert approvals.c.decided_by.nullable is True  # NULL only for pre-auth approvals
+    assert events.c.actor_subject.nullable is True  # NULL for agent/system events
+    names = {i.name for i in runs.indexes}
+    assert {"ix_runs_project_id_created_at", "ix_runs_owner_subject_created_at"} <= names
 
 
 def test_sweeper_index_covers_status_and_lease_expiry():
@@ -98,4 +107,4 @@ def test_run_id_is_uuid_and_documents_thread_id():
 
 
 def test_alembic_head_is_the_latest_migration():
-    assert expected_head_revision() == "0002"
+    assert expected_head_revision() == "0003"

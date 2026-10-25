@@ -28,6 +28,8 @@ def new_run(**overrides: object) -> RunRecord:
         "id": uuid.uuid4(),
         "task": "Diseñar módulo de pacientes",
         "status": RunLifecycleStatus.RUNNING,
+        "owner_subject": "alice",
+        "project_id": "alpha",
     }
     values.update(overrides)
     return RunRecord(**values)

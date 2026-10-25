@@ -29,6 +29,7 @@ from app.orchestration.policy import RecoveryPolicy
 from app.orchestration.ports import LeaseToken, RunProjection
 from app.orchestration.recovery import RecoveryService
 from app.orchestration.runs import RunService
+from app.security import AuthorizationPolicy
 from tests.integration.conftest import libpq_dsn, make_app
 from tests.integration.test_business_persistence import approval_row, events, run_row
 from tests.integration.test_checkpoints import query
@@ -67,7 +68,13 @@ async def components(
     saver = await checkpointer.open(wait=True)
     try:
         repository = SqlAlchemyRunRepository(database.session_factory)
-        service = RunService(build_graph(llm, checkpointer=saver), repository, policy, owner=owner)
+        service = RunService(
+            build_graph(llm, checkpointer=saver),
+            repository,
+            policy,
+            owner=owner,
+            authorization=AuthorizationPolicy(separation_of_duties=False),
+        )
         yield service, repository
     finally:
         await checkpointer.close()
@@ -99,7 +106,12 @@ def abandoned_after_planner(url: str, llm: Any, *, attempt: int = 1) -> str:
     async def _run() -> None:
         async with components(url, llm, owner="dead-process") as (service, repository):
             await repository.create_run(
-                uuid.UUID(run_id), TASK["task"], owner="dead-process", ttl_seconds=60
+                uuid.UUID(run_id),
+                TASK["task"],
+                owner="dead-process",
+                ttl_seconds=60,
+                owner_subject="local-dev",
+                project_id="default",
             )
             halted = build_state_graph(llm).compile(
                 checkpointer=service.graph.checkpointer, interrupt_after=["planner"]
@@ -214,7 +226,12 @@ def test_stale_owner_writes_are_rejected_by_postgres(
         try:
             repository = SqlAlchemyRunRepository(database.session_factory)
             outcome = await repository.create_run(
-                uuid.UUID(run_id), TASK["task"], owner="proc-a", ttl_seconds=60
+                uuid.UUID(run_id),
+                TASK["task"],
+                owner="proc-a",
+                ttl_seconds=60,
+                owner_subject="local-dev",
+                project_id="default",
             )
             old = outcome.lease
             assert old is not None
@@ -254,7 +271,12 @@ def test_recovery_reprojects_abandoned_runs_and_backfills_audit(
     async def _crash_after_interrupt() -> None:
         async with components(url, fake_llm, owner="dead-process") as (service, repository):
             await repository.create_run(
-                uuid.UUID(run_id), TASK["task"], owner="dead-process", ttl_seconds=60
+                uuid.UUID(run_id),
+                TASK["task"],
+                owner="dead-process",
+                ttl_seconds=60,
+                owner_subject="local-dev",
+                project_id="default",
             )
             await service.graph.ainvoke(TASK, cfg(run_id))
 
@@ -291,7 +313,11 @@ def test_recovery_applies_a_pending_approval_recorded_by_a_dead_process(
         database = Database(url)
         try:
             claim = await SqlAlchemyRunRepository(database.session_factory).claim_approval(
-                uuid.UUID(run_id), True, owner="dead-process", ttl_seconds=60
+                uuid.UUID(run_id),
+                True,
+                owner="dead-process",
+                ttl_seconds=60,
+                decided_by="approver-1",
             )
             assert claim is not None and claim.claimed
         finally:
@@ -471,6 +497,8 @@ CHILD = textwrap.dedent(
     from app.orchestration.graph import build_graph
     from app.orchestration.policy import RecoveryPolicy
     from app.orchestration.runs import RunService
+    from app.security import AuthorizationPolicy
+    from app.security.tokens import DisabledAuthentication
     from app.settings import LIBPQ_SCHEME, SQLALCHEMY_SCHEME
 
     url = os.environ["TEST_URL"]
@@ -489,8 +517,10 @@ CHILD = textwrap.dedent(
             SqlAlchemyRunRepository(database.session_factory),
             RecoveryPolicy(lease_ttl_seconds=1.5, heartbeat_seconds=0.4),
             owner="child-process",
+            authorization=AuthorizationPolicy(separation_of_duties=False),
         )
-        await service.create(os.environ["TEST_TASK"], run_id=os.environ["TEST_RUN_ID"])
+        principal = DisabledAuthentication().principal()
+        await service.create(os.environ["TEST_TASK"], principal, run_id=os.environ["TEST_RUN_ID"])
 
     asyncio.run(main())
     """

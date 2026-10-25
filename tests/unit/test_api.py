@@ -123,5 +123,12 @@ def test_unexpected_error_returns_problem_details_500(fake_llm: FakeLLMAdapter):
 
 def test_api_is_versioned(client: TestClient):
     paths = client.get("/openapi.json").json()["paths"]
-    assert set(paths) == {RUNS, f"{RUNS}/{{run_id}}", f"{RUNS}/{{run_id}}/approve"}
+    assert set(paths) == {
+        RUNS,
+        f"{RUNS}/{{run_id}}",
+        f"{RUNS}/{{run_id}}/approve",
+        f"{RUNS}/{{run_id}}/resume",
+        f"{RUNS}/{{run_id}}/events",
+        "/api/v1/admin/recovery/sweeps",
+    }
     assert client.post("/runs", json=TASK).status_code == 404

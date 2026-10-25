@@ -72,7 +72,11 @@ def test_run_response_failed_without_plan():
     from app.contracts.execution import RunError, RunResponse
 
     response = RunResponse(
-        run_id="r1", status="failed", error=RunError(code="llm_timeout", message="sin respuesta")
+        run_id="r1",
+        status="failed",
+        owner="alice",
+        project_id="alpha",
+        error=RunError(code="llm_timeout", message="sin respuesta"),
     )
     assert response.plan is None
     assert response.architecture is None
@@ -84,11 +88,11 @@ def test_run_response_rejects_unknown_status():
     from app.contracts.execution import RunResponse
 
     with pytest.raises(ValidationError):
-        RunResponse(run_id="r1", status="paused")  # type: ignore[arg-type]
+        RunResponse(run_id="r1", status="paused", owner="a", project_id="p")  # type: ignore[arg-type]
 
 
 def test_run_response_rejects_negative_counters():
     from app.contracts.execution import RunResponse
 
     with pytest.raises(ValidationError):
-        RunResponse(run_id="r1", status="failed", llm_calls=-1)
+        RunResponse(run_id="r1", status="failed", owner="a", project_id="p", llm_calls=-1)

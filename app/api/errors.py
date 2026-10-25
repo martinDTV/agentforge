@@ -7,12 +7,15 @@ from fastapi.responses import JSONResponse
 
 from app.exceptions import ConflictError, DomainError, NotFoundError, UnavailableError
 from app.infrastructure.db.errors import DatabaseUnavailableError, as_unavailable
+from app.security import AuthenticationError, PermissionDeniedError
 
 logger = logging.getLogger(__name__)
 
 RETRY_AFTER_SECONDS = "5"
 
 _STATUS_BY_ERROR: dict[type[DomainError], int] = {
+    AuthenticationError: status.HTTP_401_UNAUTHORIZED,
+    PermissionDeniedError: status.HTTP_403_FORBIDDEN,
     NotFoundError: status.HTTP_404_NOT_FOUND,
     ConflictError: status.HTTP_409_CONFLICT,
     UnavailableError: status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -47,11 +50,15 @@ async def domain_error_handler(request: Request, exc: Exception) -> JSONResponse
         (code for cls, code in _STATUS_BY_ERROR.items() if isinstance(exc, cls)),
         status.HTTP_400_BAD_REQUEST,
     )
-    headers = (
-        {"Retry-After": RETRY_AFTER_SECONDS}
-        if status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-        else None
-    )
+    headers: dict[str, str] | None = None
+    if status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+        headers = {"Retry-After": RETRY_AFTER_SECONDS}
+    elif isinstance(exc, AuthenticationError):
+        # RFC 6750: tell the client how to authenticate, never why it failed in detail.
+        challenge = "Bearer"
+        if exc.reason != "missing_token":
+            challenge += ' error="invalid_token"'
+        headers = {"WWW-Authenticate": challenge}
     return _problem(status_code, type(exc).__name__, exc.detail, exc.code, headers=headers)
 
 
