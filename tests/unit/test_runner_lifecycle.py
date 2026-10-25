@@ -376,6 +376,25 @@ def test_podman_preflight_requires_rootless_cgroups_v2_controllers_and_pinned_im
     ok = PodmanBackend("podman", runner=ScriptedPodman(ROOTLESS_INFO), uid=1000, gid=1000)
     report = ok.preflight({"python-3.13": IMAGE})
     assert report.ok and report.rootless and report.backend == "podman-rootless"
+    names = {c.name for c in report.checks}
+    assert {
+        "probe:root_readonly",
+        "probe:work_quota",
+        "probe:network_blocked",
+        "probe:no_capabilities",
+        "probe:memory_max",
+    } <= names
+    probe_runs = [c for c in ok._runner.calls if c[1] == "run"]  # type: ignore[attr-defined]
+    assert len(probe_runs) == 1 and "--rm" not in probe_runs[0]
+    probe_name = probe_runs[0][probe_runs[0].index("--name") + 1]
+    assert probe_name.startswith("agentforge-probe-")
+    removals = [c for c in ok._runner.calls if c[1] == "rm"]  # type: ignore[attr-defined]
+    assert removals and removals[-1][-1] == probe_name  # the probe never lingers
+    leaky = ScriptedPodman(ROOTLESS_INFO)
+    leaky.probe_ok = False
+    leaked = PodmanBackend("podman", runner=leaky, uid=1000, gid=1000).preflight({"p": IMAGE})
+    assert not leaked.ok
+    assert not next(c for c in leaked.checks if c.name == "probe:network_blocked").ok
     assert {c.name for c in report.checks} >= {
         "rootless",
         "cgroups_v2",
