@@ -56,9 +56,10 @@ jobs:
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
 
       - name: Podman rootless facts
+        # The same JSON keys the runner's preflight reads (host.cgroupVersion, ...).
         run: |
           podman --version
-          podman info --format 'rootless={{.Host.Security.Rootless}} cgroups={{.Host.CgroupVersion}} manager={{.Host.CgroupManager}} controllers={{.Host.CgroupControllers}} runtime={{.Host.OCIRuntime.Name}}'
+          podman info --format json | jq '{rootless: .host.security.rootless, cgroupVersion: .host.cgroupVersion, cgroupManager: .host.cgroupManager, controllers: .host.cgroupControllers, runtime: .host.ociRuntime.name, version: .version.Version}'
           grep -E "^$(id -un):" /etc/subuid /etc/subgid || echo "sin subuid/subgid para $(id -un)"
 
       - name: Build and pin the python-3.13 profile image
