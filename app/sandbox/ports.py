@@ -168,6 +168,7 @@ class RunnerHealth(BaseModel):
     rootless: bool = False
     profiles: list[str] = Field(default_factory=list)
     verified: bool = False  # set by the adapter after identity and backend checks
+    ready: bool = True  # the runner's own preflight; absent in older runners
 
 
 class SandboxPort(Protocol):

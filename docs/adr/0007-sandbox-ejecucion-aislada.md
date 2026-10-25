@@ -1,6 +1,6 @@
 # 0007. SandboxPort y ejecución aislada en un runner Linux remoto
 
-- Status: proposed (Fase 5, Pasos 3, 4A y 4B: contratos, adaptador remoto, `exec.run` y el servicio `runner/` con cuota por ejecución, sonda y reconciliación, probados con backend simulado; VM, Podman real y red privada no desplegados)
+- Status: accepted (Fase 5 cerrada el 2026-10-25, versión 0.5.0; aislamiento validado en Linux real con Podman rootless, ver `docs/validation/runner-podman-ubuntu-24.04.md`; VM persistente y red privada no desplegadas; limitaciones al final)
 - Date: 2026-10-25
 - Deciders: martin, Claude (Fase 5)
 
@@ -113,6 +113,21 @@ El adaptador de la API expone ahora los códigos del runner en 409 y 503 y acept
 - **Ejecuciones inciertas con evidencia.** Al arrancar, el runner consulta al motor por cada fila abierta: contenedor terminado → cierre con su código de salida y OOM como evidencia; corriendo → se mata y queda `cancelled`; desaparecido → `uncertain`. Un operador, con una credencial distinta de la de la API, puede listar, reconciliar con evidencia del motor o declarar fallida; no existe la resolución manual como éxito.
 - **Portabilidad.** El dominio y la orquestación no conocen Tailscale ni Proxmox (hay una prueba estática). El adaptador acepta `https://`, `http://` hacia loopback o redes superpuestas privadas y, solo fuera de producción y con opción explícita, `http://` hacia direcciones privadas de una VM local o una VPC. El runner acepta cualquier dirección privada de escucha, nunca la comodín, y recibe la lista de orígenes por configuración.
 - **CI.** El workflow principal tipa el runner y ejecuta sus pruebas unitarias, etiquetadas como backend simulado. Un workflow manual (`runner-podman`) construye la imagen y ejecuta la suite real con Podman rootless; hasta que tenga una ejecución en verde, el aislamiento no está demostrado.
+
+## Evidencia real
+
+El workflow `runner-podman` ejecutó el preflight con sonda y las ocho pruebas de `tests/runner_integration` en `ubuntu-24.04` con Podman 4.9.3 rootless, cgroups v2 y los controladores `cpu`, `memory` y `pids`: todas en verde sobre `349cc8d` (https://github.com/martinDTV/agentforge/actions/runs/40170680633). Detalle, historial de iteraciones y límites no comprobados en `docs/validation/runner-podman-ubuntu-24.04.md`.
+
+## Limitaciones explícitas al cerrar la Fase 5
+
+Aceptado con estas limitaciones, todas abiertas y documentadas:
+
+- **Sin prueba de concurrencia bajo carga**: las ocho pruebas reales se ejecutaron en serie; `RUNNER_MAX_CONCURRENT` y la contención entre sandboxes no están medidas.
+- **Sin validación en una VM persistente**: la evidencia procede de un runner efímero de GitHub Actions; reinicios, reconciliación tras caída y rotación en caliente quedan por probar en la máquina final.
+- **Riesgos de cadena de suministro**: la imagen del perfil se construye con red y su base aún no está fijada por digest; un paquete envenenado ejecutaría con los permisos del sandbox.
+- **Credenciales estáticas sin mTLS**: tokens con hash y, como segunda capa, la red privada; sin atestación del nodo ni firma de resultados.
+- **Ejecuciones `uncertain` que requieren intervención**: no se repiten solas; un operador debe reconciliarlas con evidencia del motor o declararlas fallidas.
+- **Ausencia de integración con los agentes reales**: ningún agente invoca herramientas; `exec`, `write` y `network` siguen bloqueados globalmente y la primera invocación real es un procedimiento de operador.
 
 ## Pending for the next steps
 

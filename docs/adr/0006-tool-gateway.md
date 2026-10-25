@@ -1,6 +1,6 @@
 # 0006. Tool Gateway: registro tipado, contexto confiable, autorización por agente y auditoría de invocaciones
 
-- Status: proposed (Fase 5 en curso; Pasos 1 y 2 implementados: registro, política, herramientas de solo lectura, auditoría por paso lógico, adaptador Git local y worktrees por ejecución; sin sandbox ni push)
+- Status: accepted (Fase 5 cerrada el 2026-10-25, versión 0.5.0; implementado en los PR #5 y #6 y verificado con las suites unitaria e integración; las limitaciones se listan al final)
 - Date: 2026-10-25
 - Deciders: martin, Claude (Fase 5)
 
@@ -96,6 +96,17 @@ La integración remota llegará como una GitHub App con permisos mínimos (conte
 - El barrido de worktrees no está programado: `sweep()` existe y está probado, pero nadie lo invoca periódicamente todavía.
 - `uncertain` requiere resolución manual y aún no hay API para ello.
 - No hay endpoint HTTP de consulta de la auditoría de herramientas ni descripción de herramientas para el modelo en los prompts: llegan cuando un agente las use.
+
+## Limitaciones explícitas al cerrar la Fase 5
+
+Aceptado con estas limitaciones, todas abiertas y documentadas:
+
+- **Sin prueba de concurrencia bajo carga**: las ocho pruebas reales se ejecutaron en serie; `RUNNER_MAX_CONCURRENT` y la contención entre sandboxes no están medidas.
+- **Sin validación en una VM persistente**: la evidencia procede de un runner efímero de GitHub Actions; reinicios, reconciliación tras caída y rotación en caliente quedan por probar en la máquina final.
+- **Riesgos de cadena de suministro**: la imagen del perfil se construye con red y su base aún no está fijada por digest; un paquete envenenado ejecutaría con los permisos del sandbox.
+- **Credenciales estáticas sin mTLS**: tokens con hash y, como segunda capa, la red privada; sin atestación del nodo ni firma de resultados.
+- **Ejecuciones `uncertain` que requieren intervención**: no se repiten solas; un operador debe reconciliarlas con evidencia del motor o declararlas fallidas.
+- **Ausencia de integración con los agentes reales**: ningún agente invoca herramientas; `exec`, `write` y `network` siguen bloqueados globalmente y la primera invocación real es un procedimiento de operador.
 
 ## Pending for the next steps
 
