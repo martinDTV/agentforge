@@ -2,7 +2,7 @@
 
 Plataforma multiagente para planificación y revisión arquitectónica de tareas de desarrollo, con FastAPI, LangGraph, Claude (Anthropic) vía Vertex AI, aprobación humana y contratos Pydantic.
 
-**Versión 0.3.0 — Fase 3 completada.** AgentForge planifica una tarea de desarrollo, revisa la arquitectura del plan con un ciclo acotado de retroalimentación entre dos agentes y detiene el flujo hasta una aprobación humana. Todo el estado vive en PostgreSQL y sobrevive a reinicios y caídas. **No ejecuta código, no usa herramientas y no toca repositorios**: todavía no es una plataforma de desarrollo autónomo — ver [Qué hace y qué no](#qué-hace-y-qué-no-hace-todavía), [Persistencia](#persistencia-fase-3) y [Roadmap](#roadmap-por-fases).
+**Versión 0.4.0 — Fase 4 completada.** AgentForge planifica una tarea de desarrollo, revisa la arquitectura del plan con un ciclo acotado de retroalimentación entre dos agentes y detiene el flujo hasta una aprobación humana. Todo el estado vive en PostgreSQL y sobrevive a reinicios y caídas. **No ejecuta código, no usa herramientas y no toca repositorios**: todavía no es una plataforma de desarrollo autónomo — ver [Qué hace y qué no](#qué-hace-y-qué-no-hace-todavía), [Persistencia](#persistencia-fase-3) y [Roadmap](#roadmap-por-fases).
 
 ## Qué hace y qué no hace todavía
 
@@ -13,10 +13,12 @@ Implementado y verificado (197 pruebas unitarias sin servicios externos, 55 de i
 - Checkpoints de LangGraph en PostgreSQL con serialización estricta y cifrado opcional; `thread_id` igual al `run_id`.
 - Proyección de cada ejecución a `runs`, decisiones humanas durables en `run_approvals`, auditoría estructurada en `run_events`.
 - Leases con heartbeat y token de fencing, barrido de recuperación al arrancar y periódico, apagado ordenado, `Idempotency-Key` en la creación, errores HTTP como Problem Details.
+- Autenticación OIDC con verificación local de tokens, autorización denegada por defecto con permisos nominales, aislamiento por proyecto y propietario, separación de funciones en la aprobación humana, idempotencia por proyecto y principal.
+- API de control: listado y auditoría con paginación keyset, reanudación manual de ejecuciones interrumpidas bajo lease y barrido administrativo síncrono acotado al ámbito del principal; cabeceras de seguridad.
 
 Pendiente, por fase del roadmap:
 
-- Autenticación, autorización, cancelación y reconducción manual de ejecuciones interrumpidas (Fase 4).
+- Cancelación de ejecuciones, caducidad de claves de idempotencia, rate limiting (delegado al gateway) y seguridad a nivel de fila.
 - Ejecución de herramientas en sandbox, agente desarrollador sobre worktrees, agentes de QA, seguridad y revisión (Fases 5 a 7).
 - Varias instancias en producción con cercado de checkpoints, paralelismo entre agentes, observabilidad y despliegue (Fases 8 y 9).
 - Ámbito por principal y caducidad de las claves de idempotencia; endpoint de auditoría; retención de checkpoints.
@@ -43,10 +45,74 @@ curl -s http://127.0.0.1:8000/health/ready
 
 Abre http://127.0.0.1:8000/docs. La API está versionada bajo `/api/v1`.
 
+## Autenticación
+
+Desde la Fase 4 toda ruta bajo `/api/v1` exige un token de acceso OIDC en `Authorization: Bearer`. AgentForge no emite credenciales: verifica tokens JWT de tu proveedor con su JWKS, solo algoritmos asimétricos, y `iss`, `aud`, `exp`, `iat` y `sub` obligatorios. Los probes `/health/*` quedan abiertos.
+
+| Variable | Significado |
+|---|---|
+| `AUTH_MODE` | `oidc` por defecto. `disabled` convierte cada petición en el administrador local; prohibido en `staging` y `production` |
+| `OIDC_ISSUER`, `OIDC_AUDIENCE` | Emisor y audiencia que deben traer los tokens |
+| `OIDC_JWKS_URL` o `OIDC_JWKS_FILE` | Exactamente una fuente de claves. El archivo estático solo se admite en `local` y `test` |
+| `OIDC_ROLES_CLAIM`, `OIDC_PROJECTS_CLAIM`, `OIDC_KIND_CLAIM` | Dónde viven roles, proyectos y tipo de principal en el token; admiten rutas punteadas |
+
+Sin proveedor a mano, en local:
+
+```bash
+uv run python -m scripts.dev_keys                      # genera .local/jwks.json y la clave privada (ignorados por git)
+# añade a .env: AUTH_MODE=oidc, OIDC_ISSUER y OIDC_AUDIENCE que imprime, OIDC_JWKS_FILE=.local/jwks.json
+TOKEN=$(uv run python -m scripts.dev_token --sub martin --roles admin)
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/v1/runs/ID
+```
+
+Un fallo de autenticación responde `401` en Problem Details con código `unauthenticated` y cabecera `WWW-Authenticate: Bearer`; el token nunca se repite en la respuesta ni en los logs.
+
+## Autorización
+
+Denegado por defecto. El código comprueba **permisos**, nunca roles; los roles del token se traducen a permisos con esta tabla; el **ámbito** lo dan los proyectos del token (`projects`) y la propiedad de cada ejecución.
+
+| Rol | `runs:create` | `runs:read` | `runs:approve` | `runs:resume` | `runs:audit:read` | `recovery:sweep` | `projects:all` |
+|---|---|---|---|---|---|---|---|
+| `viewer` | | ✓ | | | ✓ | | |
+| `operator` | ✓ | ✓ | | ✓ | ✓ | | |
+| `approver` | | ✓ | ✓ | | ✓ | | |
+| `admin` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| `platform_admin` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Reglas:
+
+- Una ejecución pertenece al proyecto en que se creó y al principal que la creó (`owner`, `project_id` en la respuesta). Solo la ven los miembros de ese proyecto con `runs:read`, su propietario mientras siga perteneciendo al proyecto, o quien tenga `projects:all`. Para cualquier otro **no existe**: `404`, nunca `403`, para no revelar recursos ajenos. Perder la pertenencia al proyecto retira también la visibilidad de las ejecuciones propias.
+- Sobre una ejecución visible, una operación sin permiso responde `403 permission_denied`. Un `admin` actúa solo dentro de los proyectos de su token; cruzar proyectos exige el permiso explícito `projects:all` del rol `platform_admin`, que además debe indicar `project_id` al crear.
+- Crear sin `project_id` usa el único proyecto del token; con varios, `400 project_required`; sin proyectos, `403`.
+- **Aprobación humana**: exige `runs:approve` y queda registrada con el sujeto que decidió (`decided_by`, y `actor_subject` en los eventos `approval_recorded`, `run_approved`/`run_rejected`, `approval_applied`). Es distinta del veredicto del Architect (`architect_approved`), que es un agente, y del permiso para aprobar, que es política. **Separación de funciones**: por defecto el creador de un run no puede aprobarlo en `staging` y `production` (`403 self_approval_forbidden`); en `local` y `test` sí, salvo que `AUTHZ_SEPARATION_OF_DUTIES` lo fuerce.
+- `Idempotency-Key` tiene ámbito por proyecto y principal: la misma clave en otro proyecto o de otro usuario es otra ejecución, y nunca permite consultar una ajena.
+- Ejecuciones anteriores a la autenticación: la migración `0003` las deja en el proyecto reservado `legacy` con propietario `legacy:unowned`. Ningún token puede reclamar ese proyecto; solo `projects:all` las ve. No se asignan a usuarios nuevos.
+- Permisos reservados para los agentes de fases posteriores: `tools:execute`, `repos:write`. Ningún rol por defecto los concede.
+
+## API de control
+
+| Endpoint | Permiso | Qué hace |
+|---|---|---|
+| `GET /api/v1/runs` | cualquier principal autenticado, dentro de su ámbito | Lista ejecuciones visibles, más recientes primero. Filtros `status`, `project_id`, `owner`, `mine`. Quien no tiene `runs:read` ve solo las suyas |
+| `GET /api/v1/runs/{id}/events` | ejecución visible y `runs:audit:read` | Traza de auditoría, más antigua primero, con `actor` por evento |
+| `POST /api/v1/runs/{id}/resume` | ejecución visible y `runs:resume` | Reanuda una ejecución `interrupted` desde su último checkpoint, bajo lease y contando intento. Síncrono: responde cuando alcanza su siguiente parada. `409 run_not_resumable` si no está interrumpida, otro proceso la tiene o agotó `MAX_RUN_ATTEMPTS` |
+| `POST /api/v1/admin/recovery/sweeps` | `recovery:sweep` | Ejecuta un barrido de recuperación **síncrono** y devuelve el informe real: reclamados, resultados y errores. Limitado a los proyectos del principal salvo `projects:all`; `project_id` lo acota más |
+
+Paginación keyset: `limit` entre 1 y 100 y un `cursor` opaco en `next_cursor`. El cursor es una posición, no una capacidad: el ámbito del principal se reaplica en cada página, va ligado a los filtros y al sujeto de la consulta y se valida estrictamente; un cursor ajeno o manipulado responde `400 invalid_cursor`. Las listas ordenan por `(created_at, id)` descendente y los eventos por `id` ascendente, estables bajo escrituras concurrentes.
+
+El barrido administrativo se ejecuta dentro de la petición, acotado por `RECOVERY_BATCH_SIZE`, y puede incluir llamadas al LLM si `RECOVERY_AUTO_RESUME` está activo; concede un tiempo de espera generoso al cliente. No se responde `202` con una tarea en memoria porque esa promesa no sería durable. Cada instancia ejecuta un solo barrido a la vez: uno manual mientras otro corre responde `409 sweep_in_progress`, y el periódico salta ese tick.
+
+## Cabeceras de seguridad y rate limiting
+
+Todas las respuestas llevan `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` y una `Permissions-Policy` restrictiva; las de `/api/*` añaden `Cache-Control: no-store`; en `staging` y `production` se añade `Strict-Transport-Security`, porque ahí se asume TLS delante. No hay CSP para no romper `/docs`, que en producción está apagado.
+
+**El rate limiting debe vivir en el gateway o ingress**, no en la aplicación: un límite por proceso no protege con varias instancias. Mientras no exista, cualquier token válido puede provocar llamadas al LLM a voluntad; `MAX_LLM_CALLS_PER_RUN` acota cada ejecución, no cada cliente.
+
 ## Flujo
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/api/v1/runs \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"task":"Diseña el módulo de pacientes en FastAPI con pruebas unitarias"}'
 ```
@@ -54,9 +120,10 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/runs \
 Copia el `run_id` que devuelve la API (código `201`). Opcionalmente envía `Idempotency-Key: <clave>` (hasta 128 caracteres): repetir la misma clave con la misma tarea devuelve la ejecución existente con `200` y `Idempotency-Replayed: true`, sin ejecutar nada; la misma clave con otra tarea responde `409 idempotency_key_reused`. La clave es global al despliegue y queda ligada al run aunque este falle.
 
 ```bash
-curl -s http://127.0.0.1:8000/api/v1/runs/TU_RUN_ID
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/v1/runs/TU_RUN_ID
 
 curl -s -X POST http://127.0.0.1:8000/api/v1/runs/TU_RUN_ID/approve \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"approved":true}'
 ```
@@ -111,6 +178,13 @@ Los errores se devuelven como [RFC 9457 Problem Details](https://www.rfc-editor.
 |---|---|---|
 | `404` | `run_not_found` | El `run_id` no existe |
 | `409` | `run_already_decided` | El run no está en `waiting_approval` |
+| `401` | `unauthenticated` | Sin token, token expirado o inválido. Lleva `WWW-Authenticate: Bearer` |
+| `403` | `permission_denied` | Autenticado pero sin permiso sobre un recurso visible, o proyecto no autorizado al crear |
+| `403` | `self_approval_forbidden` | El creador de la ejecución intenta aprobarla con separación de funciones activa |
+| `400` | `project_required` | El token pertenece a varios proyectos y la petición no indica `project_id` |
+| `400` | `invalid_cursor` | Cursor de paginación ajeno, manipulado o de otra consulta |
+| `409` | `run_not_resumable` | Reanudación manual de una ejecución que no está `interrupted`, que otro proceso tiene o que agotó sus intentos |
+| `409` | `sweep_in_progress` | Esta instancia ya está ejecutando un barrido de recuperación |
 | `422` | — | Validación de la petición (formato por defecto de FastAPI) |
 | `503` | `database_unavailable` | PostgreSQL no responde (conexión rechazada, backend terminado, pool agotado). Lleva `Retry-After: 5`. Solo errores de conexión: un error de programación o de integridad sigue siendo `500` |
 | `503` | `shutting_down` | La instancia está en apagado ordenado y ya no acepta trabajo nuevo. Lleva `Retry-After` |
@@ -180,6 +254,7 @@ Checkpointer:
 - Serialización estricta: msgpack con la allowlist interna de tipos seguros de LangGraph y **sin** fallback a pickle. El estado del grafo es JSON nativo; un tipo desconocido falla al escribir, nunca al leer de la base.
 - Cifrado en reposo opcional (`CHECKPOINT_ENCRYPTION_KEY`, AES-EAX). La clave vive en el gestor de secretos, nunca en el repositorio ni en logs.
 - Pool propio (`CHECKPOINT_POOL_SIZE`) abierto en `lifespan` sin esperar: si PostgreSQL está caído al arrancar la app queda degradada y `/health/ready` responde `503`. El apagado espera hasta `SHUTDOWN_GRACE_SECONDS` a las ejecuciones activas antes de cerrar los pools.
+- Los pasos de despliegue (`alembic upgrade head` y `scripts.setup_checkpoints`) leen solo la configuración de base de datos: no necesitan variables de Vertex AI ni de autenticación.
 - `uv run python -m scripts.setup_checkpoints --check` comprueba sin modificar nada; sin `--check` crea o actualiza las tablas. La app verifica al arrancar que existen y están en la versión que espera la librería instalada; si no, aborta.
 
 | Variable | Default | Efecto |
@@ -227,11 +302,13 @@ Reglas permanentes del repositorio en `CLAUDE.md`. Decisiones registradas en `do
 - `0002` — política de errores, reintentos y presupuesto de llamadas LLM.
 - `0003` — persistencia en PostgreSQL: tablas de negocio con SQLAlchemy/Alembic y checkpoints de LangGraph.
 - `0004` — leases con fencing, recuperación automática, idempotencia de creación y sus limitaciones conocidas.
+- `0005` — identidad delegada (OIDC), principal explícito, autorización por política, API de control y sus limitaciones conocidas.
 
 ## Roadmap por fases
 
 - **Fase 1 (completada)**: planificación y revisión arquitectónica con aprobación humana.
 - **Fase 2 (completada)**: orquestador robusto — enrutamiento condicional, retroalimentación Planner ↔ Architect con límite, estados terminales explícitos, manejo de errores del LLM, presupuesto de llamadas, pruebas deterministas.
+- **Fase 4 (completada, v0.4.0)**: autenticación OIDC, autorización por propietario y proyecto, idempotencia por principal, listado y auditoría paginados, reanudación manual, barrido administrativo, cabeceras de seguridad. Decisiones y limitaciones en el ADR 0005.
 - **Fase 3 (completada, v0.3.0)**: PostgreSQL con SQLAlchemy y Alembic, checkpoints persistentes de LangGraph, proyección de negocio y auditoría, aprobaciones durables, leases con heartbeat y fencing, barrido de recuperación, `Idempotency-Key`, apagado ordenado, CI con PostgreSQL. Decisiones en los ADR 0003 y 0004.
 - **Fase 4**: API de control con autenticación, aprobaciones y cancelación.
 - **Fase 5**: Tool Gateway con sandbox real.

@@ -1,7 +1,7 @@
 [project]
 name = "agentforge"
-version = "0.3.0"
-description = "Fase 3: FastAPI + LangGraph + Claude (Vertex AI) + persistencia PostgreSQL con checkpoints, auditoría, leases y recuperación"
+version = "0.4.0"
+description = "Fase 4: FastAPI + LangGraph + Claude (Vertex AI) + persistencia PostgreSQL + autenticación OIDC, autorización por proyecto y API de control"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
@@ -15,6 +15,7 @@ dependencies = [
     "alembic>=1.14",
     "langgraph-checkpoint-postgres>=3.2,<4",
     "pycryptodome>=3.20",
+    "pyjwt[crypto]>=2.9",
 ]
 [dependency-groups]
 dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.8", "mypy>=1.13"]

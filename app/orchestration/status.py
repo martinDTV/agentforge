@@ -62,14 +62,22 @@ def checkpoint_id_of(snapshot: StateSnapshot) -> str | None:
 
 
 def run_response_from_snapshot(
-    run_id: str, snapshot: StateSnapshot, *, in_flight: bool = False
+    run_id: str,
+    snapshot: StateSnapshot,
+    *,
+    in_flight: bool = False,
+    owner: str = "unknown",
+    project_id: str = "unknown",
 ) -> RunResponse:
+    """Diagnostic view built from the checkpoint alone (ownership is not in it)."""
     values = snapshot.values
     plan = values.get("plan")
     architecture = values.get("architecture")
     return RunResponse(
         run_id=run_id,
         status=derive_status(snapshot, in_flight=in_flight),
+        owner=owner,
+        project_id=project_id,
         revision=values.get("revision", 0),
         llm_calls=values.get("llm_calls", 0),
         architect_approved=values.get("architect_approved"),

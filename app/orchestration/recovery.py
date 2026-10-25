@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from app.contracts.lifecycle import RunLifecycleStatus
 from app.infrastructure.db.errors import DatabaseUnavailableError
-from app.orchestration.exceptions import LeaseLostError, ShuttingDownError
+from app.orchestration.exceptions import LeaseLostError, ShuttingDownError, SweepInProgressError
 from app.orchestration.runs import RecoveryOutcome, RunService
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,26 @@ class RecoveryReport(BaseModel):
 
 
 class RecoveryService:
+    """Runs sweeps one at a time per process.
+
+    Rows are protected across processes by ``FOR UPDATE SKIP LOCKED`` and the
+    leases; the lock here only keeps one process from launching several
+    sweeps (manual + periodic) at once, which would multiply LLM work when
+    auto-resume is on. A manual sweep that finds the lock busy fails fast
+    (409) instead of queueing; the periodic one simply skips that tick.
+    """
+
     def __init__(self, service: RunService) -> None:
         self._service = service
+        self._lock = asyncio.Lock()
+
+    @property
+    def sweeping(self) -> bool:
+        return self._lock.locked()
+
+    @property
+    def service(self) -> RunService:
+        return self._service
 
     @property
     def candidate_statuses(self) -> frozenset[RunLifecycleStatus]:
@@ -51,7 +69,22 @@ class RecoveryService:
             statuses.add(RunLifecycleStatus.INTERRUPTED)
         return frozenset(statuses)
 
-    async def sweep(self) -> RecoveryReport:
+    async def sweep(
+        self,
+        *,
+        projects: frozenset[str] | None = None,
+        actor: str | None = None,
+        wait: bool = True,
+    ) -> RecoveryReport:
+        """One synchronous pass. ``projects`` narrows the batch (manual, scoped
+        sweeps); ``actor`` attributes the resulting events to a principal.
+        With ``wait=False`` a busy instance raises ``SweepInProgressError``."""
+        if not wait and self._lock.locked():
+            raise SweepInProgressError()
+        async with self._lock:
+            return await self._sweep(projects=projects, actor=actor)
+
+    async def _sweep(self, *, projects: frozenset[str] | None, actor: str | None) -> RecoveryReport:
         report = RecoveryReport()
         service = self._service
         try:
@@ -60,6 +93,7 @@ class RecoveryService:
                 ttl_seconds=service.policy.lease_ttl_seconds,
                 statuses=self.candidate_statuses,
                 limit=service.policy.batch_size,
+                projects=projects,
             )
         except DatabaseUnavailableError as exc:
             logger.warning("Barrido de recuperación sin base de datos: %s", exc.message)
@@ -68,7 +102,7 @@ class RecoveryService:
         report.claimed = len(claimed)
         for row, lease in claimed:
             try:
-                report.add(await service.recover(row, lease))
+                report.add(await service.recover(row, lease, actor=actor))
             except (LeaseLostError, ShuttingDownError):
                 report.add(RecoveryOutcome.SKIPPED)
             except DatabaseUnavailableError as exc:
@@ -96,6 +130,8 @@ class RecoveryService:
             await asyncio.sleep(interval_seconds)
             if not self._service.accepting:
                 return
+            if self._lock.locked():
+                continue  # a manual sweep is running; nothing is lost by skipping a tick
             try:
                 await self.sweep()
             except Exception:  # pragma: no cover - defensive: never kill the loop

@@ -12,6 +12,7 @@ def make_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "anthropic_vertex_project_id": "test-project",
         "database_url": "postgresql+psycopg://localhost/agentforge",
+        "auth_mode": "disabled",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)  # type: ignore[arg-type]

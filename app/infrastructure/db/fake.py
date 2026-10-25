@@ -20,9 +20,11 @@ from app.orchestration.ports import (
     LeaseToken,
     PersistedEvent,
     PersistedRun,
+    RunCursor,
     RunEvent,
     RunProjection,
 )
+from app.security import AccessScope
 
 
 class InMemoryRunRepository:
@@ -70,12 +72,18 @@ class InMemoryRunRepository:
         *,
         owner: str,
         ttl_seconds: float,
+        owner_subject: str,
+        project_id: str,
         idempotency_key: str | None = None,
     ) -> CreateOutcome:
         self._enter("create_run")
         if idempotency_key is not None:
             for existing in self.runs.values():
-                if existing.idempotency_key == idempotency_key:
+                if (
+                    existing.idempotency_key == idempotency_key
+                    and existing.project_id == project_id
+                    and existing.owner_subject == owner_subject
+                ):
                     return CreateOutcome(run=self._fresh(existing), created=False)
         if run_id in self.runs:
             raise RunAlreadyExistsError(str(run_id))
@@ -84,6 +92,8 @@ class InMemoryRunRepository:
             id=run_id,
             task=task,
             status=RunLifecycleStatus.RUNNING,
+            owner_subject=owner_subject,
+            project_id=project_id,
             idempotency_key=idempotency_key,
             attempt=1,
             lease_owner=owner,
@@ -92,7 +102,7 @@ class InMemoryRunRepository:
             created_at=now,
             updated_at=now,
         )
-        self._append(run_id, [RunEvent(kind=RunEventKind.RUN_CREATED)])
+        self._append(run_id, [RunEvent(kind=RunEventKind.RUN_CREATED, actor_subject=owner_subject)])
         return CreateOutcome(
             run=self._store(run), created=True, lease=LeaseToken(owner=owner, generation=1)
         )
@@ -101,6 +111,32 @@ class InMemoryRunRepository:
         self._enter("get_run")
         run = self.runs.get(run_id)
         return self._fresh(run) if run is not None else None
+
+    async def list_runs(
+        self,
+        *,
+        scope: AccessScope,
+        status: RunLifecycleStatus | None = None,
+        owner_subject: str | None = None,
+        before: RunCursor | None = None,
+        limit: int,
+    ) -> list[PersistedRun]:
+        self._enter("list_runs")
+        if scope.is_empty:
+            return []
+        rows = [
+            run
+            for run in self.runs.values()
+            if (scope.projects is None or run.project_id in scope.projects)
+            and (scope.owner_only is None or run.owner_subject == scope.owner_only)
+            and (owner_subject is None or run.owner_subject == owner_subject)
+            and (status is None or run.status is status)
+            and (
+                before is None or (run.created_at, run.id.int) < (before.created_at, before.id.int)
+            )
+        ]
+        rows.sort(key=lambda r: (r.created_at, r.id.int), reverse=True)
+        return [self._fresh(r) for r in rows[:limit]]
 
     async def project(
         self,
@@ -211,12 +247,15 @@ class InMemoryRunRepository:
         ttl_seconds: float,
         statuses: frozenset[RunLifecycleStatus],
         limit: int,
+        projects: frozenset[str] | None = None,
     ) -> list[tuple[PersistedRun, LeaseToken]]:
         self._enter("claim_expired_leases")
         claimed: list[tuple[PersistedRun, LeaseToken]] = []
         for run in sorted(self.runs.values(), key=lambda r: r.updated_at):
             if len(claimed) >= limit:
                 break
+            if projects is not None and run.project_id not in projects:
+                continue
             if run.status in statuses and self._lease_free(run):
                 generation = run.lease_generation + 1
                 updated = self._store(
@@ -256,14 +295,23 @@ class InMemoryRunRepository:
             inserted += 1
         return inserted
 
-    async def list_events(self, run_id: UUID) -> list[PersistedEvent]:
+    async def list_events(
+        self, run_id: UUID, *, after_id: int | None = None, limit: int | None = None
+    ) -> list[PersistedEvent]:
         self._enter("list_events")
-        return list(self.events.get(run_id, []))
+        rows = [e for e in self.events.get(run_id, []) if after_id is None or e.id > after_id]
+        return rows if limit is None else rows[:limit]
 
     # -- approvals ------------------------------------------------------------
 
     async def claim_approval(
-        self, run_id: UUID, approved: bool, *, owner: str, ttl_seconds: float
+        self,
+        run_id: UUID,
+        approved: bool,
+        *,
+        owner: str,
+        ttl_seconds: float,
+        decided_by: str | None,
     ) -> ApprovalClaim | None:
         self._enter("claim_approval")
         current = self.runs.get(run_id)
@@ -275,7 +323,9 @@ class InMemoryRunRepository:
             return ApprovalClaim(
                 claimed=False, status=current.status, existing=self.approvals.get(run_id)
             )
-        decision = ApprovalDecision(approved=approved, decided_at=self.clock())
+        decision = ApprovalDecision(
+            approved=approved, decided_at=self.clock(), decided_by=decided_by
+        )
         generation = current.lease_generation + 1
         self._store(
             current.model_copy(
@@ -290,7 +340,14 @@ class InMemoryRunRepository:
         )
         self.approvals[run_id] = decision
         self._append(
-            run_id, [RunEvent(kind=RunEventKind.APPROVAL_RECORDED, payload={"approved": approved})]
+            run_id,
+            [
+                RunEvent(
+                    kind=RunEventKind.APPROVAL_RECORDED,
+                    payload={"approved": approved},
+                    actor_subject=decided_by,
+                )
+            ],
         )
         return ApprovalClaim(
             claimed=True,

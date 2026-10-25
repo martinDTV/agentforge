@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 import app.infrastructure.db.models  # noqa: F401  (registers every table on Base.metadata)
 from app.infrastructure.db.base import Base
-from app.settings import get_settings
+from app.settings import get_database_settings
 
 config = context.config
 if config.config_file_name is not None:
@@ -28,7 +28,7 @@ def _database_url() -> str:
     override = config.get_main_option("sqlalchemy.url")
     if override:
         return override
-    return get_settings().database_url.get_secret_value()
+    return get_database_settings().database_url.get_secret_value()
 
 
 def run_migrations_offline() -> None:

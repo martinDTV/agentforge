@@ -15,9 +15,17 @@ from app.orchestration.exceptions import RunAlreadyDecidedError, RunNotFoundErro
 from app.orchestration.graph import build_graph
 from app.orchestration.limits import RunLimits
 from app.orchestration.runs import RunService
+from app.security import AuthorizationPolicy
+from app.security.tokens import DisabledAuthentication
 
 T = TypeVar("T", bound=BaseModel)
 TASK = "Diseña un módulo de pacientes con pruebas"
+
+# Local administrator of the unit suite: explicit, not implicit (see test_api_authz).
+ADMIN = DisabledAuthentication().principal()
+# Local semantics for the unit suite: the single developer may approve their own run.
+LENIENT = AuthorizationPolicy(separation_of_duties=False)
+
 
 pytestmark = pytest.mark.anyio
 
@@ -25,7 +33,11 @@ pytestmark = pytest.mark.anyio
 def make_service(
     llm: object, limits: RunLimits | None = None, repository: InMemoryRunRepository | None = None
 ) -> RunService:
-    return RunService(build_graph(llm, limits), repository or InMemoryRunRepository())  # type: ignore[arg-type]
+    return RunService(
+        build_graph(llm, limits),  # type: ignore[arg-type]
+        repository or InMemoryRunRepository(),
+        authorization=LENIENT,
+    )
 
 
 class GatedLLM:
@@ -45,10 +57,10 @@ class GatedLLM:
 
 async def test_create_get_and_approve_roundtrip(fake_llm: FakeLLMAdapter):
     service = make_service(fake_llm)
-    created = (await service.create(TASK)).response
+    created = (await service.create(TASK, ADMIN)).response
     assert created.status == "waiting_approval"
-    assert (await service.get(created.run_id)) == created
-    approved = await service.approve(created.run_id, True)
+    assert (await service.get(created.run_id, ADMIN)) == created
+    approved = await service.approve(created.run_id, True, ADMIN)
     assert approved.status == "approved"
     assert service.active_run_ids == frozenset()
     assert await service.wait_until_idle(0.01) is True
@@ -58,20 +70,20 @@ async def test_unknown_or_malformed_run_ids_raise_not_found(fake_llm: FakeLLMAda
     service = make_service(fake_llm)
     for run_id in ("missing", str(uuid.uuid4())):
         with pytest.raises(RunNotFoundError):
-            await service.get(run_id)
+            await service.get(run_id, ADMIN)
         with pytest.raises(RunNotFoundError):
-            await service.approve(run_id, True)
+            await service.approve(run_id, True, ADMIN)
 
 
 async def test_run_reads_as_running_while_this_process_drives_it(fake_llm: FakeLLMAdapter):
     gated = GatedLLM(fake_llm)
     service = make_service(gated)
     run_id = str(uuid.uuid4())
-    pending = asyncio.create_task(service.create(TASK, run_id=run_id))
+    pending = asyncio.create_task(service.create(TASK, ADMIN, run_id=run_id))
     await asyncio.to_thread(gated.entered.wait, 10)
 
     assert service.active_run_ids == frozenset({run_id})
-    assert (await service.get(run_id)).status == "running"
+    assert (await service.get(run_id, ADMIN)).status == "running"
     assert await service.wait_until_idle(0.05) is False
 
     gated.release.set()
@@ -84,13 +96,13 @@ async def test_run_reads_as_running_while_this_process_drives_it(fake_llm: FakeL
 async def test_concurrent_approvals_apply_one_decision(fake_llm: FakeLLMAdapter):
     repository = InMemoryRunRepository()
     service = make_service(fake_llm, repository=repository)
-    run_id = (await service.create(TASK)).response.run_id
+    run_id = (await service.create(TASK, ADMIN)).response.run_id
     calls_before = len(fake_llm.calls)
 
     outcomes = await asyncio.gather(
-        service.approve(run_id, True),
-        service.approve(run_id, False),
-        service.approve(run_id, True),
+        service.approve(run_id, True, ADMIN),
+        service.approve(run_id, False, ADMIN),
+        service.approve(run_id, True, ADMIN),
         return_exceptions=True,
     )
 
@@ -107,7 +119,7 @@ async def test_the_llm_runs_off_the_event_loop(fake_llm: FakeLLMAdapter):
     """A blocking LLM call must not stall other coroutines (sync nodes run in a thread)."""
     gated = GatedLLM(fake_llm)
     service = make_service(gated)
-    pending = asyncio.create_task(service.create(TASK, run_id=str(uuid.uuid4())))
+    pending = asyncio.create_task(service.create(TASK, ADMIN, run_id=str(uuid.uuid4())))
     await asyncio.to_thread(gated.entered.wait, 10)
     ticks = 0
     for _ in range(5):
@@ -121,5 +133,8 @@ async def test_the_llm_runs_off_the_event_loop(fake_llm: FakeLLMAdapter):
 def test_graph_and_repository_are_exposed_read_only(fake_llm: FakeLLMAdapter):
     graph = build_graph(fake_llm)
     repository = InMemoryRunRepository()
-    service = RunService(graph, repository)
+    service = RunService(graph, repository, authorization=LENIENT)
     assert service.graph is graph and service.repository is repository
+    assert (
+        RunService(graph, repository).authorization.separation_of_duties is True
+    )  # strict by default

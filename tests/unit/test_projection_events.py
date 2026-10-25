@@ -45,6 +45,8 @@ def test_projection_differs_detects_checkpoint_drift_only_when_present():
         id=uuid4(),
         task="t",
         status=S.WAITING_APPROVAL,
+        owner_subject="alice",
+        project_id="alpha",
         last_checkpoint_id="cp-1",
         created_at=now,
         updated_at=now,
@@ -116,7 +118,14 @@ def test_transition_events_cover_what_the_stream_cannot_report():
 
     def row(status: RunLifecycleStatus, **extra: object) -> PersistedRun:
         return PersistedRun(
-            id=uuid4(), task="t", status=status, created_at=now, updated_at=now, **extra
+            id=uuid4(),
+            task="t",
+            status=status,
+            owner_subject="a",
+            project_id="p",
+            created_at=now,
+            updated_at=now,
+            **extra,
         )  # type: ignore[arg-type]
 
     assert transition_events(S.RUNNING, row(S.RUNNING)) == []

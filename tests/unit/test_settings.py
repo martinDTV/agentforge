@@ -3,7 +3,7 @@ import os
 import pytest
 from pydantic import ValidationError
 
-from app.settings import Settings
+from app.settings import DatabaseSettings, Settings
 
 DB_URL = "postgresql+psycopg://user:s3cret@localhost:5432/agentforge"
 _PREFIXES = (
@@ -19,6 +19,8 @@ _PREFIXES = (
     "SHUTDOWN_",
     "RUN_",
     "RECOVERY_",
+    "AUTH_",
+    "OIDC_",
 )
 
 
@@ -34,9 +36,18 @@ def make(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "anthropic_vertex_project_id": "test-project",
         "database_url": DB_URL,
+        "auth_mode": "disabled",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)  # type: ignore[arg-type]
+
+
+OIDC = {
+    "auth_mode": "oidc",
+    "oidc_issuer": "https://issuer.example",
+    "oidc_audience": "agentforge",
+    "oidc_jwks_url": "https://issuer.example/.well-known/jwks.json",
+}
 
 
 def test_defaults_are_sane():
@@ -139,7 +150,8 @@ def test_database_password_is_not_leaked_by_repr():
 def test_database_ssl_is_derived_from_environment_unless_explicit(
     environment: str, explicit: bool | None, expected: bool
 ):
-    settings = make(environment=environment, database_ssl_required=explicit)
+    auth = OIDC if environment in ("staging", "production") else {}
+    settings = make(environment=environment, database_ssl_required=explicit, **auth)
     assert settings.database_ssl is expected
     assert settings.is_production_like is (environment in ("staging", "production"))
 
@@ -167,3 +179,51 @@ def test_recovery_defaults_are_conservative():
     assert settings.recovery_auto_resume is False
     assert settings.run_lease_ttl_seconds >= 3 * (settings.run_heartbeat_seconds or 0)
     assert settings.max_run_attempts >= 1
+
+
+def test_oidc_is_the_default_and_needs_issuer_audience_and_one_key_source():
+    with pytest.raises(ValidationError, match="OIDC_ISSUER, OIDC_AUDIENCE"):
+        make(auth_mode="oidc")
+    with pytest.raises(ValidationError, match="exactamente una fuente"):
+        make(**{**OIDC, "oidc_jwks_url": None})
+    with pytest.raises(ValidationError, match="exactamente una fuente"):
+        make(**OIDC, oidc_jwks_file="/tmp/jwks.json")
+    settings = make(**OIDC)
+    assert settings.auth_mode == "oidc" and settings.oidc_algorithms == ["RS256", "ES256"]
+    assert Settings.model_fields["auth_mode"].default == "oidc"
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+def test_production_refuses_disabled_auth_and_static_jwks(environment: str):
+    with pytest.raises(ValidationError, match="prohibido en staging y production"):
+        make(environment=environment, auth_mode="disabled", database_ssl_required=False)
+    with pytest.raises(ValidationError, match="OIDC_JWKS_FILE solo se admite"):
+        make(
+            environment=environment,
+            database_ssl_required=False,
+            **{**OIDC, "oidc_jwks_url": None, "oidc_jwks_file": "/tmp/jwks.json"},
+        )
+    assert make(environment=environment, database_ssl_required=False, **OIDC).auth_mode == "oidc"
+
+
+@pytest.mark.parametrize("algorithms", [["HS256"], ["RS256", "none"], []])
+def test_only_asymmetric_algorithms_are_allowed(algorithms: list[str]):
+    with pytest.raises(ValidationError, match="asim"):
+        make(**OIDC, oidc_algorithms=algorithms)
+
+
+def test_local_static_jwks_is_allowed_and_leeway_is_bounded():
+    settings = make(**{**OIDC, "oidc_jwks_url": None, "oidc_jwks_file": "/tmp/jwks.json"})
+    assert str(settings.oidc_jwks_file) == "/tmp/jwks.json"
+    with pytest.raises(ValidationError):
+        make(**OIDC, oidc_leeway_seconds=600)
+
+
+def test_database_settings_need_neither_llm_nor_authentication():
+    """What `alembic upgrade head` and the checkpoint setup read."""
+    deploy = DatabaseSettings(_env_file=None, database_url=DB_URL)  # type: ignore[call-arg]
+    assert deploy.database_dsn.get_secret_value().startswith("postgresql://")
+    assert deploy.database_ssl is False and deploy.checkpoint_pool_size >= 1
+    with pytest.raises(ValidationError, match="database_url"):
+        DatabaseSettings(_env_file=None)  # type: ignore[call-arg]
+    assert not hasattr(deploy, "oidc_issuer") and not hasattr(deploy, "anthropic_vertex_project_id")

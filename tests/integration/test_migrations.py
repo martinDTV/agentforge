@@ -22,7 +22,7 @@ def test_upgrade_head_on_a_clean_database_creates_the_business_schema(empty_data
         assert set(inspector.get_table_names()) == BUSINESS_TABLES | {"alembic_version"}
         with engine.connect() as conn:
             version = conn.scalar(text("SELECT version_num FROM alembic_version"))
-        assert version == expected_head_revision() == "0002"
+        assert version == expected_head_revision() == "0003"
     finally:
         engine.dispose()
 
@@ -72,8 +72,9 @@ def test_migrated_schema_has_the_designed_constraints(migrated_database_url: str
             "ck_runs_attempt_non_negative",
         }
         runs_indexes = {i["name"]: i for i in inspector.get_indexes("runs")}
-        idem = runs_indexes["ix_runs_idempotency_key"]
+        idem = runs_indexes["ix_runs_idempotency_scope"]
         assert idem["unique"] is True
+        assert idem["column_names"] == ["project_id", "owner_subject", "idempotency_key"]
         assert "idempotency_key IS NOT NULL" in str(
             idem.get("dialect_options", {}).get("postgresql_where", "")
         )
@@ -95,7 +96,7 @@ async def test_verify_schema_accepts_head_and_rejects_anything_else(
 ):
     good = create_async_engine(migrated_database_url)
     try:
-        assert await verify_schema(good) == "0002"
+        assert await verify_schema(good) == "0003"
     finally:
         await good.dispose()
 
@@ -112,6 +113,6 @@ async def test_verify_schema_accepts_head_and_rejects_anything_else(
     try:
         with pytest.raises(SchemaMismatchError) as wrong:
             await verify_schema(stale)
-        assert (wrong.value.current, wrong.value.expected) == ("9999", "0002")
+        assert (wrong.value.current, wrong.value.expected) == ("9999", "0003")
     finally:
         await stale.dispose()

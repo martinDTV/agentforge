@@ -10,6 +10,10 @@ Antes de implementar o modificar cualquier componente de FastAPI (routers, schem
 - Toda desviación intencional respecto a la skill debe documentarse como ADR en `docs/adr/`.
 - Ver `docs/adr/0001-layout-por-capa-tecnica.md` para la decisión sobre por qué `app/` está organizado por capa técnica (`agents/`, `contracts/`, `infrastructure/`, `orchestration/`, `api/`) y no por módulo de negocio. Ver `docs/adr/0002-politica-de-errores-reintentos-y-presupuesto-llm.md` para la política de errores LLM, reintentos y presupuesto por run.
 
+## Seguridad
+
+`app/security/` no importa FastAPI: ahí viven `Principal`, la verificación de tokens y la política de autorización; `app/api/security.py` solo las adapta a dependencias. Los servicios reciben el principal como argumento. `AUTH_MODE=disabled` y `OIDC_JWKS_FILE` existen solo para local y pruebas y Settings los rechaza en staging/production. Nunca registrar tokens ni correos: en logs y auditoría se usa el sujeto opaco. Ver `docs/adr/0005-identidad-y-autorizacion.md`.
+
 ## Proveedor LLM
 
 Claude vía Vertex AI (`AnthropicVertex`) es el proveedor principal. No cambiar de proveedor sin autorización explícita. Los agentes dependen de `LLMPort` (Protocol), nunca instancian `VertexClaudeAdapter` directamente — reciben el adaptador por inyección.

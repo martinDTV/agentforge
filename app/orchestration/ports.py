@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.contracts.execution import RunError
 from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus
+from app.security import AccessScope
 
 
 class LeaseToken(BaseModel):
@@ -38,6 +39,8 @@ class PersistedRun(BaseModel):
     id: UUID
     task: str
     status: RunLifecycleStatus
+    owner_subject: str
+    project_id: str
     revision: int = 0
     llm_calls: int = 0
     architect_approved: bool | None = None
@@ -104,6 +107,8 @@ class RunEvent(BaseModel):
     ordinal: int = Field(default=0, ge=0)
     payload: dict[str, Any] = Field(default_factory=dict)
     checkpoint_id: str | None = None
+    # Human/service principal behind the event; None for agent and system events.
+    actor_subject: str | None = None
 
 
 class PersistedEvent(RunEvent):
@@ -117,6 +122,7 @@ class ApprovalDecision(BaseModel):
     approved: bool
     decided_at: datetime
     applied_at: datetime | None = None
+    decided_by: str | None = None  # None only for pre-authentication approvals
 
 
 class ApprovalClaim(BaseModel):
@@ -130,6 +136,15 @@ class ApprovalClaim(BaseModel):
     lease: LeaseToken | None = None
 
 
+class RunCursor(BaseModel):
+    """Keyset position in the runs listing (newest first)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    created_at: datetime
+    id: UUID
+
+
 class RunRepository(Protocol):
     # -- rows -----------------------------------------------------------------
 
@@ -140,17 +155,34 @@ class RunRepository(Protocol):
         *,
         owner: str,
         ttl_seconds: float,
+        owner_subject: str,
+        project_id: str,
         idempotency_key: str | None = None,
     ) -> CreateOutcome:
         """Insert the row in ``running`` holding a fresh lease, plus ``run_created``.
 
-        With an ``idempotency_key`` the insert is atomic against the unique
-        index: a concurrent or earlier request with the same key yields
+        ``owner_subject``/``project_id`` are the principal and project the run
+        belongs to (``owner`` is the lease holder, a process). With an
+        ``idempotency_key`` the insert is atomic against the unique index over
+        (project, owner_subject, key): a concurrent or earlier request with the
+        same key *by the same principal in the same project* yields
         ``created=False`` and the existing row (the caller compares the task).
         """
         ...
 
     async def get_run(self, run_id: UUID) -> PersistedRun | None: ...
+
+    async def list_runs(
+        self,
+        *,
+        scope: AccessScope,
+        status: RunLifecycleStatus | None = None,
+        owner_subject: str | None = None,
+        before: RunCursor | None = None,
+        limit: int,
+    ) -> list[PersistedRun]:
+        """Newest first, keyset-paginated, always filtered by ``scope``."""
+        ...
 
     async def project(
         self,
@@ -198,6 +230,7 @@ class RunRepository(Protocol):
         ttl_seconds: float,
         statuses: frozenset[RunLifecycleStatus],
         limit: int,
+        projects: frozenset[str] | None = None,
     ) -> list[tuple[PersistedRun, LeaseToken]]:
         """Recovery: atomically take over runs whose lease is free or expired
         (``FOR UPDATE SKIP LOCKED``), so concurrent sweepers never share one."""
@@ -209,17 +242,27 @@ class RunRepository(Protocol):
         """Insert events, ignoring duplicates; returns how many were new."""
         ...
 
-    async def list_events(self, run_id: UUID) -> list[PersistedEvent]: ...
+    async def list_events(
+        self, run_id: UUID, *, after_id: int | None = None, limit: int | None = None
+    ) -> list[PersistedEvent]:
+        """Oldest first; ``after_id`` and ``limit`` give keyset pages."""
+        ...
 
     # -- approvals ------------------------------------------------------------
 
     async def claim_approval(
-        self, run_id: UUID, approved: bool, *, owner: str, ttl_seconds: float
+        self,
+        run_id: UUID,
+        approved: bool,
+        *,
+        owner: str,
+        ttl_seconds: float,
+        decided_by: str | None,
     ) -> ApprovalClaim | None:
-        """One transaction: CAS to ``resume_pending``, record the decision, take
-        the lease for applying it, emit the event. ``None`` when the run does
-        not exist; ``claimed=False`` carries the current status and any
-        decision already recorded."""
+        """One transaction: CAS to ``resume_pending``, record the decision and
+        who made it, take the lease for applying it, emit the event. ``None``
+        when the run does not exist; ``claimed=False`` carries the current
+        status and any decision already recorded."""
         ...
 
     async def get_approval(self, run_id: UUID) -> ApprovalDecision | None: ...

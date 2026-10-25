@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from app.api import api_router, health
 from app.api.errors import register_exception_handlers
+from app.api.headers import SecurityHeadersMiddleware
 from app.infrastructure.checkpoints import PostgresCheckpointer
 from app.infrastructure.db import (
     Database,
@@ -23,6 +24,8 @@ from app.orchestration.policy import RecoveryPolicy
 from app.orchestration.ports import RunRepository
 from app.orchestration.recovery import RecoveryService
 from app.orchestration.runs import RunService
+from app.security import AuthorizationPolicy, JwtVerifier, TokenVerifier
+from app.security.tokens import DisabledAuthentication
 from app.settings import get_environment, get_settings
 
 logger = logging.getLogger(__name__)
@@ -71,6 +74,8 @@ def create_app(
     checkpoints: PostgresCheckpointer | None = None,
     repository: RunRepository | None = None,
     policy: RecoveryPolicy | None = None,
+    token_verifier: TokenVerifier | None = None,
+    authorization: AuthorizationPolicy | None = None,
     *,
     docs_enabled: bool | None = None,
     shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
@@ -87,20 +92,36 @@ def create_app(
     through ``SqlAlchemyRunRepository``. Unit tests pass neither: the graph
     then checkpoints in memory, runs live in ``InMemoryRunRepository`` and
     Settings are never read. Recovery sweeps are opt-in outside production.
+
+    Authentication: production builds the verifier from Settings (OIDC, or
+    ``AUTH_MODE=disabled`` where Settings allow it). Tests inject a
+    ``TokenVerifier``; when they inject none, authentication is disabled
+    for that app, which is only possible because it never runs in production.
     """
     production = llm is None
+    production_like = production and get_environment().is_production_like
     if docs_enabled is None:
         # Only the environment is read here; full Settings are validated in lifespan.
-        docs_enabled = not production or not get_environment().is_production_like
+        docs_enabled = not production_like
     run_startup_sweep = production if startup_sweep is None else startup_sweep
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         port, run_limits, db, cp, run_policy = llm, limits, database, checkpoints, policy
+        verifier: TokenVerifier | None = token_verifier
+        authz: AuthorizationPolicy | None = authorization
         grace, sweep_every = shutdown_grace_seconds, recovery_sweep_seconds
         if port is None:
             settings = get_settings()
             port = build_llm(settings)
+            if verifier is None:
+                verifier = (
+                    JwtVerifier.from_settings(settings)
+                    if settings.auth_mode == "oidc"
+                    else DisabledAuthentication()
+                )
+            if authz is None:
+                authz = AuthorizationPolicy(separation_of_duties=settings.separation_of_duties)
             run_limits = run_limits or RunLimits(
                 max_revisions=settings.max_plan_revisions,
                 max_llm_calls=settings.max_llm_calls_per_run,
@@ -122,11 +143,16 @@ def create_app(
             build_graph(port, run_limits or RunLimits(), checkpointer=saver),
             repo,
             run_policy or RecoveryPolicy(),
+            # Outside production (tests) the local default allows self-approval,
+            # matching a single developer; production derives it from Settings.
+            authorization=authz or AuthorizationPolicy(separation_of_duties=False),
         )
         recovery = RecoveryService(service)
         app.state.run_service = service
         app.state.repository = repo
         app.state.recovery = recovery
+        app.state.token_verifier = verifier or DisabledAuthentication()
+        app.state.authorization = service.authorization
         app.state.database = db
         app.state.checkpoints = cp
         app.state.schema_verified = False
@@ -166,7 +192,7 @@ def create_app(
 
     app = FastAPI(
         title="AgentForge",
-        version="0.3.0",
+        version="0.4.0",
         lifespan=lifespan,
         docs_url="/docs" if docs_enabled else None,
         redoc_url="/redoc" if docs_enabled else None,
@@ -175,6 +201,8 @@ def create_app(
     register_exception_handlers(app)
     app.include_router(api_router)
     app.include_router(health.router)
+    # Outermost: applies to every response, including Problem Details and docs.
+    app.add_middleware(SecurityHeadersMiddleware, hsts=production_like)
     return app
 
 

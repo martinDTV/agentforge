@@ -23,6 +23,7 @@ from app.infrastructure.db import Database, SqlAlchemyRunRepository
 from app.infrastructure.llm.fake import FakeLLMAdapter
 from app.orchestration.graph import build_graph, build_state_graph
 from app.orchestration.runs import RunService
+from app.security.tokens import DisabledAuthentication
 from tests.integration.conftest import (
     CHECKPOINTS_APP_NAME as APP_NAME,
 )
@@ -171,7 +172,12 @@ def halt_after_planner(url: str, llm: FakeLLMAdapter, run_id: str) -> None:
         try:
             repository = SqlAlchemyRunRepository(database.session_factory)
             await repository.create_run(
-                uuid.UUID(run_id), TASK["task"], owner="dead-process", ttl_seconds=0.001
+                uuid.UUID(run_id),
+                TASK["task"],
+                owner="dead-process",
+                ttl_seconds=0.001,
+                owner_subject="local-dev",
+                project_id="default",
             )
             halted = build_state_graph(llm).compile(checkpointer=saver, interrupt_after=["planner"])
             await halted.ainvoke(TASK, {"configurable": {"thread_id": run_id}})
@@ -217,9 +223,10 @@ def test_recovery_continues_from_the_last_checkpoint_without_repeating_the_plann
         try:
             repository = SqlAlchemyRunRepository(database.session_factory)
             service = RunService(build_graph(fake_llm, checkpointer=saver), repository)
-            assert (await service.get(run_id)).status == "interrupted"
+            principal = DisabledAuthentication().principal()
+            assert (await service.get(run_id, principal)).status == "interrupted"
             await service.graph.ainvoke(None, {"configurable": {"thread_id": run_id}})
-            return str((await service.get(run_id)).status)
+            return str((await service.get(run_id, principal)).status)
         finally:
             await checkpointer.close()
             await database.dispose()

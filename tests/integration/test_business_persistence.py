@@ -222,7 +222,12 @@ def test_reconciliation_after_a_crash_between_checkpoint_and_projection(
         try:
             repository = SqlAlchemyRunRepository(database.session_factory)
             await repository.create_run(
-                uuid.UUID(run_id), TASK["task"], owner="dead-process", ttl_seconds=0.001
+                uuid.UUID(run_id),
+                TASK["task"],
+                owner="dead-process",
+                ttl_seconds=0.001,
+                owner_subject="local-dev",
+                project_id="default",
             )
             # Graph completes and checkpoints; the projection never happens.
             await build_graph(fake_llm, checkpointer=saver).ainvoke(

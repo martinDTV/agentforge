@@ -25,13 +25,23 @@ from app.orchestration.exceptions import (
     LeaseLostError,
     RunAlreadyDecidedError,
     RunNotFoundError,
+    RunNotResumableError,
     ShuttingDownError,
 )
 from app.orchestration.graph import RunGraph
 from app.orchestration.policy import RecoveryPolicy, new_owner_id
-from app.orchestration.ports import LeaseToken, PersistedRun, RunEvent, RunProjection, RunRepository
+from app.orchestration.ports import (
+    LeaseToken,
+    PersistedEvent,
+    PersistedRun,
+    RunCursor,
+    RunEvent,
+    RunProjection,
+    RunRepository,
+)
 from app.orchestration.projection import build_projection, projection_differs
 from app.orchestration.status import checkpoint_id_of, derive_status, has_pending_interrupt
+from app.security import AuthorizationPolicy, Permission, Principal
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +65,8 @@ def _response(row: PersistedRun) -> RunResponse:
     return RunResponse(
         run_id=str(row.id),
         status=row.status,
+        owner=row.owner_subject,
+        project_id=row.project_id,
         revision=row.revision,
         llm_calls=row.llm_calls,
         architect_approved=row.architect_approved,
@@ -90,6 +102,20 @@ class ShutdownReport(BaseModel):
     leases_released: int
 
 
+class RunListing(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    items: list[PersistedRun]
+    has_more: bool
+
+
+class EventListing(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    items: list[PersistedEvent]
+    has_more: bool
+
+
 class RunService:
     """Use cases over a compiled run graph and a ``RunRepository``.
 
@@ -114,10 +140,14 @@ class RunService:
         policy: RecoveryPolicy | None = None,
         *,
         owner: str | None = None,
+        authorization: AuthorizationPolicy | None = None,
     ) -> None:
         self._graph = graph
         self._repository = repository
         self._policy = policy or RecoveryPolicy()
+        # Deny by default: without an injected policy, separation of duties is
+        # on and nothing is granted beyond what the principal's roles map to.
+        self._authz = authorization or AuthorizationPolicy()
         self._owner = owner or new_owner_id()
         self._drives: dict[str, asyncio.Task[None]] = {}
         self._idle = asyncio.Event()
@@ -138,6 +168,10 @@ class RunService:
     @property
     def policy(self) -> RecoveryPolicy:
         return self._policy
+
+    @property
+    def authorization(self) -> AuthorizationPolicy:
+        return self._authz
 
     @property
     def owner(self) -> str:
@@ -161,9 +195,18 @@ class RunService:
     # -- use cases --------------------------------------------------------------
 
     async def create(
-        self, task: str, run_id: str | None = None, *, idempotency_key: str | None = None
+        self,
+        task: str,
+        principal: Principal,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> CreateResult:
         self._ensure_accepting()
+        # Authorization first: nothing is written until the principal may
+        # create in a project it belongs to (403/400 come from the policy).
+        project = self._authz.resolve_project_for_create(principal, project_id)
         rid = _parse(run_id) if run_id else uuid4()
         # The row (status=running, lease held by us) exists before any LLM work:
         # a crash from here on leaves something to recover, never an orphan.
@@ -172,51 +215,133 @@ class RunService:
             task,
             owner=self._owner,
             ttl_seconds=self._policy.lease_ttl_seconds,
+            owner_subject=principal.subject,
+            project_id=project,
             idempotency_key=idempotency_key,
         )
         if not outcome.created:
-            # Same key: reuse only if it is the same request. The run may still
-            # be in flight (concurrent call) or finished; either way one run.
+            # Same key, same principal, same project: reuse only if it is the
+            # same request. The run may still be in flight or finished.
             if outcome.run.task != task:
                 raise IdempotencyKeyReusedError(idempotency_key or "")
-            return CreateResult(response=await self.get(str(outcome.run.id)), created=False)
+            return CreateResult(
+                response=await self.get(str(outcome.run.id), principal), created=False
+            )
         assert outcome.lease is not None
         async with self._lock(rid):
             await self._drive(rid, {"task": task}, outcome.lease)
-        return CreateResult(response=await self.get(str(rid)), created=True)
+        return CreateResult(response=await self.get(str(rid), principal), created=True)
 
-    async def get(self, run_id: str) -> RunResponse:
+    async def get(self, run_id: str, principal: Principal) -> RunResponse:
         rid = _parse(run_id)
-        row = await self._repository.get_run(rid)
-        if row is None:
-            raise RunNotFoundError(run_id)
+        row = await self._visible_row(rid, principal)
         if row.status not in TERMINAL_STATUSES:
             row = await self._project(rid, row=row)
         return _response(row)
 
-    async def approve(self, run_id: str, approved: bool) -> RunResponse:
+    async def approve(self, run_id: str, approved: bool, principal: Principal) -> RunResponse:
         self._ensure_accepting()
         rid = _parse(run_id)
         async with self._lock(rid):
+            # Authorization before any write: hidden -> 404, not allowed -> 403.
+            row = await self._visible_row(rid, principal)
+            decision = self._authz.decide(principal, Permission.RUNS_APPROVE, row)
+            if not decision.allowed:
+                self._authz.raise_for(decision, run_id=run_id)
             claim = await self._repository.claim_approval(
-                rid, approved, owner=self._owner, ttl_seconds=self._policy.lease_ttl_seconds
+                rid,
+                approved,
+                owner=self._owner,
+                ttl_seconds=self._policy.lease_ttl_seconds,
+                decided_by=principal.subject,
             )
             if claim is None:
                 raise RunNotFoundError(run_id)
             if not claim.claimed:
                 # Same decision again: idempotent replay. Anything else: 409.
                 if claim.existing is not None and claim.existing.approved == approved:
-                    return await self.get(run_id)
+                    return await self.get(run_id, principal)
                 raise RunAlreadyDecidedError(run_id, claim.status)
             assert claim.lease is not None
-            # The decision is durable from this point; applying it may still fail
-            # and be finished later by apply_pending_approval / recovery.
-            await self._apply_approval(rid, approved, claim.lease)
-        return await self.get(run_id)
+            # The decision (and who made it) is durable from this point; applying
+            # it may still fail and be finished later by apply_pending_approval.
+            await self._apply_approval(rid, approved, claim.lease, actor=principal.subject)
+        return await self.get(run_id, principal)
+
+    async def list_runs(
+        self,
+        principal: Principal,
+        *,
+        status: RunLifecycleStatus | None = None,
+        project_id: str | None = None,
+        owner: str | None = None,
+        before: RunCursor | None = None,
+        limit: int,
+    ) -> RunListing:
+        """Runs the principal may see, newest first; the scope is applied on every page."""
+        scope = self._authz.listing_scope(principal).narrowed_to(project_id)
+        rows = await self._repository.list_runs(
+            scope=scope, status=status, owner_subject=owner, before=before, limit=limit + 1
+        )
+        return RunListing(items=rows[:limit], has_more=len(rows) > limit)
+
+    async def list_events(
+        self, run_id: str, principal: Principal, *, after_id: int | None = None, limit: int
+    ) -> EventListing:
+        rid = _parse(run_id)
+        row = await self._visible_row(rid, principal)  # hidden -> 404
+        decision = self._authz.decide(principal, Permission.RUNS_AUDIT_READ, row)
+        if not decision.allowed:
+            self._authz.raise_for(decision, run_id=run_id)
+        rows = await self._repository.list_events(rid, after_id=after_id, limit=limit + 1)
+        return EventListing(items=rows[:limit], has_more=len(rows) > limit)
+
+    async def resume(self, run_id: str, principal: Principal) -> RunResponse:
+        """Manually re-drive an ``interrupted`` run from its last checkpoint.
+
+        Authorization first (hidden -> 404, no ``runs:resume`` -> 403), then the
+        same lease the recovery sweep uses: only one process can win it, and
+        ``MAX_RUN_ATTEMPTS`` still bounds how often a run may be re-driven.
+        """
+        self._ensure_accepting()
+        rid = _parse(run_id)
+        async with self._lock(rid):
+            row = await self._visible_row(rid, principal)
+            decision = self._authz.decide(principal, Permission.RUNS_RESUME, row)
+            if not decision.allowed:
+                self._authz.raise_for(decision, run_id=run_id)
+            if row.status is not _S.INTERRUPTED:
+                raise RunNotResumableError(run_id, f"estado actual '{row.status}'")
+            if row.attempt >= self._policy.max_attempts:
+                raise RunNotResumableError(
+                    run_id, f"agotó sus {self._policy.max_attempts} intentos"
+                )
+            acquired = await self._repository.acquire_lease(
+                rid,
+                owner=self._owner,
+                ttl_seconds=self._policy.lease_ttl_seconds,
+                from_statuses=frozenset({_S.INTERRUPTED}),
+                count_attempt=True,
+            )
+            if acquired is None:
+                raise RunNotResumableError(run_id, "otro proceso la está reanudando")
+            claimed, lease = acquired
+            snapshot = await self._graph.aget_state(_config(rid))
+            await self._redrive(rid, claimed, snapshot, lease, actor=principal.subject)
+        return await self.get(run_id, principal)
+
+    async def _visible_row(self, rid: UUID, principal: Principal) -> PersistedRun:
+        """The row, or RunNotFoundError when it does not exist *or must stay hidden*."""
+        row = await self._repository.get_run(rid)
+        if row is None or not self._authz.can_see(principal, row):
+            raise RunNotFoundError(str(rid))
+        return row
 
     async def apply_pending_approval(self, run_id: str) -> RunResponse:
         """Apply a recorded decision never confirmed as applied (idempotent).
 
+        System path (recovery, operators' tooling): the decision and who made
+        it were authorized when recorded, so no principal is re-checked here.
         Takes the run's lease (only if free or expired) so it never races the
         process that recorded the decision or a concurrent recovery sweep.
         """
@@ -229,23 +354,33 @@ class RunService:
                 from_statuses=frozenset({_S.RESUME_PENDING}),
             )
             if acquired is None:
-                if await self._repository.get_run(rid) is None:
-                    raise RunNotFoundError(run_id)
-                return await self.get(run_id)  # someone holds it, or it moved on
+                return await self._read_unchecked(rid)  # someone holds it, or it moved on
             _, lease = acquired
             decision = await self._repository.get_approval(rid)
             if decision is None or decision.applied_at is not None:
                 await self._repository.release_lease(rid, lease)
-                return await self.get(run_id)
-            await self._apply_approval(rid, decision.approved, lease)
-        return await self.get(run_id)
+                return await self._read_unchecked(rid)
+            await self._apply_approval(rid, decision.approved, lease, actor=decision.decided_by)
+        return await self._read_unchecked(rid)
 
-    async def recover(self, row: PersistedRun, lease: LeaseToken) -> RecoveryOutcome:
+    async def _read_unchecked(self, rid: UUID) -> RunResponse:
+        """Row view without authorization: internal/system callers only."""
+        row = await self._repository.get_run(rid)
+        if row is None:
+            raise RunNotFoundError(str(rid))
+        if row.status not in TERMINAL_STATUSES:
+            row = await self._project(rid, row=row)
+        return _response(row)
+
+    async def recover(
+        self, row: PersistedRun, lease: LeaseToken, *, actor: str | None = None
+    ) -> RecoveryOutcome:
         """Decide what a run whose lease we just took over needs (ADR 0004).
 
         ``row`` is the row as claimed; ``lease`` is the token the caller
         (normally ``RecoveryService``) obtained for it. Every branch ends with
-        the lease released or handed to a drive that releases it.
+        the lease released or handed to a drive that releases it. ``actor`` is
+        the principal behind a manually triggered sweep, for the audit trail.
         """
         rid = row.id
         async with self._lock(rid):
@@ -276,11 +411,29 @@ class RunService:
             attempt = await self._repository.bump_attempt(rid, lease)
             if attempt is None:
                 raise LeaseLostError(str(rid))
-            await self._project_status(rid, snapshot, _S.RUNNING, lease)
-            await self._record(rid, [RunEvent(kind=RunEventKind.RUN_RESUMED, ordinal=attempt)])
-            graph_input: Any = None if has_checkpoint else {"task": row.task}
-            await self._drive(rid, graph_input, lease)
+            await self._redrive(rid, row, snapshot, lease, actor=actor, attempt=attempt)
             return RecoveryOutcome.RESUMED
+
+    async def _redrive(
+        self,
+        rid: UUID,
+        row: PersistedRun,
+        snapshot: StateSnapshot,
+        lease: LeaseToken,
+        *,
+        actor: str | None,
+        attempt: int | None = None,
+    ) -> None:
+        """Continue a run from its last checkpoint under ``lease`` (shared by sweep and resume)."""
+        has_checkpoint = "task" in snapshot.values
+        await self._project_status(rid, snapshot, _S.RUNNING, lease)
+        await self._record(
+            rid,
+            [RunEvent(kind=RunEventKind.RUN_RESUMED, ordinal=attempt or row.attempt)],
+            actor=actor,
+        )
+        graph_input: Any = None if has_checkpoint else {"task": row.task}
+        await self._drive(rid, graph_input, lease)
 
     # -- shutdown ---------------------------------------------------------------
 
@@ -333,7 +486,9 @@ class RunService:
             if not self._drives:
                 self._idle.set()
 
-    async def _drive(self, rid: UUID, graph_input: Any, lease: LeaseToken) -> None:
+    async def _drive(
+        self, rid: UUID, graph_input: Any, lease: LeaseToken, *, actor: str | None = None
+    ) -> None:
         """Run the graph under ``lease`` until it stops, then project and release.
 
         The heartbeat renews the lease off the event loop's critical path (the
@@ -341,7 +496,7 @@ class RunService:
         this process must not keep advancing a run someone else now owns.
         """
         lost = asyncio.Event()
-        stream = asyncio.create_task(self._stream(rid, graph_input))
+        stream = asyncio.create_task(self._stream(rid, graph_input, actor))
         heartbeat = asyncio.create_task(self._heartbeat(rid, lease, lost))
         lost_waiter = asyncio.create_task(lost.wait())
         async with self._driving(rid, stream):
@@ -367,11 +522,13 @@ class RunService:
                     task.cancel()
                 await asyncio.gather(heartbeat, lost_waiter, return_exceptions=True)
 
-    async def _stream(self, rid: UUID, graph_input: Any) -> None:
+    async def _stream(self, rid: UUID, graph_input: Any, actor: str | None = None) -> None:
         revision = 0
         async for update in self._graph.astream(graph_input, _config(rid), stream_mode="updates"):
             revision = revision_from_update(update, revision)
-            await self._record(rid, events_from_update(update, revision=revision))
+            # ``actor`` is set for drives caused by a human decision (resume);
+            # node events of a fresh drive belong to the agents, not to a person.
+            await self._record(rid, events_from_update(update, revision=revision), actor=actor)
 
     async def _heartbeat(self, rid: UUID, lease: LeaseToken, lost: asyncio.Event) -> None:
         loop = asyncio.get_running_loop()
@@ -397,10 +554,12 @@ class RunService:
 
     # -- internals: projecting ---------------------------------------------------
 
-    async def _apply_approval(self, rid: UUID, approved: bool, lease: LeaseToken) -> None:
+    async def _apply_approval(
+        self, rid: UUID, approved: bool, lease: LeaseToken, *, actor: str | None = None
+    ) -> None:
         snapshot = await self._graph.aget_state(_config(rid))
         if has_pending_interrupt(snapshot):
-            await self._drive(rid, Command(resume={"approved": approved}), lease)
+            await self._drive(rid, Command(resume={"approved": approved}), lease, actor=actor)
         else:
             # The resume already happened (crash after it): only the projection is missing.
             await self._project(rid, lease=lease, release=True)
@@ -410,6 +569,7 @@ class RunService:
                 await self._record(
                     rid,
                     [RunEvent(kind=RunEventKind.APPROVAL_APPLIED, payload={"approved": approved})],
+                    actor=actor,
                 )
 
     async def _project(
@@ -522,9 +682,11 @@ class RunService:
                 "Proyección de run %s pendiente (%s); la recuperación la completará", rid, exc
             )
 
-    async def _record(self, rid: UUID, events: list[RunEvent]) -> None:
+    async def _record(self, rid: UUID, events: list[RunEvent], *, actor: str | None = None) -> None:
         if not events:
             return
+        if actor is not None:
+            events = [event.model_copy(update={"actor_subject": actor}) for event in events]
         try:
             await self._repository.append_events(rid, events)
         except DatabaseUnavailableError as exc:

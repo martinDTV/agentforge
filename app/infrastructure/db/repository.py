@@ -18,7 +18,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -33,9 +33,11 @@ from app.orchestration.ports import (
     LeaseToken,
     PersistedEvent,
     PersistedRun,
+    RunCursor,
     RunEvent,
     RunProjection,
 )
+from app.security import AccessScope
 
 from .errors import as_unavailable
 from .models import RunApprovalRecord, RunEventRecord, RunRecord
@@ -58,6 +60,8 @@ def _to_run(record: RunRecord, lease_active: bool) -> PersistedRun:
         id=record.id,
         task=record.task,
         status=record.status,
+        owner_subject=record.owner_subject,
+        project_id=record.project_id,
         revision=record.revision,
         llm_calls=record.llm_calls,
         architect_approved=record.architect_approved,
@@ -80,7 +84,10 @@ def _to_decision(record: RunApprovalRecord | None) -> ApprovalDecision | None:
     if record is None:
         return None
     return ApprovalDecision(
-        approved=record.approved, decided_at=record.decided_at, applied_at=record.applied_at
+        approved=record.approved,
+        decided_at=record.decided_at,
+        applied_at=record.applied_at,
+        decided_by=record.decided_by,
     )
 
 
@@ -124,6 +131,8 @@ class SqlAlchemyRunRepository:
         *,
         owner: str,
         ttl_seconds: float,
+        owner_subject: str,
+        project_id: str,
         idempotency_key: str | None = None,
     ) -> CreateOutcome:
         async with self._tx() as session:
@@ -131,6 +140,8 @@ class SqlAlchemyRunRepository:
                 id=run_id,
                 task=task,
                 status=RunLifecycleStatus.RUNNING,
+                owner_subject=owner_subject,
+                project_id=project_id,
                 idempotency_key=idempotency_key,
                 attempt=1,
                 lease_owner=owner,
@@ -138,9 +149,10 @@ class SqlAlchemyRunRepository:
                 lease_generation=1,
             )
             if idempotency_key is not None:
-                # Atomic against the partial unique index: no check-then-insert race.
+                # Atomic against the partial unique index over (project, principal,
+                # key): no check-then-insert race, and no cross-principal reuse.
                 stmt = stmt.on_conflict_do_nothing(
-                    index_elements=["idempotency_key"],
+                    index_elements=["project_id", "owner_subject", "idempotency_key"],
                     index_where=text("idempotency_key IS NOT NULL"),
                 )
             try:
@@ -153,14 +165,23 @@ class SqlAlchemyRunRepository:
                 existing = (
                     await session.execute(
                         select(RunRecord, _LEASE_ACTIVE).where(
-                            RunRecord.idempotency_key == idempotency_key
+                            RunRecord.project_id == project_id,
+                            RunRecord.owner_subject == owner_subject,
+                            RunRecord.idempotency_key == idempotency_key,
                         )
                     )
                 ).first()
                 if existing is None:  # pragma: no cover - only if the row vanished meanwhile
                     raise RunAlreadyExistsError(str(run_id))
                 return CreateOutcome(run=_to_run(existing[0], bool(existing[1])), created=False)
-            session.add(RunEventRecord(run_id=run_id, kind=RunEventKind.RUN_CREATED, payload={}))
+            session.add(
+                RunEventRecord(
+                    run_id=run_id,
+                    kind=RunEventKind.RUN_CREATED,
+                    payload={},
+                    actor_subject=owner_subject,
+                )
+            )
             await session.flush()
             run = await self._load(session, run_id)
             assert run is not None
@@ -169,6 +190,41 @@ class SqlAlchemyRunRepository:
     async def get_run(self, run_id: UUID) -> PersistedRun | None:
         async with self._tx() as session:
             return await self._load(session, run_id)
+
+    async def list_runs(
+        self,
+        *,
+        scope: AccessScope,
+        status: RunLifecycleStatus | None = None,
+        owner_subject: str | None = None,
+        before: RunCursor | None = None,
+        limit: int,
+    ) -> list[PersistedRun]:
+        if scope.is_empty:
+            return []
+        conditions: list[Any] = []
+        if scope.projects is not None:
+            conditions.append(RunRecord.project_id.in_(sorted(scope.projects)))
+        if scope.owner_only is not None:
+            conditions.append(RunRecord.owner_subject == scope.owner_only)
+        if owner_subject is not None:
+            conditions.append(RunRecord.owner_subject == owner_subject)
+        if status is not None:
+            conditions.append(RunRecord.status == status)
+        if before is not None:
+            # Keyset on (created_at, id) descending: strictly older than the cursor.
+            conditions.append(
+                tuple_(RunRecord.created_at, RunRecord.id) < tuple_(before.created_at, before.id)
+            )
+        stmt = (
+            select(RunRecord, _LEASE_ACTIVE.label("lease_active"))
+            .where(*conditions)
+            .order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
+            .limit(limit)
+        )
+        async with self._tx() as session:
+            rows = (await session.execute(stmt)).all()
+            return [_to_run(row[0], bool(row[1])) for row in rows]
 
     async def project(
         self,
@@ -303,10 +359,16 @@ class SqlAlchemyRunRepository:
         ttl_seconds: float,
         statuses: frozenset[RunLifecycleStatus],
         limit: int,
+        projects: frozenset[str] | None = None,
     ) -> list[tuple[PersistedRun, LeaseToken]]:
+        if projects is not None and not projects:
+            return []
+        scope_conditions: list[Any] = [RunRecord.status.in_(list(statuses)), _LEASE_FREE]
+        if projects is not None:
+            scope_conditions.append(RunRecord.project_id.in_(sorted(projects)))
         candidates = (
             select(RunRecord.id)
-            .where(RunRecord.status.in_(list(statuses)), _LEASE_FREE)
+            .where(*scope_conditions)
             .order_by(RunRecord.updated_at)
             .limit(limit)
             .with_for_update(skip_locked=True)
@@ -349,6 +411,7 @@ class SqlAlchemyRunRepository:
                             "ordinal": event.ordinal,
                             "payload": event.payload,
                             "checkpoint_id": event.checkpoint_id,
+                            "actor_subject": event.actor_subject,
                         }
                         for event in events
                     ]
@@ -361,13 +424,17 @@ class SqlAlchemyRunRepository:
             inserted = (await session.execute(stmt)).scalars().all()
             return len(inserted)
 
-    async def list_events(self, run_id: UUID) -> list[PersistedEvent]:
+    async def list_events(
+        self, run_id: UUID, *, after_id: int | None = None, limit: int | None = None
+    ) -> list[PersistedEvent]:
+        stmt = select(RunEventRecord).where(RunEventRecord.run_id == run_id)
+        if after_id is not None:
+            stmt = stmt.where(RunEventRecord.id > after_id)
+        stmt = stmt.order_by(RunEventRecord.id)
+        if limit is not None:
+            stmt = stmt.limit(limit)
         async with self._tx() as session:
-            records = await session.scalars(
-                select(RunEventRecord)
-                .where(RunEventRecord.run_id == run_id)
-                .order_by(RunEventRecord.id)
-            )
+            records = await session.scalars(stmt)
             return [
                 PersistedEvent(
                     id=r.id,
@@ -375,6 +442,7 @@ class SqlAlchemyRunRepository:
                     ordinal=r.ordinal,
                     payload=r.payload,
                     checkpoint_id=r.checkpoint_id,
+                    actor_subject=r.actor_subject,
                     created_at=r.created_at,
                 )
                 for r in records
@@ -383,7 +451,13 @@ class SqlAlchemyRunRepository:
     # -- approvals ------------------------------------------------------------
 
     async def claim_approval(
-        self, run_id: UUID, approved: bool, *, owner: str, ttl_seconds: float
+        self,
+        run_id: UUID,
+        approved: bool,
+        *,
+        owner: str,
+        ttl_seconds: float,
+        decided_by: str | None,
     ) -> ApprovalClaim | None:
         async with self._tx() as session:
             generation = (
@@ -414,13 +488,14 @@ class SqlAlchemyRunRepository:
                 return ApprovalClaim(
                     claimed=False, status=record.status, existing=_to_decision(existing)
                 )
-            approval = RunApprovalRecord(run_id=run_id, approved=approved)
+            approval = RunApprovalRecord(run_id=run_id, approved=approved, decided_by=decided_by)
             session.add(approval)
             session.add(
                 RunEventRecord(
                     run_id=run_id,
                     kind=RunEventKind.APPROVAL_RECORDED,
                     payload={"approved": approved},
+                    actor_subject=decided_by,
                 )
             )
             await session.flush()

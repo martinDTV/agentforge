@@ -28,6 +28,9 @@ from app.infrastructure.db.schema import alembic_config
 from app.main import create_app
 from app.orchestration.limits import RunLimits
 from app.orchestration.policy import RecoveryPolicy
+from app.security import AuthorizationPolicy, JwtVerifier, VerificationRules
+from app.security.dev_keys import DevIssuer
+from app.security.tokens import StaticKeys
 from app.settings import LIBPQ_SCHEME, SQLALCHEMY_SCHEME
 
 DEFAULT_ADMIN_URL = "postgresql+psycopg://localhost:5432/postgres"
@@ -194,6 +197,8 @@ def make_app(
     startup_sweep: bool = False,
     recovery_sweep_seconds: float = 0,
     shutdown_grace_seconds: float = 30.0,
+    issuer: DevIssuer | None = None,
+    authorization: AuthorizationPolicy | None = None,
 ) -> Any:
     """Fully persistent app: SQLAlchemy repository + Postgres checkpointer on ``url``.
 
@@ -203,12 +208,22 @@ def make_app(
     checkpoints = PostgresCheckpointer(
         libpq_dsn(url), serde=build_serializer(key), application_name=CHECKPOINTS_APP_NAME
     )
+    verifier = (
+        JwtVerifier(
+            StaticKeys(issuer.jwks),
+            VerificationRules(issuer=issuer.issuer, audience=issuer.audience),
+        )
+        if issuer is not None
+        else None
+    )
     return create_app(
         llm,
         RunLimits(),
         database=Database(url),
         checkpoints=checkpoints,
         policy=policy,
+        token_verifier=verifier,
+        authorization=authorization,
         startup_sweep=startup_sweep,
         recovery_sweep_seconds=recovery_sweep_seconds,
         shutdown_grace_seconds=shutdown_grace_seconds,

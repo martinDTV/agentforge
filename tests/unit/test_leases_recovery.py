@@ -22,12 +22,18 @@ from app.orchestration.policy import RecoveryPolicy
 from app.orchestration.ports import RunProjection
 from app.orchestration.recovery import RecoveryService
 from app.orchestration.runs import RunService
+from app.security import AuthorizationPolicy
+from app.security.tokens import DisabledAuthentication
 
 T = TypeVar("T", bound=BaseModel)
 S = RunLifecycleStatus
 TASK = "Diseña un módulo de pacientes con pruebas"
 FAST = RecoveryPolicy(lease_ttl_seconds=0.9, heartbeat_seconds=0.15)
 pytestmark = pytest.mark.anyio
+
+# Local administrator of the unit suite: explicit, not implicit (see test_api_authz).
+ADMIN = DisabledAuthentication().principal()
+LENIENT = AuthorizationPolicy(separation_of_duties=False)
 
 
 def cfg(run_id: uuid.UUID) -> dict[str, Any]:
@@ -58,7 +64,9 @@ def make(
     owner: str = "proc-a",
 ) -> tuple[RunService, InMemoryRunRepository]:
     repo = repository or InMemoryRunRepository()
-    return RunService(build_graph(llm), repo, policy or FAST, owner=owner), repo
+    return RunService(
+        build_graph(llm), repo, policy or FAST, owner=owner, authorization=LENIENT
+    ), repo
 
 
 async def abandoned_after_planner(
@@ -66,7 +74,9 @@ async def abandoned_after_planner(
 ) -> uuid.UUID:
     """A run whose owner died right after the planner checkpoint, lease expired."""
     rid = uuid.uuid4()
-    await repo.create_run(rid, TASK, owner="dead", ttl_seconds=60)
+    await repo.create_run(
+        rid, TASK, owner="dead", ttl_seconds=60, owner_subject=ADMIN.subject, project_id="default"
+    )
     halted = build_state_graph(llm).compile(
         checkpointer=service.graph.checkpointer, interrupt_after=["planner"]
     )
@@ -83,7 +93,9 @@ async def abandoned_after_planner(
 async def test_concurrent_claims_of_the_same_run_yield_one_owner(fake_llm: FakeLLMAdapter):
     _, repo = make(fake_llm)
     rid = uuid.uuid4()
-    await repo.create_run(rid, TASK, owner="proc-a", ttl_seconds=60)
+    await repo.create_run(
+        rid, TASK, owner="proc-a", ttl_seconds=60, owner_subject=ADMIN.subject, project_id="default"
+    )
     live = await repo.acquire_lease(
         rid, owner="proc-b", ttl_seconds=60, from_statuses=frozenset({S.RUNNING})
     )
@@ -110,7 +122,7 @@ async def test_heartbeat_renews_the_lease_during_a_long_llm_call(fake_llm: FakeL
     gated = GatedLLM(fake_llm)
     service, repo = make(gated)
     rid = uuid.uuid4()
-    pending = asyncio.create_task(service.create(TASK, run_id=str(rid)))
+    pending = asyncio.create_task(service.create(TASK, ADMIN, run_id=str(rid)))
     await asyncio.to_thread(gated.entered.wait, 10)
     first_expiry = repo.runs[rid].lease_expires_at
     ticks = 0
@@ -121,7 +133,7 @@ async def test_heartbeat_renews_the_lease_during_a_long_llm_call(fake_llm: FakeL
     assert len(repo.renewals) >= 2
     assert repo.runs[rid].lease_expires_at is not None and first_expiry is not None
     assert repo.runs[rid].lease_expires_at > first_expiry
-    assert (await service.get(str(rid))).status == "running"
+    assert (await service.get(str(rid), ADMIN)).status == "running"
     gated.release.set()
     assert (await pending).response.status == "waiting_approval"
     assert repo.runs[rid].lease_owner is None  # released with the final projection
@@ -136,7 +148,7 @@ async def test_losing_the_lease_cancels_the_drive_and_leaves_the_row_to_the_new_
     gated = GatedLLM(fake_llm)
     service, repo = make(gated)
     rid = uuid.uuid4()
-    pending = asyncio.create_task(service.create(TASK, run_id=str(rid)))
+    pending = asyncio.create_task(service.create(TASK, ADMIN, run_id=str(rid)))
     await asyncio.to_thread(gated.entered.wait, 10)
     # Another process took over (as recovery would after the lease expired).
     repo.expire_lease(rid)
@@ -159,7 +171,9 @@ async def test_losing_the_lease_cancels_the_drive_and_leaves_the_row_to_the_new_
 async def test_previous_owner_cannot_write_after_a_takeover(fake_llm: FakeLLMAdapter):
     _, repo = make(fake_llm)
     rid = uuid.uuid4()
-    outcome = await repo.create_run(rid, TASK, owner="proc-a", ttl_seconds=60)
+    outcome = await repo.create_run(
+        rid, TASK, owner="proc-a", ttl_seconds=60, owner_subject=ADMIN.subject, project_id="default"
+    )
     old = outcome.lease
     assert old is not None
     repo.expire_lease(rid)
@@ -187,7 +201,9 @@ async def test_recovery_reprojects_an_abandoned_run_and_backfills_its_audit(
 ):
     service, repo = make(fake_llm)
     rid = uuid.uuid4()
-    await repo.create_run(rid, TASK, owner="dead", ttl_seconds=60)
+    await repo.create_run(
+        rid, TASK, owner="dead", ttl_seconds=60, owner_subject=ADMIN.subject, project_id="default"
+    )
     # The dead owner checkpointed up to the approval interrupt but wrote neither
     # the projection nor any audit event.
     await service.graph.ainvoke({"task": TASK}, cfg(rid))
@@ -214,13 +230,17 @@ async def test_recovery_from_scratch_when_the_owner_died_before_any_checkpoint(
 ):
     service, repo = make(fake_llm)
     rid = uuid.uuid4()
-    await repo.create_run(rid, TASK, owner="dead", ttl_seconds=60)
+    await repo.create_run(
+        rid, TASK, owner="dead", ttl_seconds=60, owner_subject=ADMIN.subject, project_id="default"
+    )
     repo.expire_lease(rid)
     assert (await RecoveryService(service).sweep()).outcomes == {"interrupted": 1}
     assert repo.runs[rid].status is S.INTERRUPTED and repo.runs[rid].plan is None
 
     resuming, _ = make(fake_llm, FAST.model_copy(update={"auto_resume": True}), repo)
-    resuming = RunService(service.graph, repo, FAST.model_copy(update={"auto_resume": True}))
+    resuming = RunService(
+        service.graph, repo, FAST.model_copy(update={"auto_resume": True}), authorization=LENIENT
+    )
     assert (await RecoveryService(resuming).sweep()).outcomes == {"resumed": 1}
     assert repo.runs[rid].status is S.WAITING_APPROVAL and repo.runs[rid].attempt == 2
 
@@ -230,9 +250,11 @@ async def test_recovery_from_scratch_when_the_owner_died_before_any_checkpoint(
 
 async def test_recovery_applies_a_decision_recorded_by_a_dead_process(fake_llm: FakeLLMAdapter):
     service, repo = make(fake_llm)
-    rid = uuid.UUID((await service.create(TASK)).response.run_id)
+    rid = uuid.UUID((await service.create(TASK, ADMIN)).response.run_id)
     calls_before = len(fake_llm.calls)
-    claim = await repo.claim_approval(rid, False, owner="dead", ttl_seconds=60)
+    claim = await repo.claim_approval(
+        rid, False, owner="dead", ttl_seconds=60, decided_by=ADMIN.subject
+    )
     assert claim is not None and claim.claimed
     repo.expire_lease(rid)
 
@@ -255,7 +277,7 @@ async def test_recovery_applies_a_decision_recorded_by_a_dead_process(fake_llm: 
 async def test_two_concurrent_sweepers_never_share_a_run(fake_llm: FakeLLMAdapter):
     policy = FAST.model_copy(update={"batch_size": 2})
     service_a, repo = make(fake_llm, policy, owner="sweeper-a")
-    service_b = RunService(service_a.graph, repo, policy, owner="sweeper-b")
+    service_b = RunService(service_a.graph, repo, policy, owner="sweeper-b", authorization=LENIENT)
     rids = [await abandoned_after_planner(service_a, repo, fake_llm) for _ in range(4)]
 
     reports = await asyncio.gather(
@@ -277,18 +299,18 @@ async def test_two_concurrent_sweepers_never_share_a_run(fake_llm: FakeLLMAdapte
 async def test_idempotent_creation_under_concurrency(fake_llm: FakeLLMAdapter):
     service, repo = make(fake_llm)
     results = await asyncio.gather(
-        *(service.create(TASK, idempotency_key="order-42") for _ in range(5))
+        *(service.create(TASK, ADMIN, idempotency_key="order-42") for _ in range(5))
     )
     run_ids = {r.response.run_id for r in results}
     assert len(run_ids) == 1
     assert sum(1 for r in results if r.created) == 1
     assert len(fake_llm.calls) == 2  # one logical execution
     assert len([r for r in repo.runs.values() if r.idempotency_key == "order-42"]) == 1
-    replay = await service.create(TASK, idempotency_key="order-42")
+    replay = await service.create(TASK, ADMIN, idempotency_key="order-42")
     assert replay.created is False and replay.response.status == "waiting_approval"
     with pytest.raises(IdempotencyKeyReusedError):
-        await service.create("Otra tarea completamente distinta", idempotency_key="order-42")
-    fresh = await service.create(TASK, idempotency_key="order-43")
+        await service.create("Otra tarea completamente distinta", ADMIN, idempotency_key="order-42")
+    fresh = await service.create(TASK, ADMIN, idempotency_key="order-43")
     assert fresh.created and fresh.response.run_id not in run_ids
 
 
@@ -350,9 +372,16 @@ async def test_graceful_shutdown_drains_cancels_and_releases_only_its_leases(
     gated = GatedLLM(fake_llm)
     service, repo = make(gated)
     other = uuid.uuid4()
-    await repo.create_run(other, TASK, owner="someone-else", ttl_seconds=60)
+    await repo.create_run(
+        other,
+        TASK,
+        owner="someone-else",
+        ttl_seconds=60,
+        owner_subject=ADMIN.subject,
+        project_id="default",
+    )
     rid = uuid.uuid4()
-    pending = asyncio.create_task(service.create(TASK, run_id=str(rid)))
+    pending = asyncio.create_task(service.create(TASK, ADMIN, run_id=str(rid)))
     await asyncio.to_thread(gated.entered.wait, 10)
 
     report = await service.shutdown(grace_seconds=0.2)
@@ -362,17 +391,17 @@ async def test_graceful_shutdown_drains_cancels_and_releases_only_its_leases(
     with pytest.raises(ShuttingDownError):
         await pending
     with pytest.raises(ShuttingDownError):
-        await service.create(TASK)
+        await service.create(TASK, ADMIN)
     gated.release.set()
     row = repo.runs[rid]
     assert row.status is S.RUNNING and row.lease_owner is None  # not marked terminal
     assert repo.runs[other].lease_owner == "someone-else"  # untouched
     # A reader (or recovery) sees pending work with no owner: recoverable.
-    assert (await service.get(str(rid))).status == "interrupted"
+    assert (await service.get(str(rid), ADMIN)).status == "interrupted"
 
 
 async def test_shutdown_with_nothing_running_is_a_clean_drain(fake_llm: FakeLLMAdapter):
     service, _ = make(fake_llm)
-    await service.create(TASK)
+    await service.create(TASK, ADMIN)
     report = await service.shutdown(grace_seconds=1)
     assert report.drained and report.cancelled == [] and report.leases_released == 0
