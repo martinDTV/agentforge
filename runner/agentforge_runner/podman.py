@@ -249,13 +249,13 @@ def build_run_argv(
 
 
 def build_probe_argv(
-    podman: str, image: str, limits: SandboxLimits, *, uid: int, gid: int
+    podman: str, image: str, limits: SandboxLimits, *, uid: int, gid: int, name: str
 ) -> list[str]:
-    name = f"{CONTAINER_PREFIX}probe-{os.getpid()}-{int(time.time())}"
+    """Same shape as a workload (``--rm=false`` included): the caller removes
+    the container explicitly, exactly like it does after a workload."""
     return [
         podman,
         "run",
-        "--rm",
         *container_flags(name, limits, {}, uid=uid, gid=gid),
         image,
         "python",
@@ -408,11 +408,16 @@ class PodmanBackend:
         return IsolationReport(ok=ok, rootless=rootless, backend=self.name, checks=checks)
 
     def _run_probe(self, image: str) -> list[IsolationCheck]:
-        argv = build_probe_argv(self._podman, image, PROBE_LIMITS, uid=self._uid, gid=self._gid)
+        name = f"{CONTAINER_PREFIX}probe-{os.getpid()}-{int(time.time())}"
+        argv = build_probe_argv(
+            self._podman, image, PROBE_LIMITS, uid=self._uid, gid=self._gid, name=name
+        )
         try:
             completed = self._runner.run(argv, timeout=PROBE_LIMITS.wall_seconds + 30, stdin=b"")
         except (OSError, subprocess.TimeoutExpired) as exc:
+            self.remove(name)
             return [IsolationCheck(name="probe", ok=False, detail=type(exc).__name__)]
+        self.remove(name)
         if completed.returncode != 0:
             return [
                 IsolationCheck(
