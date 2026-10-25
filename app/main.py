@@ -22,16 +22,20 @@ from app.infrastructure.db import (
 from app.infrastructure.git import LocalGitAdapter
 from app.infrastructure.llm import build_llm
 from app.infrastructure.llm.port import LLMPort
+from app.infrastructure.sandbox import RemoteSandboxAdapter, UnconfiguredSandbox
 from app.orchestration.graph import build_graph
 from app.orchestration.limits import RunLimits
 from app.orchestration.policy import RecoveryPolicy
 from app.orchestration.ports import RunRepository
 from app.orchestration.recovery import RecoveryService
 from app.orchestration.runs import RunService
+from app.sandbox import SandboxPort
 from app.security import AuthorizationPolicy, JwtVerifier, TokenVerifier, ToolAuthorizationPolicy
 from app.security.tokens import DisabledAuthentication
 from app.settings import get_environment, get_settings
 from app.tools import (
+    ExecRunTool,
+    ExecutionPolicy,
     GitTools,
     ToolGateway,
     ToolInvocationRepository,
@@ -94,6 +98,7 @@ def create_app(
     tool_audit: ToolInvocationRepository | None = None,
     tool_limits: ToolLimits | None = None,
     worktrees: WorktreeManager | None = None,
+    sandbox: SandboxPort | None = None,
     docs_enabled: bool | None = None,
     shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
     startup_sweep: bool | None = None,
@@ -118,7 +123,9 @@ def create_app(
     Tools (Fase 5): the gateway is built here with the read-only registry and
     the invocation audit (PostgreSQL or in memory); no agent calls it yet.
     Git tools appear only when managed repositories are configured
-    (``GIT_REPOSITORIES_FILE``) or a ``WorktreeManager`` is injected.
+    (``GIT_REPOSITORIES_FILE``) or a ``WorktreeManager`` is injected; so does
+    ``exec.run``, which talks to the remote sandbox runner when one is
+    configured (``SANDBOX_RUNNER_URL``) and refuses otherwise.
     """
     production = llm is None
     production_like = production and get_environment().is_production_like
@@ -135,10 +142,15 @@ def create_app(
         grace, sweep_every = shutdown_grace_seconds, recovery_sweep_seconds
         limits_for_tools = tool_limits
         manager = worktrees
+        sandbox_port = sandbox
+        execution_policy = ExecutionPolicy()
         if port is None:
             settings = get_settings()
             port = build_llm(settings)
             limits_for_tools = limits_for_tools or ToolLimits.from_settings(settings)
+            execution_policy = ExecutionPolicy.from_settings(settings)
+            if sandbox_port is None and settings.sandbox_runner_url is not None:
+                sandbox_port = RemoteSandboxAdapter.from_settings(settings)
             if manager is None and settings.git_repositories_file is not None:
                 assert settings.git_repositories_root is not None  # validated by Settings
                 assert settings.worktrees_root is not None
@@ -187,11 +199,17 @@ def create_app(
         )
         recovery = RecoveryService(service)
         limits_for_tools = limits_for_tools or ToolLimits()
+        sandbox_port = sandbox_port or UnconfiguredSandbox()
         git_tools = (
             GitTools(manager.git, manager, limits_for_tools) if manager is not None else None
         )
+        exec_tool = (
+            ExecRunTool(sandbox_port, manager, git=manager.git, policy=execution_policy)
+            if manager is not None
+            else None
+        )
         tool_gateway = ToolGateway(
-            tool_registry or default_registry(limits_for_tools, git_tools),
+            tool_registry or default_registry(limits_for_tools, git_tools, exec_tool),
             ToolAuthorizationPolicy(service.authorization),
             tool_audit
             or (
@@ -204,6 +222,7 @@ def create_app(
         app.state.run_service = service
         app.state.tool_gateway = tool_gateway
         app.state.worktrees = manager
+        app.state.sandbox = sandbox_port
         app.state.repository = repo
         app.state.recovery = recovery
         app.state.token_verifier = verifier or DisabledAuthentication()
