@@ -8,6 +8,7 @@ for resuming a graph.
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import (
@@ -31,11 +32,12 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus
+from app.contracts.tools import InvocationStatus
 
 from .base import Base
 
 
-def _values(enum_cls: type[RunLifecycleStatus] | type[RunEventKind]) -> list[str]:
+def _values(enum_cls: type[StrEnum]) -> list[str]:
     return [member.value for member in enum_cls]
 
 
@@ -175,4 +177,61 @@ class RunEventRecord(Base):
         UniqueConstraint("run_id", "kind", "ordinal", name="uq_run_events_run_id_kind_ordinal"),
         Index("ix_run_events_run_id_id", "run_id", "id"),
         CheckConstraint("ordinal >= 0", name="ordinal_non_negative"),
+    )
+
+
+class ToolInvocationRecord(Base):
+    """Audit of every tool call made on behalf of a run (Fase 5, ADR 0006).
+
+    One row per (run, logical step, attempt), claimed *before* the tool runs
+    and closed after. ``step`` is chosen by the orchestration and is stable
+    across restarts; ``input_digest`` lets a retry prove it repeats the same
+    call. A ``running`` row whose attempt is over means the process died:
+    the next attempt marks it ``uncertain`` and refuses to repeat steps with
+    effects. Digests, codes and counters only: arguments, file contents and
+    outputs are never stored.
+    """
+
+    __tablename__ = "tool_invocations"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id", ondelete="CASCADE"))
+    step: Mapped[str] = mapped_column(String(128))
+    attempt: Mapped[int] = mapped_column(Integer)
+    tool_name: Mapped[str] = mapped_column(String(128))
+    tool_version: Mapped[str] = mapped_column(String(32), server_default=text("''"))
+    risk: Mapped[str | None] = mapped_column(String(16))  # NULL: name matched no tool
+    agent: Mapped[str] = mapped_column(String(32))
+    actor_subject: Mapped[str] = mapped_column(String(255))
+    project_id: Mapped[str] = mapped_column(String(64))
+    status: Mapped[InvocationStatus] = mapped_column(
+        Enum(
+            InvocationStatus,
+            name="tool_invocation_status",
+            native_enum=False,
+            length=24,
+            create_constraint=True,
+            validate_strings=True,
+            values_callable=_values,
+        )
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    input_digest: Mapped[str] = mapped_column(String(64))
+    output_digest: Mapped[str | None] = mapped_column(String(64))
+    output_bytes: Mapped[int | None] = mapped_column(Integer)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "step", "attempt", name="uq_tool_invocations_run_id_step_attempt"
+        ),
+        Index("ix_tool_invocations_project_id_started_at", "project_id", "started_at"),
+        CheckConstraint("attempt >= 0", name="attempt_non_negative"),
+        CheckConstraint("length(step) > 0", name="step_not_blank"),
+        CheckConstraint(
+            "(finished_at IS NULL) = (status IN ('pending', 'running'))",
+            name="finished_when_closed",
+        ),
     )

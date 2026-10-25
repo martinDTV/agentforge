@@ -146,6 +146,41 @@ class Settings(DatabaseSettings):
     recovery_auto_resume: bool = False
     max_run_attempts: int = Field(default=3, ge=1)
 
+    # Tool Gateway (Fase 5, ADR 0006): bounds for the read-only workspace tools.
+    tool_max_read_bytes: int = Field(default=64_000, ge=1_024)
+    tool_max_entries: int = Field(default=500, ge=1)
+    tool_max_output_bytes: int = Field(default=256_000, ge=1_024)
+    tool_timeout_seconds: float = Field(default=10.0, gt=0)
+
+    # Managed Git repositories and per-run worktrees (Fase 5, Paso 2). All
+    # optional: without GIT_REPOSITORIES_FILE no Git tool is registered.
+    git_binary: str | None = None
+    git_timeout_seconds: float = Field(default=30.0, gt=0)
+    git_repositories_root: Path | None = None  # every registered repository lives under it
+    git_repositories_file: Path | None = None  # JSON: {"repositories": [...]}
+    worktrees_root: Path | None = None
+    worktree_retention_seconds: float = Field(default=3600.0, ge=0)
+    worktree_interrupted_retention_seconds: float = Field(default=7 * 24 * 3600.0, ge=0)
+    worktree_max_per_project: int = Field(default=20, ge=1)
+    worktree_min_free_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+
+    # Remote sandbox runner (Fase 5, Paso 3; ADR 0007). Without a runner the
+    # exec tools refuse: there is no local execution of untrusted code.
+    sandbox_runner_url: str | None = None  # https://, or http:// to a tailnet address
+    sandbox_runner_token: SecretStr | None = None
+    sandbox_runner_id: str | None = None  # identity the runner must report in /v1/health
+    sandbox_runner_ca_file: Path | None = None
+    # Plain HTTP to a private LAN/VPC address (local VM, cloud subnet). Local/test only.
+    sandbox_runner_allow_private_http: bool = False
+    sandbox_profile: str = Field(default="python-3.13", pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
+    sandbox_cpu_seconds: float = Field(default=60.0, gt=0, le=3600)
+    sandbox_memory_mb: int = Field(default=1024, ge=64, le=16384)
+    sandbox_pids: int = Field(default=256, ge=16, le=4096)
+    sandbox_wall_seconds: float = Field(default=120.0, gt=0, le=3600)
+    sandbox_storage_mb: int = Field(default=512, ge=16, le=20480)
+    sandbox_max_output_bytes: int = Field(default=256_000, ge=4096, le=16 * 1024 * 1024)
+    sandbox_max_archive_mb: int = Field(default=50, ge=1, le=1024)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -188,6 +223,42 @@ class Settings(DatabaseSettings):
             )
         if self.oidc_jwks_file is not None and self.is_production_like:
             raise ValueError("OIDC_JWKS_FILE solo se admite en local y test; usa OIDC_JWKS_URL")
+        return self
+
+    @model_validator(mode="after")
+    def _git_storage_is_coherent(self) -> "Settings":
+        if self.git_repositories_file is None:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("GIT_REPOSITORIES_ROOT", self.git_repositories_root),
+                ("WORKTREES_ROOT", self.worktrees_root),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(f"GIT_REPOSITORIES_FILE requiere {', '.join(missing)}")
+        paths = (self.git_repositories_root, self.git_repositories_file, self.worktrees_root)
+        if any(path is not None and not path.is_absolute() for path in paths):
+            raise ValueError("Las rutas de repositorios y worktrees deben ser absolutas")
+        return self
+
+    @model_validator(mode="after")
+    def _sandbox_runner_is_complete(self) -> "Settings":
+        given = {
+            "SANDBOX_RUNNER_URL": self.sandbox_runner_url,
+            "SANDBOX_RUNNER_TOKEN": self.sandbox_runner_token,
+            "SANDBOX_RUNNER_ID": self.sandbox_runner_id,
+        }
+        if any(v is not None for v in given.values()) and not all(given.values()):
+            missing = [k for k, v in given.items() if not v]
+            raise ValueError(f"El runner de sandbox requiere {', '.join(missing)}")
+        if self.sandbox_runner_allow_private_http and self.is_production_like:
+            raise ValueError(
+                "SANDBOX_RUNNER_ALLOW_PRIVATE_HTTP solo se admite en local y test; "
+                "en staging/production usa https:// o una red superpuesta privada"
+            )
         return self
 
     @model_validator(mode="after")

@@ -12,6 +12,7 @@ from uuid import UUID
 
 from app.contracts.execution import RunError
 from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, can_transition
+from app.contracts.tools import InvocationStatus
 from app.orchestration.exceptions import RunAlreadyExistsError
 from app.orchestration.ports import (
     ApprovalClaim,
@@ -25,6 +26,7 @@ from app.orchestration.ports import (
     RunProjection,
 )
 from app.security import AccessScope
+from app.tools.ports import InvocationCompletion, ToolInvocation
 
 
 class InMemoryRunRepository:
@@ -379,3 +381,62 @@ class InMemoryRunRepository:
 
     def set_error(self, run_id: UUID, error: RunError) -> None:
         self._store(self.runs[run_id].model_copy(update={"error": error}))
+
+
+class InMemoryToolInvocationRepository:
+    """Mirror of ``SqlAlchemyToolInvocationRepository`` for the unit suite."""
+
+    def __init__(self) -> None:
+        self.rows: dict[UUID, ToolInvocation] = {}
+        self.fail_with: Exception | None = None
+
+    def _enter(self) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+
+    async def find_step(self, run_id: UUID, step: str) -> list[ToolInvocation]:
+        self._enter()
+        rows = [r for r in self.rows.values() if r.run_id == run_id and r.step == step]
+        return sorted(rows, key=lambda r: r.attempt)
+
+    async def start(self, invocation: ToolInvocation) -> bool:
+        self._enter()
+        key = (invocation.run_id, invocation.step, invocation.attempt)
+        if invocation.id in self.rows or any(
+            (r.run_id, r.step, r.attempt) == key for r in self.rows.values()
+        ):
+            return False
+        self.rows[invocation.id] = invocation
+        return True
+
+    async def transition(
+        self,
+        invocation_id: UUID,
+        *,
+        expected: InvocationStatus,
+        status: InvocationStatus,
+        completion: InvocationCompletion | None = None,
+    ) -> bool:
+        self._enter()
+        row = self.rows.get(invocation_id)
+        if row is None or row.status is not expected:
+            return False
+        update: dict[str, object] = {"status": status}
+        if completion is not None:
+            update.update(
+                error_code=completion.error_code,
+                output_digest=completion.output_digest,
+                output_bytes=completion.output_bytes,
+                duration_ms=completion.duration_ms,
+                finished_at=completion.finished_at,
+            )
+        self.rows[invocation_id] = row.model_copy(update=update)
+        return True
+
+    async def list_for_run(self, run_id: UUID, *, limit: int = 100) -> list[ToolInvocation]:
+        self._enter()
+        rows = [r for r in self.rows.values() if r.run_id == run_id]
+        rows.sort(
+            key=lambda r: (r.attempt, r.started_at or datetime.min.replace(tzinfo=UTC), r.step)
+        )
+        return rows[:limit]
