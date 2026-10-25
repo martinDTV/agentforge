@@ -66,8 +66,11 @@ def test_pytest_sees_no_network_and_a_read_only_root(
 
 
 def test_memory_limit_kills_the_process(backend: PodmanBackend, image: str, workspace: Path):
+    # The cgroup limit is memory_bytes + storage_bytes (tmpfs pages are charged
+    # to it), so keep the tmpfs small and really touch the pages: a zeroed
+    # bytearray is lazily mapped and would never be counted.
     (workspace / "tests" / "test_hog.py").write_text(
-        "def test_hog():\n    blob = bytearray(600 * 1024 * 1024)\n    assert blob\n"
+        "def test_hog():\n    blob = b'x' * (256 * 1024 * 1024)\n    assert blob\n"
     )
     outcome = backend.run(
         spec(
@@ -86,9 +89,14 @@ def test_memory_limit_kills_the_process(backend: PodmanBackend, image: str, work
                 "tests/test_hog.py",
             ],
             memory_bytes=128 * 1024 * 1024,
+            storage_bytes=16 * 1024 * 1024,
         )
     )
-    assert outcome.status is SandboxStatus.KILLED or outcome.exit_code not in (0, None)
+    assert (
+        outcome.status is SandboxStatus.KILLED
+        or outcome.oom_killed
+        or outcome.exit_code not in (0, None)
+    ), outcome
 
 
 def test_wall_clock_timeout_terminates_the_container(
@@ -203,3 +211,8 @@ def test_each_container_gets_its_own_workspace(backend: PodmanBackend, image: st
     first = backend.run(spec(image, workspace, argv))
     second = backend.run(spec(image, workspace, argv))
     assert first.exit_code == 0 and second.exit_code == 0, first.stdout + second.stdout
+
+
+def test_no_containers_are_left_behind(backend: PodmanBackend):
+    """Runs last: every container created above (and the probe) is gone."""
+    assert backend.list_containers() == []

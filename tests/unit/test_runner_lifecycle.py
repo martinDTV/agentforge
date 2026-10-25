@@ -1,7 +1,9 @@
 """Idempotency, concurrency, cancellation, timeouts, isolation refusal and the Podman shape."""
 
+import io
 import json
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -440,7 +442,7 @@ def test_the_container_shape_is_fixed_and_hardened():
         f"--memory {256 * 1024 * 1024 + 64 * 1024 * 1024}",  # tmpfs pages count against the cgroup
         f"--memory-swap {256 * 1024 * 1024 + 64 * 1024 * 1024}",
         "--ulimit cpu=30:30",
-        "--timeout 45",
+        "--timeout 50",  # wall 45 + 5 s of grace: the runner's own timer fires first
         "--log-driver none",
         "--pull never",
         "--env HOME=/tmp",
@@ -500,3 +502,94 @@ def test_podman_run_failures_are_reported_without_a_fallback(tmp_path: Path):
     assert backend.kill("agentforge-y") is True  # scripted kill answers 0
     assert datetime.now(UTC) >= outcome.started_at
     assert isinstance(threading.current_thread(), threading.Thread)
+
+
+class FakeProcess:
+    """Stands in for the podman client process: sleeps, then exits."""
+
+    def __init__(self, seconds: float, returncode: int) -> None:
+        self._deadline = time.monotonic() + seconds
+        self._returncode = returncode
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(b"partial output\n")
+        self.stderr = io.BytesIO()
+        self.killed = False
+
+    def poll(self) -> int | None:
+        return self._returncode if time.monotonic() >= self._deadline or self.killed else None
+
+    def wait(self, timeout: float | None = None) -> int:
+        while self.poll() is None:
+            time.sleep(0.01)
+        return 137 if self.killed else self._returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+class TimingPodman(ScriptedPodman):
+    def __init__(self, process: FakeProcess, *, inspect_exit: str = "0") -> None:
+        super().__init__(ROOTLESS_INFO)
+        self.process = process
+        self.inspect_exit = inspect_exit
+
+    def start(self, argv: Any) -> Any:
+        return self.process
+
+    def run(self, argv: Any, *, timeout: float, stdin: bytes | None = None) -> Completed:
+        argv = list(argv)
+        if argv[1] == "kill":
+            self.process.killed = True
+            self.calls.append(argv)
+            return Completed(0, "", "")
+        if argv[1] == "inspect":
+            return Completed(0, f"false false {self.inspect_exit} 2026-10-25T00:00:00Z", "")
+        return super().run(argv, timeout=timeout, stdin=stdin)
+
+
+def test_the_runner_enforces_the_wall_clock_and_kills_the_real_container():
+    process = FakeProcess(seconds=5.0, returncode=0)
+    podman = TimingPodman(process, inspect_exit="137")
+    backend = PodmanBackend(
+        "podman", runner=podman, uid=1000, gid=1000, probe=False, kill_grace_seconds=1
+    )
+    spec = RunSpec(
+        "agentforge-t", IMAGE, ["ruff"], {}, DEFAULT_ARCHIVE, SandboxLimits(wall_seconds=0.2), 100
+    )
+    started = time.monotonic()
+    outcome = backend.run(spec)
+    assert outcome.status is SandboxStatus.TIMED_OUT and time.monotonic() - started < 3
+    assert any(call[1] == "kill" and call[-1] == "agentforge-t" for call in podman.calls)
+    assert process.killed and outcome.stdout == "partial output\n"
+
+
+def test_an_engine_side_timeout_is_still_reported_as_a_timeout():
+    # podman's --timeout stopped the container (exit -1) right at the deadline.
+    process = FakeProcess(seconds=0.25, returncode=255)
+    podman = TimingPodman(process, inspect_exit="-1")
+    backend = PodmanBackend(
+        "podman", runner=podman, uid=1000, gid=1000, probe=False, kill_grace_seconds=1
+    )
+    spec = RunSpec(
+        "agentforge-e", IMAGE, ["ruff"], {}, DEFAULT_ARCHIVE, SandboxLimits(wall_seconds=0.25), 100
+    )
+    outcome = backend.run(spec)
+    assert outcome.status is SandboxStatus.TIMED_OUT
+    quick = FakeProcess(seconds=0.01, returncode=0)
+    fine = PodmanBackend(
+        "podman", runner=TimingPodman(quick, inspect_exit="0"), uid=1000, gid=1000, probe=False
+    )
+    assert (
+        fine.run(
+            RunSpec(
+                "agentforge-f",
+                IMAGE,
+                ["ruff"],
+                {},
+                DEFAULT_ARCHIVE,
+                SandboxLimits(wall_seconds=5),
+                100,
+            )
+        ).status
+        is SandboxStatus.COMPLETED
+    )

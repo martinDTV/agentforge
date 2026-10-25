@@ -82,3 +82,9 @@ jobs:
         env:
           RUNNER_TEST_IMAGE: ${{ steps.image.outputs.reference }}
         run: uv run pytest tests/runner_integration -v --tb=short -p no:cacheprovider
+
+      - name: Containers left behind (must be none)
+        if: always()
+        run: |
+          podman ps -a --format '{{.Names}} {{.Status}}'
+          test -z "$(podman ps -a --filter name=^agentforge- --format '{{.Names}}')"

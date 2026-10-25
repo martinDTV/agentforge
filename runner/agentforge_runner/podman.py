@@ -158,13 +158,21 @@ class SubprocessRunner:
 
 
 def container_flags(
-    name: str, limits: SandboxLimits, env: dict[str, str], *, uid: int, gid: int
+    name: str,
+    limits: SandboxLimits,
+    env: dict[str, str],
+    *,
+    uid: int,
+    gid: int,
+    engine_timeout_seconds: float = 5.0,
 ) -> list[str]:
     """Everything between ``podman run`` and the image. Nothing here comes from
     the request except the numeric limits (already capped) and the
-    allowlisted environment."""
+    allowlisted environment. The runner kills the container itself at
+    ``wall_seconds``; podman's ``--timeout`` is a backstop a few seconds later."""
     cpu = max(1, int(limits.cpu_seconds))
     memory = limits.memory_bytes + limits.storage_bytes  # tmpfs pages are charged to the cgroup
+    engine_timeout = max(1, int(limits.wall_seconds + engine_timeout_seconds))
     flags = [
         "--name",
         name,
@@ -201,7 +209,7 @@ def container_flags(
         "--ulimit",
         "nofile=1024:1024",
         "--timeout",
-        str(max(1, int(limits.wall_seconds))),
+        str(engine_timeout),
         "--log-driver",
         "none",
         "--env-host=false",
@@ -217,11 +225,20 @@ def container_flags(
     return flags
 
 
-def build_run_argv(podman: str, spec: RunSpec, *, uid: int, gid: int) -> list[str]:
+def build_run_argv(
+    podman: str, spec: RunSpec, *, uid: int, gid: int, grace_seconds: float = 5.0
+) -> list[str]:
     return [
         podman,
         "run",
-        *container_flags(spec.container_name, spec.limits, spec.env, uid=uid, gid=gid),
+        *container_flags(
+            spec.container_name,
+            spec.limits,
+            spec.env,
+            uid=uid,
+            gid=gid,
+            engine_timeout_seconds=grace_seconds,
+        ),
         spec.image,
         "python",
         "-I",
@@ -409,7 +426,9 @@ class PodmanBackend:
     # -- execution ------------------------------------------------------------------------
 
     def run(self, spec: RunSpec) -> RunOutcome:
-        argv = build_run_argv(self._podman, spec, uid=self._uid, gid=self._gid)
+        argv = build_run_argv(
+            self._podman, spec, uid=self._uid, gid=self._gid, grace_seconds=self._grace
+        )
         started_at = datetime.now(UTC)
         t0 = time.monotonic()
         try:
@@ -431,7 +450,9 @@ class PodmanBackend:
                 except Exception:  # the podman client is stuck: last resort
                     process.kill()
 
-        timer = threading.Timer(spec.limits.wall_seconds + self._grace, enforce_wall)
+        # The runner owns the wall clock: it kills at wall_seconds and only
+        # then does podman's own --timeout act as a backstop.
+        timer = threading.Timer(spec.limits.wall_seconds, enforce_wall)
         timer.daemon = True
         timer.start()
         try:
@@ -441,14 +462,20 @@ class PodmanBackend:
         feeder.join(timeout=5)
         out.join()
         err.join()
-        duration_ms = int((time.monotonic() - t0) * 1000)
+        elapsed = time.monotonic() - t0
+        duration_ms = int(elapsed * 1000)
         finished_at = datetime.now(UTC)
         state = self.inspect(spec.container_name)
         self.remove(spec.container_name)
         oom_killed = state.oom_killed if state is not None else False
         inspected_exit = state.exit_code if state is not None else None
         exit_code = inspected_exit if inspected_exit is not None else returncode
-        if timed_out.is_set():
+        # The engine stopped it at its own deadline (exit -1 or SIGKILL) just
+        # before our timer could: still a timeout, never a completion.
+        engine_timed_out = elapsed >= spec.limits.wall_seconds * 0.95 and (
+            inspected_exit in (-1, 137) or returncode in (137, 255)
+        )
+        if timed_out.is_set() or engine_timed_out:
             status = SandboxStatus.TIMED_OUT
         elif oom_killed:
             status = SandboxStatus.KILLED
