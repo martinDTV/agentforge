@@ -15,10 +15,12 @@ Implementado y verificado (197 pruebas unitarias sin servicios externos, 55 de i
 - Leases con heartbeat y token de fencing, barrido de recuperación al arrancar y periódico, apagado ordenado, `Idempotency-Key` en la creación, errores HTTP como Problem Details.
 - Autenticación OIDC con verificación local de tokens, autorización denegada por defecto con permisos nominales, aislamiento por proyecto y propietario, separación de funciones en la aprobación humana, idempotencia por proyecto y principal.
 - API de control: listado y auditoría con paginación keyset, reanudación manual de ejecuciones interrumpidas bajo lease y barrido administrativo síncrono acotado al ámbito del principal; cabeceras de seguridad.
+- Tool Gateway (Fase 5, Pasos 1 a 3): registro tipado de herramientas, contexto de ejecución confiable, identidad de automatización `agentforge:<agente>`, política por agente y proyecto con denegación por defecto, herramientas de solo lectura sobre el workspace y sobre Git, auditoría por paso lógico en `tool_invocations` con estados `pending`, `running`, `ok`, `failed`, `denied`, `invalid_input` y `uncertain`, repositorios Git administrados por configuración, un worktree por ejecución en la rama `run/<run_id>`, y la ejecución aislada: `SandboxPort`, `exec.run`, cliente del runner remoto por Tailscale y el servicio `runner/` (Podman rootless, protocolo v1), probado con backend simulado. Ningún agente lo usa todavía y ningún runner está desplegado.
 
 Pendiente, por fase del roadmap:
 
 - Cancelación de ejecuciones, caducidad de claves de idempotencia, rate limiting (delegado al gateway) y seguridad a nivel de fila.
+- Escrituras Git por agentes, `push`, ejecución de comandos y red: `git.commit`, `git.push` y `exec.run` están registrados como contratos pero la puerta de riesgo los rechaza, y el adaptador no hace `push` en ningún caso. Sin runner configurado, `exec.run` responde `sandbox_unconfigured`: este host nunca ejecuta código no confiable.
 - Ejecución de herramientas en sandbox, agente desarrollador sobre worktrees, agentes de QA, seguridad y revisión (Fases 5 a 7).
 - Varias instancias en producción con cercado de checkpoints, paralelismo entre agentes, observabilidad y despliegue (Fases 8 y 9).
 - Ámbito por principal y caducidad de las claves de idempotencia; endpoint de auditoría; retención de checkpoints.
@@ -107,6 +109,21 @@ El barrido administrativo se ejecuta dentro de la petición, acotado por `RECOVE
 Todas las respuestas llevan `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` y una `Permissions-Policy` restrictiva; las de `/api/*` añaden `Cache-Control: no-store`; en `staging` y `production` se añade `Strict-Transport-Security`, porque ahí se asume TLS delante. No hay CSP para no romper `/docs`, que en producción está apagado.
 
 **El rate limiting debe vivir en el gateway o ingress**, no en la aplicación: un límite por proceso no protege con varias instancias. Mientras no exista, cualquier token válido puede provocar llamadas al LLM a voluntad; `MAX_LLM_CALLS_PER_RUN` acota cada ejecución, no cada cliente.
+
+## Tool Gateway (Fase 5, Paso 1)
+
+Toda herramienta pasa por `ToolGateway.invoke(context, call)`. El `ToolCall` es lo único que produce el modelo: un nombre y argumentos que se validan contra el esquema cerrado de la herramienta. El `ToolContext` lo construye la orquestación con la ejecución, el intento, el proyecto, el agente, el principal de automatización y la raíz del workspace; nunca se deriva de texto del modelo.
+
+- **Identidad.** Los agentes actúan como `agentforge:<agente>`, un principal de servicio con el rol `agent` (solo `tools:execute`) y un único proyecto. No heredan credenciales ni variables del entorno; ningún rol humano puede invocar herramientas.
+- **Política.** Denegación por defecto: emisor confiable, permiso, proyecto, concesión del agente y clase de riesgo, en ese orden. Matriz por defecto: Planner sin herramientas; Architect, Developer, QA y Security con `workspace.*` en clase `read`. Solo `read` es ejecutable en este paso.
+- **Herramientas.** `workspace.list_dir`, `workspace.read_file` y `workspace.find`: rutas relativas sin `..`, enlaces simbólicos resueltos dentro de la raíz, `.git` y archivos de credenciales rechazados, lecturas acotadas (`TOOL_MAX_READ_BYTES`, `TOOL_MAX_ENTRIES`), binarios detectados y secretos redactados.
+- **Auditoría e idempotencia.** Una fila en `tool_invocations` por `(run_id, step, attempt)`, reclamada antes de ejecutar y cerrada después: estado, código, digests de entrada y salida, duración; nunca argumentos ni contenidos. El paso lógico lo elige la orquestación y sobrevive a reinicios: un reintento con los mismos argumentos vuelve a ejecutar las lecturas; con otros argumentos es `invocation_conflict`; el mismo paso dos veces en un intento es `duplicate_invocation`. Un intento que murió ejecutando deja el paso `uncertain`, y las herramientas con efectos no lo repiten (`uncertain_effects`, `already_completed`). Sin auditoría no se ejecuta nada.
+- **Git administrado.** Los repositorios se registran por configuración (`GIT_REPOSITORIES_FILE`, todos bajo `GIT_REPOSITORIES_ROOT`); el modelo solo los nombra por identificador. El adaptador ejecuta el binario `git` sin shell, con argumentos construidos por la aplicación, entorno saneado (sin `~/.gitconfig`, sin agente SSH, sin credenciales, sin hooks) y timeout. `git.log`, `git.diff` y `git.status` leen con argumentos nominales; `git.commit` y `git.push` existen como contratos bloqueados. Las ramas `main`, `master`, `release/*`, la rama por defecto y las etiquetas están protegidas; solo `run/<run_id>` es escribible, con la identidad de servicio `AgentForge`.
+- **Ejecución aislada.** `exec.run` (clase `exec`) acepta un programa permitido (`ruff_check`, `ruff_format_check`, `pytest`) y opciones tipadas; la aplicación construye `argv`, empaqueta el worktree sin `.git` ni credenciales y lo envía a un runner Linux remoto (Ubuntu 24.04, Podman rootless, Tailscale) con límites explícitos de CPU, memoria, procesos, tiempo, almacenamiento y salida, y red deshabilitada. `pytest` es código no confiable y solo corre allí. Sin `SANDBOX_RUNNER_URL`, `SANDBOX_RUNNER_TOKEN` y `SANDBOX_RUNNER_ID` no hay ejecución; nunca hay ejecución local de reserva. El cliente verifica identidad y backend del runner antes de ejecutar y cancela en el runner cuando expira el timeout. Protocolo, frontera y plan de despliegue en el ADR 0007.
+- **Worktrees.** Uno por ejecución en `<WORKTREES_ROOT>/<proyecto>/<run_id>/tree`, con un marcador fuera del checkout. Creación y recuperación idempotentes, retención tras terminar (`WORKTREE_RETENTION_SECONDS`) y más larga para `interrupted` (`WORKTREE_INTERRUPTED_RETENTION_SECONDS`), cuotas por proyecto y espacio libre mínimo. Al eliminar no se siguen enlaces simbólicos y la rama se conserva.
+- **Resultados.** `ToolResult` con `outcome` `ok`, `denied`, `invalid_input` o `failed` y un `ToolError` con código estable; los fallos de la herramienta nunca llegan como excepción al llamador.
+
+Límites: `TOOL_MAX_OUTPUT_BYTES` acota la salida serializada, `TOOL_TIMEOUT_SECONDS` el tiempo por invocación y `GIT_TIMEOUT_SECONDS` cada llamada a `git`. Decisiones y limitaciones en el ADR 0006.
 
 ## Flujo
 
@@ -294,6 +311,10 @@ Se invocan como módulos (`-m`) porque el proyecto no se instala en el entorno v
 
 No existe todavía ejecución de código, herramientas ni aislamiento de repositorios. Checkpoints, proyección de negocio, auditoría, decisiones humanas, leases y recuperación viven en PostgreSQL. Con varias instancias simultáneas queda un riesgo residual documentado en el ADR 0004: el fencing protege las tablas de negocio pero no los checkpoints de LangGraph. Ejecuta **un solo proceso** de servidor y usa únicamente `127.0.0.1`; la API todavía no tiene autenticación ni controles multiusuario.
 
+## Runner (paquete independiente)
+
+`runner/` contiene `agentforge-runner`, el servicio que ejecuta los programas permitidos dentro de Podman rootless en una máquina Linux dedicada: VM de Proxmox, VM local o nube, con el mismo paquete. Es un miembro del workspace de `uv` instalado aquí solo para sus pruebas unitarias, que usan un backend simulado y no demuestran aislamiento; `app/` nunca lo importa. Las pruebas reales viven en `tests/runner_integration/` y en el workflow manual `runner-podman`, y solo corren en Linux con Podman. Estructura, endpoints, cuotas, ejecuciones inciertas, despliegue en Ubuntu Server 24.04 y rotación de secretos en `runner/README.md`.
+
 ## Arquitectura
 
 Reglas permanentes del repositorio en `CLAUDE.md`. Decisiones registradas en `docs/adr/`:
@@ -303,6 +324,8 @@ Reglas permanentes del repositorio en `CLAUDE.md`. Decisiones registradas en `do
 - `0003` — persistencia en PostgreSQL: tablas de negocio con SQLAlchemy/Alembic y checkpoints de LangGraph.
 - `0004` — leases con fencing, recuperación automática, idempotencia de creación y sus limitaciones conocidas.
 - `0005` — identidad delegada (OIDC), principal explícito, autorización por política, API de control y sus limitaciones conocidas.
+- `0006` — Tool Gateway: registro tipado, contexto confiable, identidad de automatización, política por agente, auditoría por paso lógico, adaptador Git administrado y worktrees por ejecución (borrador, Fase 5).
+- `0007` — SandboxPort y ejecución aislada en un runner Linux remoto: contratos, frontera de seguridad, Tailscale y plan de despliegue en Proxmox (borrador, Fase 5).
 
 ## Roadmap por fases
 
@@ -310,8 +333,7 @@ Reglas permanentes del repositorio en `CLAUDE.md`. Decisiones registradas en `do
 - **Fase 2 (completada)**: orquestador robusto — enrutamiento condicional, retroalimentación Planner ↔ Architect con límite, estados terminales explícitos, manejo de errores del LLM, presupuesto de llamadas, pruebas deterministas.
 - **Fase 4 (completada, v0.4.0)**: autenticación OIDC, autorización por propietario y proyecto, idempotencia por principal, listado y auditoría paginados, reanudación manual, barrido administrativo, cabeceras de seguridad. Decisiones y limitaciones en el ADR 0005.
 - **Fase 3 (completada, v0.3.0)**: PostgreSQL con SQLAlchemy y Alembic, checkpoints persistentes de LangGraph, proyección de negocio y auditoría, aprobaciones durables, leases con heartbeat y fencing, barrido de recuperación, `Idempotency-Key`, apagado ordenado, CI con PostgreSQL. Decisiones en los ADR 0003 y 0004.
-- **Fase 4**: API de control con autenticación, aprobaciones y cancelación.
-- **Fase 5**: Tool Gateway con sandbox real.
+- **Fase 5 (en curso)**: Tool Gateway. Paso 1 hecho: registro tipado, política por agente, herramientas de solo lectura y auditoría. Paso 2 hecho: auditoría por paso lógico con estados y resultado incierto, adaptador Git local saneado, repositorios administrados, worktrees por ejecución y contratos de escritura bloqueados (ADR 0006). Paso 3 hecho: `SandboxPort`, programas permitidos, `exec.run`, cliente del runner remoto y plan de despliegue (ADR 0007). Paso 4A hecho: servicio `runner/` con Podman rootless, extracción controlada, idempotencia persistente y unidad de despliegue (`runner/README.md`). Pendientes: despliegue en la VM y suite real, aprobaciones para operaciones sensibles.
 - **Fase 6**: Developer Agent trabajando en git worktrees aislados.
 - **Fase 7**: agentes de QA, seguridad y revisión.
 - **Fase 8**: paralelismo entre agentes.

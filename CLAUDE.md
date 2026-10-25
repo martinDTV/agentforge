@@ -14,6 +14,14 @@ Antes de implementar o modificar cualquier componente de FastAPI (routers, schem
 
 `app/security/` no importa FastAPI: ahí viven `Principal`, la verificación de tokens y la política de autorización; `app/api/security.py` solo las adapta a dependencias. Los servicios reciben el principal como argumento. `AUTH_MODE=disabled` y `OIDC_JWKS_FILE` existen solo para local y pruebas y Settings los rechaza en staging/production. Nunca registrar tokens ni correos: en logs y auditoría se usa el sujeto opaco. Ver `docs/adr/0005-identidad-y-autorizacion.md`.
 
+## Herramientas (Tool Gateway)
+
+`app/tools/` solo importa `contracts` y `security`; la orquestación lo llama y `app/infrastructure/db` implementa su auditoría. Toda herramienta se ejecuta únicamente a través de `ToolGateway.invoke` con un `ToolContext` construido por código confiable: nunca a partir de texto del modelo, que solo aporta `ToolCall`. Los modelos de entrada declaran `extra="forbid"`. Los agentes actúan como la identidad de automatización `agentforge:<agente>` (rol `agent`, solo `tools:execute`), sin heredar credenciales ni entorno del host. En la Fase 5 solo la clase de riesgo `read` es ejecutable; no se añaden herramientas de escritura, ejecución o red sin el paso correspondiente aprobado. Las invocaciones se identifican por `(run_id, step, attempt)`: quien llame al gateway debe pasar un `step` determinista. Ver `docs/adr/0006-tool-gateway.md`.
+
+Git: `app/git/` define el puerto, la validación de referencias y el registro confiable de repositorios; `app/infrastructure/git/` ejecuta el binario sin shell, con argumentos construidos por la aplicación, entorno saneado y timeout. Ningún comando Git llega del modelo. Solo las ramas `run/<run_id>` son escribibles; `main`, la rama por defecto, `release/*` y las etiquetas están protegidas; el `push` está deshabilitado. Las pruebas usan repositorios temporales bajo `tmp_path` y nunca el repositorio de AgentForge ni otros del host. Los worktrees (`app/workspaces/`) viven bajo `WORKTREES_ROOT/<proyecto>/<run_id>/tree` con su marcador fuera del checkout.
+
+Ejecución aislada: `app/sandbox/` define los contratos y la lista de programas (`ruff_check`, `ruff_format_check`, `pytest`); `argv` lo construye la aplicación, nunca el modelo. El único adaptador que ejecuta es el runner remoto (`app/infrastructure/sandbox/remote.py`); `UnconfiguredSandbox` rechaza y no existe ejecución local de reserva. La suite unitaria bloquea todo subproceso que no sea `git`. El servicio runner vive en `runner/` como paquete independiente (`agentforge_runner`): no importa `app/` ni `app/` lo importa; sus contratos son una copia del protocolo v1 y una prueba de conformidad mantiene ambas copias iguales. Las pruebas reales con Podman están en `tests/runner_integration/` y en el workflow manual `runner-podman`; no forman parte de `pytest` por defecto y las pruebas con `FakeBackend` nunca se presentan como evidencia de aislamiento. El dominio (`app/sandbox`, `app/tools`, `app/orchestration`) no menciona Tailscale, Proxmox ni Podman: el transporte privado es cosa del adaptador y del despliegue. Ver `docs/adr/0007-sandbox-ejecucion-aislada.md` y `runner/README.md`.
+
 ## Proveedor LLM
 
 Claude vía Vertex AI (`AnthropicVertex`) es el proveedor principal. No cambiar de proveedor sin autorización explícita. Los agentes dependen de `LLMPort` (Protocol), nunca instancian `VertexClaudeAdapter` directamente — reciben el adaptador por inyección.
@@ -34,6 +42,7 @@ El proyecto avanza fase por fase, con aprobación explícita antes de iniciar ca
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy app
+uv run mypy runner/agentforge_runner   # el runner se tipa aparte
 uv run pytest -q
 uv run pytest tests/integration -q   # requiere PostgreSQL accesible
 ```
