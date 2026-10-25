@@ -1,0 +1,15 @@
+# Imagen del perfil python-3.13: ruff, pytest y las dependencias del repositorio
+# objetivo, instaladas en tiempo de construcción (la única fase con red).
+# Construir en la VM:  podman build -t localhost/agentforge/python-3.13 -f Containerfile.python-3.13 .
+# Fijar por digest:    podman image inspect --format '{{.Digest}}' localhost/agentforge/python-3.13
+FROM docker.io/library/python:3.13-slim
+ARG RUFF_VERSION=0.14.0
+ARG PYTEST_VERSION=8.4.2
+RUN pip install --no-cache-dir "ruff==${RUFF_VERSION}" "pytest==${PYTEST_VERSION}" \
+ && useradd --uid 65534 --no-create-home --shell /usr/sbin/nologin sandbox || true
+# Dependencias del proyecto objetivo: copiar su requirements exportado desde uv.lock
+# (uv export --no-dev --frozen > requirements.txt) y descomentar:
+# COPY requirements.txt /tmp/requirements.txt
+# RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
+WORKDIR /work
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1

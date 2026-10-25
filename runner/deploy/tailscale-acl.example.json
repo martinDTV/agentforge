@@ -1,0 +1,21 @@
+{
+  "tagOwners": {
+    "tag:agentforge-api": ["autogroup:admin"],
+    "tag:agentforge-runner": ["autogroup:admin"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["tag:agentforge-api"],
+      "dst": ["tag:agentforge-runner:8787"]
+    }
+  ],
+  "ssh": [
+    {
+      "action": "check",
+      "src": ["autogroup:admin"],
+      "dst": ["tag:agentforge-runner"],
+      "users": ["autogroup:nonroot"]
+    }
+  ]
+}

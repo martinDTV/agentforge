@@ -1,0 +1,24 @@
+# ~/.config/systemd/user/agentforge-runner.service  (usuario agentforge-runner, sin sudo)
+# systemctl --user daemon-reload && systemctl --user enable --now agentforge-runner
+[Unit]
+Description=AgentForge Runner (ejecución aislada con Podman rootless)
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/agentforge-runner/runner.env
+ExecStart=%h/agentforge/.venv/bin/agentforge-runner serve
+Restart=on-failure
+RestartSec=5
+# Endurecimiento del propio servicio (el aislamiento del trabajo lo da Podman).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/agentforge-runner %h/.local/share/containers %t/containers
+PrivateTmp=yes
+LockPersonality=yes
+RestrictRealtime=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
