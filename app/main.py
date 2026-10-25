@@ -266,7 +266,7 @@ def create_app(
 
     app = FastAPI(
         title="AgentForge",
-        version="0.4.0",
+        version="0.5.0",
         lifespan=lifespan,
         docs_url="/docs" if docs_enabled else None,
         redoc_url="/redoc" if docs_enabled else None,
