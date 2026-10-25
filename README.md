@@ -2,7 +2,7 @@
 
 Plataforma multiagente para planificación y revisión arquitectónica de tareas de desarrollo, con FastAPI, LangGraph, Claude (Anthropic) vía Vertex AI, aprobación humana y contratos Pydantic.
 
-**Versión 0.4.0 — Fase 4 completada.** AgentForge planifica una tarea de desarrollo, revisa la arquitectura del plan con un ciclo acotado de retroalimentación entre dos agentes y detiene el flujo hasta una aprobación humana. Todo el estado vive en PostgreSQL y sobrevive a reinicios y caídas. **No ejecuta código, no usa herramientas y no toca repositorios**: todavía no es una plataforma de desarrollo autónomo — ver [Qué hace y qué no](#qué-hace-y-qué-no-hace-todavía), [Persistencia](#persistencia-fase-3) y [Roadmap](#roadmap-por-fases).
+**Versión 0.5.0 — Fase 5 completada.** AgentForge planifica una tarea de desarrollo, revisa la arquitectura del plan con un ciclo acotado de retroalimentación entre dos agentes y detiene el flujo hasta una aprobación humana. Todo el estado vive en PostgreSQL y sobrevive a reinicios y caídas. Existe un Tool Gateway con auditoría, repositorios Git administrados con un worktree por ejecución y un runner de ejecución aislada validado en Linux real, **pero ningún agente usa todavía herramientas, ninguna herramienta de escritura, ejecución o red está habilitada y ningún runner está desplegado**: todavía no es una plataforma de desarrollo autónomo — ver [Qué hace y qué no](#qué-hace-y-qué-no-hace-todavía), [Runner](#runner-paquete-independiente) y [Roadmap](#roadmap-por-fases).
 
 ## Qué hace y qué no hace todavía
 
@@ -15,7 +15,7 @@ Implementado y verificado (197 pruebas unitarias sin servicios externos, 55 de i
 - Leases con heartbeat y token de fencing, barrido de recuperación al arrancar y periódico, apagado ordenado, `Idempotency-Key` en la creación, errores HTTP como Problem Details.
 - Autenticación OIDC con verificación local de tokens, autorización denegada por defecto con permisos nominales, aislamiento por proyecto y propietario, separación de funciones en la aprobación humana, idempotencia por proyecto y principal.
 - API de control: listado y auditoría con paginación keyset, reanudación manual de ejecuciones interrumpidas bajo lease y barrido administrativo síncrono acotado al ámbito del principal; cabeceras de seguridad.
-- Tool Gateway (Fase 5, Pasos 1 a 3): registro tipado de herramientas, contexto de ejecución confiable, identidad de automatización `agentforge:<agente>`, política por agente y proyecto con denegación por defecto, herramientas de solo lectura sobre el workspace y sobre Git, auditoría por paso lógico en `tool_invocations` con estados `pending`, `running`, `ok`, `failed`, `denied`, `invalid_input` y `uncertain`, repositorios Git administrados por configuración, un worktree por ejecución en la rama `run/<run_id>`, y la ejecución aislada: `SandboxPort`, `exec.run`, cliente del runner remoto por Tailscale y el servicio `runner/` (Podman rootless, protocolo v1), probado con backend simulado. Ningún agente lo usa todavía y ningún runner está desplegado.
+- Tool Gateway (Fase 5): registro tipado de herramientas, contexto de ejecución confiable, identidad de automatización `agentforge:<agente>`, política por agente y proyecto con denegación por defecto, herramientas de solo lectura sobre el workspace y sobre Git, auditoría por paso lógico en `tool_invocations` con estados `pending`, `running`, `ok`, `failed`, `denied`, `invalid_input` y `uncertain`, repositorios Git administrados por configuración, un worktree por ejecución en la rama `run/<run_id>`, y la ejecución aislada: `SandboxPort`, `exec.run`, cliente del runner remoto por Tailscale y el servicio `runner/` (Podman rootless, protocolo v1), cuyo aislamiento se validó en Linux real: ocho pruebas en verde en Ubuntu 24.04 (`docs/validation/runner-podman-ubuntu-24.04.md`). Ningún agente lo usa todavía y ningún runner está desplegado.
 
 Pendiente, por fase del roadmap:
 
@@ -313,7 +313,7 @@ No existe todavía ejecución de código, herramientas ni aislamiento de reposit
 
 ## Runner (paquete independiente)
 
-`runner/` contiene `agentforge-runner`, el servicio que ejecuta los programas permitidos dentro de Podman rootless en una máquina Linux dedicada: VM de Proxmox, VM local o nube, con el mismo paquete. Es un miembro del workspace de `uv` instalado aquí solo para sus pruebas unitarias, que usan un backend simulado y no demuestran aislamiento; `app/` nunca lo importa. Las pruebas reales viven en `tests/runner_integration/` y en el workflow manual `runner-podman`, y solo corren en Linux con Podman. Estructura, endpoints, cuotas, ejecuciones inciertas, despliegue en Ubuntu Server 24.04 y rotación de secretos en `runner/README.md`.
+`runner/` contiene `agentforge-runner`, el servicio que ejecuta los programas permitidos dentro de Podman rootless en una máquina Linux dedicada: VM de Proxmox, VM local o nube, con el mismo paquete. Es un miembro del workspace de `uv` instalado aquí solo para sus pruebas unitarias, que usan un backend simulado y no demuestran aislamiento; `app/` nunca lo importa. Las pruebas reales viven en `tests/runner_integration/` y en el workflow `runner-podman`, que corre en Linux con Podman; su primera ejecución en verde está documentada en `docs/validation/runner-podman-ubuntu-24.04.md`. Estructura, endpoints, cuotas, ejecuciones inciertas y rotación de secretos en `runner/README.md`; despliegue paso a paso en el homelab en `docs/runbooks/runner-proxmox.md`; primera invocación real con `scripts/sandbox_smoke.py`.
 
 ## Arquitectura
 
@@ -324,8 +324,8 @@ Reglas permanentes del repositorio en `CLAUDE.md`. Decisiones registradas en `do
 - `0003` — persistencia en PostgreSQL: tablas de negocio con SQLAlchemy/Alembic y checkpoints de LangGraph.
 - `0004` — leases con fencing, recuperación automática, idempotencia de creación y sus limitaciones conocidas.
 - `0005` — identidad delegada (OIDC), principal explícito, autorización por política, API de control y sus limitaciones conocidas.
-- `0006` — Tool Gateway: registro tipado, contexto confiable, identidad de automatización, política por agente, auditoría por paso lógico, adaptador Git administrado y worktrees por ejecución (borrador, Fase 5).
-- `0007` — SandboxPort y ejecución aislada en un runner Linux remoto: contratos, frontera de seguridad, Tailscale y plan de despliegue en Proxmox (borrador, Fase 5).
+- `0006` — Tool Gateway: registro tipado, contexto confiable, identidad de automatización, política por agente, auditoría por paso lógico, adaptador Git administrado y worktrees por ejecución, con sus limitaciones al cierre.
+- `0007` — SandboxPort y ejecución aislada en un runner Linux remoto: contratos, frontera de seguridad, transporte privado, evidencia de la validación real y limitaciones al cierre.
 
 ## Roadmap por fases
 
@@ -333,7 +333,7 @@ Reglas permanentes del repositorio en `CLAUDE.md`. Decisiones registradas en `do
 - **Fase 2 (completada)**: orquestador robusto — enrutamiento condicional, retroalimentación Planner ↔ Architect con límite, estados terminales explícitos, manejo de errores del LLM, presupuesto de llamadas, pruebas deterministas.
 - **Fase 4 (completada, v0.4.0)**: autenticación OIDC, autorización por propietario y proyecto, idempotencia por principal, listado y auditoría paginados, reanudación manual, barrido administrativo, cabeceras de seguridad. Decisiones y limitaciones en el ADR 0005.
 - **Fase 3 (completada, v0.3.0)**: PostgreSQL con SQLAlchemy y Alembic, checkpoints persistentes de LangGraph, proyección de negocio y auditoría, aprobaciones durables, leases con heartbeat y fencing, barrido de recuperación, `Idempotency-Key`, apagado ordenado, CI con PostgreSQL. Decisiones en los ADR 0003 y 0004.
-- **Fase 5 (en curso)**: Tool Gateway. Paso 1 hecho: registro tipado, política por agente, herramientas de solo lectura y auditoría. Paso 2 hecho: auditoría por paso lógico con estados y resultado incierto, adaptador Git local saneado, repositorios administrados, worktrees por ejecución y contratos de escritura bloqueados (ADR 0006). Paso 3 hecho: `SandboxPort`, programas permitidos, `exec.run`, cliente del runner remoto y plan de despliegue (ADR 0007). Paso 4A hecho: servicio `runner/` con Podman rootless, extracción controlada, idempotencia persistente y unidad de despliegue (`runner/README.md`). Pendientes: despliegue en la VM y suite real, aprobaciones para operaciones sensibles.
+- **Fase 5 (completada, v0.5.0)**: Tool Gateway con auditoría por paso lógico, identidad de automatización y política por agente; adaptador Git administrado y worktrees por ejecución; `SandboxPort`, programas permitidos y `exec.run`; servicio `runner/` con Podman rootless validado en Linux real (ocho pruebas de aislamiento). Decisiones y limitaciones en los ADR 0006 y 0007; despliegue en `docs/runbooks/runner-proxmox.md`. Pendiente: despliegue en una VM persistente, prueba de concurrencia, integración de herramientas con los agentes bajo aprobación humana.
 - **Fase 6**: Developer Agent trabajando en git worktrees aislados.
 - **Fase 7**: agentes de QA, seguridad y revisión.
 - **Fase 8**: paralelismo entre agentes.
