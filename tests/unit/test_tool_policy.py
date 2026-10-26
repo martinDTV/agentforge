@@ -29,10 +29,15 @@ def test_automation_identity_is_a_service_principal_with_tools_only():
     assert not authz.has(principal, Permission.RUNS_READ)
     assert not authz.has(principal, Permission.RUNS_APPROVE)
     assert DEFAULT_ROLE_PERMISSIONS[Role.AGENT] == {Permission.TOOLS_EXECUTE}
-    # No human role carries tools:execute or repos:write.
-    for role in (Role.VIEWER, Role.OPERATOR, Role.APPROVER, Role.ADMIN, Role.PLATFORM_ADMIN):
+    # No human role carries tools:execute; repos:write belongs to the humans who
+    # may ask for worktree writes (ADR 0009); nobody publishes yet.
+    for role in Role:
         granted = DEFAULT_ROLE_PERMISSIONS[role]
-        assert Permission.TOOLS_EXECUTE not in granted and Permission.REPOS_WRITE not in granted
+        assert (Permission.TOOLS_EXECUTE in granted) is (role is Role.AGENT)
+        assert (Permission.REPOS_WRITE in granted) is (
+            role in (Role.PROJECT_OPERATOR, Role.ADMIN, Role.PLATFORM_ADMIN)
+        )
+        assert Permission.REPOS_PUBLISH not in granted
 
 
 @pytest.mark.parametrize("agent", list(AgentKind))

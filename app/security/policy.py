@@ -33,16 +33,24 @@ class Permission(StrEnum):
     RECOVERY_SWEEP = "recovery:sweep"
     # Crosses project boundaries. Granted only by an explicit global role.
     PROJECTS_ALL = "projects:all"
+    # Withdraw a run that waits for a decision or sits interrupted (Fase 7).
+    RUNS_CANCEL = "runs:cancel"
     # Held only by the automation identity's agents (Fase 5, ``app/security/tools.py``).
     TOOLS_EXECUTE = "tools:execute"
-    # Reserved for the Git adapter of a later step; no role grants it yet.
+    # Create development runs that write inside a worktree and approve their
+    # scope (Fase 7, ADR 0009). Humans only; agents never hold it.
     REPOS_WRITE = "repos:write"
+    # Approve publication to a remote (Paso 3 of Fase 7). No role grants it yet.
+    REPOS_PUBLISH = "repos:publish"
 
 
 class Role(StrEnum):
     VIEWER = "viewer"
     OPERATOR = "operator"
     APPROVER = "approver"
+    # Humans who may ask AgentForge to write inside a project's repositories
+    # and approve the exact scope of those writes (ADR 0009).
+    PROJECT_OPERATOR = "project_operator"
     ADMIN = "admin"  # every run permission, but only inside the token's projects
     PLATFORM_ADMIN = "platform_admin"  # admin + projects:all
     AGENT = "agent"  # the automation identity: tools only, never runs
@@ -55,15 +63,31 @@ _PROJECT_ADMIN = frozenset(
         _P.RUNS_READ,
         _P.RUNS_APPROVE,
         _P.RUNS_RESUME,
+        _P.RUNS_CANCEL,
         _P.RUNS_AUDIT_READ,
         _P.RECOVERY_SWEEP,
+        _P.REPOS_WRITE,
+    }
+)
+_PROJECT_OPERATOR = frozenset(
+    {
+        _P.RUNS_CREATE,
+        _P.RUNS_READ,
+        _P.RUNS_APPROVE,
+        _P.RUNS_RESUME,
+        _P.RUNS_CANCEL,
+        _P.RUNS_AUDIT_READ,
+        _P.REPOS_WRITE,
     }
 )
 
 DEFAULT_ROLE_PERMISSIONS: Mapping[str, frozenset[Permission]] = {
     Role.VIEWER: frozenset({_P.RUNS_READ, _P.RUNS_AUDIT_READ}),
-    Role.OPERATOR: frozenset({_P.RUNS_READ, _P.RUNS_AUDIT_READ, _P.RUNS_CREATE, _P.RUNS_RESUME}),
+    Role.OPERATOR: frozenset(
+        {_P.RUNS_READ, _P.RUNS_AUDIT_READ, _P.RUNS_CREATE, _P.RUNS_RESUME, _P.RUNS_CANCEL}
+    ),
     Role.APPROVER: frozenset({_P.RUNS_READ, _P.RUNS_AUDIT_READ, _P.RUNS_APPROVE}),
+    Role.PROJECT_OPERATOR: _PROJECT_OPERATOR,
     Role.ADMIN: _PROJECT_ADMIN,
     Role.PLATFORM_ADMIN: _PROJECT_ADMIN | {_P.PROJECTS_ALL},
     Role.AGENT: frozenset({_P.TOOLS_EXECUTE}),
