@@ -70,6 +70,7 @@ _WORKSPACE_READ = AgentGrant(
 DEFAULT_AGENT_GRANTS: Mapping[AgentKind, AgentGrant] = {
     AgentKind.PLANNER: AgentGrant(),  # plans from the task text alone
     AgentKind.ARCHITECT: _WORKSPACE_READ,
+    AgentKind.SCOPER: _WORKSPACE_READ,  # proposes a scope; a human authorises it
     AgentKind.DEVELOPER: _WORKSPACE_READ,  # write and exec arrive with the sandbox
     AgentKind.QA: _WORKSPACE_READ,
     AgentKind.SECURITY: _WORKSPACE_READ,

@@ -26,6 +26,7 @@ class AgentKind(StrEnum):
 
     PLANNER = "planner"
     ARCHITECT = "architect"
+    SCOPER = "scoper"  # proposes the files a task needs; read-only, never writes or executes
     DEVELOPER = "developer"
     QA = "qa"
     SECURITY = "security"
