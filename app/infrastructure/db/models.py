@@ -31,7 +31,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus
+from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, WorkflowKind
 from app.contracts.tools import InvocationStatus
 
 from .base import Base
@@ -62,6 +62,20 @@ class RunRecord(Base):
             validate_strings=True,
             values_callable=_values,
         )
+    )
+
+    # Which graph drives the run (ADR 0008). Rows created before 0005 are planning runs.
+    workflow_kind: Mapped[WorkflowKind] = mapped_column(
+        Enum(
+            WorkflowKind,
+            name="run_workflow_kind",
+            native_enum=False,
+            length=32,
+            create_constraint=True,
+            validate_strings=True,
+            values_callable=_values,
+        ),
+        server_default=text("'planning'"),
     )
 
     # Projection of RunState.

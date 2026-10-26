@@ -18,6 +18,9 @@ class RunLifecycleStatus(StrEnum):
     INTERRUPTED = "interrupted"  # pending work, no interrupt, nobody driving it
     APPROVED = "approved"
     REJECTED = "rejected"
+    # A workflow that needs no human decision (development, Fase 6) finished
+    # with its own success criterion met; ``approved`` stays a human verdict.
+    COMPLETED = "completed"
     FAILED = "failed"
 
 
@@ -25,25 +28,35 @@ TERMINAL_STATUSES: frozenset[RunLifecycleStatus] = frozenset(
     {
         RunLifecycleStatus.APPROVED,
         RunLifecycleStatus.REJECTED,
+        RunLifecycleStatus.COMPLETED,
         RunLifecycleStatus.FAILED,
     }
 )
+
+
+class WorkflowKind(StrEnum):
+    """Which graph drives a run; stored with the row so recovery never guesses."""
+
+    PLANNING = "planning"  # Planner -> Architect -> human approval
+    DEVELOPMENT = "development"  # Developer -> QA, bounded corrections, no approval
+
 
 _S = RunLifecycleStatus
 
 # from -> allowed targets (re-projecting the same status is always allowed).
 ALLOWED_TRANSITIONS: dict[RunLifecycleStatus, frozenset[RunLifecycleStatus]] = {
     _S.RUNNING: frozenset(
-        {_S.WAITING_APPROVAL, _S.INTERRUPTED, _S.APPROVED, _S.REJECTED, _S.FAILED}
+        {_S.WAITING_APPROVAL, _S.INTERRUPTED, _S.APPROVED, _S.REJECTED, _S.COMPLETED, _S.FAILED}
     ),
     _S.WAITING_APPROVAL: frozenset({_S.RESUME_PENDING, _S.FAILED}),
     # resume_pending never goes back to waiting_approval: the decision is already recorded.
     _S.RESUME_PENDING: frozenset({_S.APPROVED, _S.REJECTED, _S.FAILED}),
     _S.INTERRUPTED: frozenset(
-        {_S.RUNNING, _S.WAITING_APPROVAL, _S.APPROVED, _S.REJECTED, _S.FAILED}
+        {_S.RUNNING, _S.WAITING_APPROVAL, _S.APPROVED, _S.REJECTED, _S.COMPLETED, _S.FAILED}
     ),
     _S.APPROVED: frozenset(),
     _S.REJECTED: frozenset(),
+    _S.COMPLETED: frozenset(),
     _S.FAILED: frozenset(),
 }
 
@@ -58,6 +71,9 @@ def sources_for(new: RunLifecycleStatus) -> frozenset[RunLifecycleStatus]:
 
 
 class RunEventKind(StrEnum):
+    DEVELOPER_COMPLETED = "developer_completed"
+    DEVELOPER_APPLIED = "developer_applied"
+    QA_REVIEWED = "qa_reviewed"
     RUN_CREATED = "run_created"
     PLANNER_COMPLETED = "planner_completed"
     ARCHITECT_REVIEWED = "architect_reviewed"
@@ -67,6 +83,7 @@ class RunEventKind(StrEnum):
     APPROVAL_APPLIED = "approval_applied"
     RUN_APPROVED = "run_approved"
     RUN_REJECTED = "run_rejected"
+    RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
     RUN_INTERRUPTED = "run_interrupted"
     RUN_RESUMED = "run_resumed"

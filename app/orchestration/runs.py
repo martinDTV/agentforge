@@ -11,7 +11,12 @@ from langgraph.types import Command, StateSnapshot
 from pydantic import BaseModel, ConfigDict
 
 from app.contracts.execution import RunError, RunResponse
-from app.contracts.lifecycle import TERMINAL_STATUSES, RunEventKind, RunLifecycleStatus
+from app.contracts.lifecycle import (
+    TERMINAL_STATUSES,
+    RunEventKind,
+    RunLifecycleStatus,
+    WorkflowKind,
+)
 from app.contracts.planning import ArchitectureReview, DevelopmentPlan
 from app.infrastructure.db.errors import DatabaseUnavailableError
 from app.orchestration.events import (
@@ -67,6 +72,7 @@ def _response(row: PersistedRun) -> RunResponse:
         status=row.status,
         owner=row.owner_subject,
         project_id=row.project_id,
+        workflow_kind=row.workflow_kind,
         revision=row.revision,
         llm_calls=row.llm_calls,
         architect_approved=row.architect_approved,
@@ -141,8 +147,10 @@ class RunService:
         *,
         owner: str | None = None,
         authorization: AuthorizationPolicy | None = None,
+        workflow_kind: WorkflowKind = WorkflowKind.PLANNING,
     ) -> None:
         self._graph = graph
+        self._workflow_kind = WorkflowKind(workflow_kind)
         self._repository = repository
         self._policy = policy or RecoveryPolicy()
         # Deny by default: without an injected policy, separation of duties is
@@ -218,6 +226,7 @@ class RunService:
             owner_subject=principal.subject,
             project_id=project,
             idempotency_key=idempotency_key,
+            workflow_kind=self._workflow_kind,
         )
         if not outcome.created:
             # Same key, same principal, same project: reuse only if it is the
@@ -229,7 +238,9 @@ class RunService:
             )
         assert outcome.lease is not None
         async with self._lock(rid):
-            await self._drive(rid, {"task": task}, outcome.lease)
+            await self._drive(
+                rid, {"task": task, "workflow_kind": self._workflow_kind.value}, outcome.lease
+            )
         return CreateResult(response=await self.get(str(rid), principal), created=True)
 
     async def get(self, run_id: str, principal: Principal) -> RunResponse:
@@ -401,6 +412,12 @@ class RunService:
                 await self._project(rid, lease=lease, release=True)
                 return RecoveryOutcome.REPROJECTED
 
+            if row.workflow_kind is WorkflowKind.DEVELOPMENT:
+                # Writes, billable calls and sandbox programs with unknown
+                # outcome are never repeated implicitly (ADR 0008).
+                await self._fail_development_interrupted(row, lease)
+                return RecoveryOutcome.ABANDONED
+
             # Pending work and nobody driving it: abandoned by its previous owner.
             if row.attempt >= self._policy.max_attempts:
                 await self._fail_abandoned(rid, snapshot, lease, row.attempt)
@@ -425,6 +442,9 @@ class RunService:
         attempt: int | None = None,
     ) -> None:
         """Continue a run from its last checkpoint under ``lease`` (shared by sweep and resume)."""
+        if row.workflow_kind is WorkflowKind.DEVELOPMENT:
+            await self._fail_development_interrupted(row, lease)
+            return
         has_checkpoint = "task" in snapshot.values
         await self._project_status(rid, snapshot, _S.RUNNING, lease)
         await self._record(
@@ -434,6 +454,20 @@ class RunService:
         )
         graph_input: Any = None if has_checkpoint else {"task": row.task}
         await self._drive(rid, graph_input, lease)
+
+    async def _fail_development_interrupted(self, row: PersistedRun, lease: LeaseToken) -> None:
+        error = RunError(
+            code="development_interrupted",
+            message=(
+                "El intento de desarrollo se interrumpió; requiere una nueva ejecución autorizada."
+            ),
+        )
+        await self._repository.project(
+            row.id, RunProjection(status=_S.FAILED, error=error), lease=lease, release=True
+        )
+        await self._record(
+            row.id, [RunEvent(kind=RunEventKind.RUN_FAILED, payload={"code": error.code})]
+        )
 
     # -- shutdown ---------------------------------------------------------------
 
@@ -517,6 +551,10 @@ class RunService:
                     await self._project_quietly(rid, lease)
                     raise
                 await self._project(rid, lease=lease, release=True)
+            except asyncio.CancelledError:
+                stream.cancel()
+                await asyncio.gather(stream, return_exceptions=True)
+                raise
             finally:
                 for task in (heartbeat, lost_waiter):
                     task.cancel()

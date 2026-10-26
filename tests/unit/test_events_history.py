@@ -72,3 +72,79 @@ def test_history_without_changes_yields_nothing_and_errors_once():
     assert [(e.kind, e.ordinal) for e in events] == [(RunEventKind.RUN_FAILED, 0)]
     assert events[0].payload == {"code": "llm_timeout"}
     assert events_from_history([]) == []
+
+
+def test_development_history_yields_node_events_and_completion():
+    changes = {"summary": "s", "edits": [{"path": "src/app.py", "content": "x"}]}
+    review = {"approved": False, "summary": "r", "issues": [{"code": "x"}]}
+    base = {"task": "t", "workflow_kind": "development"}
+    history = [
+        snapshot(base, ("developer",)),
+        snapshot({**base, "changes": changes, "revision": 0}, ("apply_changes",)),
+        snapshot(
+            {
+                **base,
+                "changes": changes,
+                "revision": 0,
+                "developer_checks": [],
+                "changed_files": ["src/app.py"],
+            },
+            ("qa",),
+        ),
+        snapshot(
+            {
+                **base,
+                "changes": changes,
+                "revision": 0,
+                "developer_checks": [],
+                "qa_review": review,
+                "validation": [{"exit_code": 1}],
+            },
+            ("revise_development",),
+        ),
+        snapshot(
+            {
+                **base,
+                "changes": changes,
+                "revision": 1,
+                "developer_checks": [],
+                "qa_review": review,
+            },
+            ("developer",),
+        ),
+        # Same proposal again in revision 1: still a Developer round (revision moved).
+        snapshot(
+            {
+                **base,
+                "changes": changes,
+                "revision": 1,
+                "developer_checks": [],
+                "qa_review": review,
+            },
+            ("apply_changes",),
+        ),
+        snapshot(
+            {
+                **base,
+                "changes": changes,
+                "revision": 1,
+                "developer_checks": [],
+                "qa_review": {**review, "approved": True, "issues": []},
+                "validation": [{"exit_code": 0}],
+                "completed": True,
+            },
+            (),
+        ),
+    ]
+    events = events_from_history(history)
+    assert [(e.kind, e.ordinal) for e in events] == [
+        (RunEventKind.DEVELOPER_COMPLETED, 0),
+        (RunEventKind.DEVELOPER_APPLIED, 0),
+        (RunEventKind.QA_REVIEWED, 0),
+        (RunEventKind.DEVELOPER_COMPLETED, 1),
+        (RunEventKind.DEVELOPER_APPLIED, 1),
+        (RunEventKind.QA_REVIEWED, 1),
+        (RunEventKind.QA_REVIEWED, 1),
+        (RunEventKind.RUN_COMPLETED, 0),
+    ]
+    assert events[2].payload == {"approved": False, "issues": 1, "checks": 1, "failed_checks": 1}

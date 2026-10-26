@@ -35,6 +35,7 @@ def test_api_and_persistence_share_one_status_definition():
     assert TERMINAL_STATUSES == {
         RunLifecycleStatus.APPROVED,
         RunLifecycleStatus.REJECTED,
+        RunLifecycleStatus.COMPLETED,
         RunLifecycleStatus.FAILED,
     }
 
@@ -107,4 +108,4 @@ def test_run_id_is_uuid_and_documents_thread_id():
 
 
 def test_alembic_head_is_the_latest_migration():
-    assert expected_head_revision() == "0004"
+    assert expected_head_revision() == "0005"

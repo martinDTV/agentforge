@@ -46,6 +46,15 @@ def test_finished_runs_are_approved_or_rejected():
     assert derive_status(snapshot({**TASK, "approved": False})) == "rejected"
 
 
+def test_workflows_without_a_human_decision_end_completed_unless_they_failed():
+    assert derive_status(snapshot({**TASK, "completed": True})) == "completed"
+    assert (
+        derive_status(snapshot({**TASK, "completed": False}, ("qa",)), in_flight=True) == "running"
+    )
+    failed = snapshot({**TASK, "completed": True, "error": {"code": "x", "message": "m"}})
+    assert derive_status(failed) == "failed"
+
+
 def test_error_in_state_is_failed_even_with_pending_nodes():
     snap = snapshot({**TASK, "error": {"code": "llm_timeout", "message": "m"}}, ("architect",))
     assert derive_status(snap) == "failed"

@@ -14,7 +14,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.contracts.execution import RunError
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus
+from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, WorkflowKind
 from app.security import AccessScope
 
 
@@ -41,6 +41,7 @@ class PersistedRun(BaseModel):
     status: RunLifecycleStatus
     owner_subject: str
     project_id: str
+    workflow_kind: WorkflowKind = WorkflowKind.PLANNING
     revision: int = 0
     llm_calls: int = 0
     architect_approved: bool | None = None
@@ -158,6 +159,7 @@ class RunRepository(Protocol):
         owner_subject: str,
         project_id: str,
         idempotency_key: str | None = None,
+        workflow_kind: WorkflowKind = WorkflowKind.PLANNING,
     ) -> CreateOutcome:
         """Insert the row in ``running`` holding a fresh lease, plus ``run_created``.
 

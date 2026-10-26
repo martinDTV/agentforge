@@ -18,6 +18,10 @@ INTERRUPT_KEY = "__interrupt__"
 
 
 def revision_from_update(update: dict[str, Any], current: int) -> int:
+    for name in ("developer", "revise_development"):
+        value = update.get(name)
+        if isinstance(value, dict) and isinstance(value.get("revision"), int):
+            return int(value["revision"])
     planner = update.get("planner")
     if isinstance(planner, dict) and isinstance(planner.get("revision"), int):
         return int(planner["revision"])
@@ -35,6 +39,23 @@ def events_from_update(
             continue
         if not isinstance(delta, dict):
             continue
+        if node == "qa" and "qa_review" in delta:
+            # The review happened even when it ends the run (correction limit).
+            events.append(
+                RunEvent(
+                    kind=RunEventKind.QA_REVIEWED,
+                    ordinal=revision,
+                    payload={
+                        "approved": bool((delta.get("qa_review") or {}).get("approved")),
+                        "issues": len((delta.get("qa_review") or {}).get("issues", [])),
+                        "checks": len(delta.get("validation", [])),
+                        "failed_checks": sum(
+                            1 for r in delta.get("validation", []) if r.get("exit_code") != 0
+                        ),
+                        "usage": delta.get("usage", {}),
+                    },
+                )
+            )
         if "error" in delta:
             error = delta["error"] or {}
             events.append(
@@ -44,7 +65,29 @@ def events_from_update(
                 )
             )
             continue
-        if node == "planner":
+        if node == "developer":
+            events.append(
+                RunEvent(
+                    kind=RunEventKind.DEVELOPER_COMPLETED,
+                    ordinal=revision,
+                    payload={
+                        "files": len((delta.get("changes") or {}).get("edits", [])),
+                        "usage": delta.get("usage", {}),
+                    },
+                )
+            )
+        elif node == "apply_changes":
+            events.append(
+                RunEvent(
+                    kind=RunEventKind.DEVELOPER_APPLIED,
+                    ordinal=revision,
+                    payload={"files": len(delta.get("changed_files", []))},
+                )
+            )
+        elif node == "qa":
+            if delta.get("completed") is True:
+                events.append(RunEvent(kind=RunEventKind.RUN_COMPLETED))
+        elif node == "planner":
             plan = delta.get("plan") or {}
             if revision > 0:
                 events.append(
@@ -101,6 +144,8 @@ def transition_events(previous: RunLifecycleStatus, updated: PersistedRun) -> li
         return [RunEvent(kind=RunEventKind.RUN_APPROVED)]
     if status is RunLifecycleStatus.REJECTED:
         return [RunEvent(kind=RunEventKind.RUN_REJECTED)]
+    if status is RunLifecycleStatus.COMPLETED:
+        return [RunEvent(kind=RunEventKind.RUN_COMPLETED)]
     return []
 
 
@@ -166,6 +211,7 @@ def events_from_history(history: Sequence[StateSnapshot]) -> list[RunEvent]:
                     checkpoint_id=checkpoint_id,
                 )
             )
+        events.extend(_development_events(values, previous, revision, checkpoint_id))
         if values.get("error") and not previous.get("error"):
             events.append(
                 RunEvent(
@@ -186,6 +232,59 @@ def events_from_history(history: Sequence[StateSnapshot]) -> list[RunEvent]:
         if "approved" in values and "approved" not in previous:
             kind = RunEventKind.RUN_APPROVED if values["approved"] else RunEventKind.RUN_REJECTED
             events.append(RunEvent(kind=kind, checkpoint_id=checkpoint_id))
+        if values.get("completed") is True and not previous.get("completed"):
+            events.append(RunEvent(kind=RunEventKind.RUN_COMPLETED, checkpoint_id=checkpoint_id))
         previous = dict(values)
         previously_interrupted = interrupted
+    return events
+
+
+def _development_events(
+    values: dict[str, Any], previous: dict[str, Any], revision: int, checkpoint_id: str | None
+) -> list[RunEvent]:
+    """Developer/QA node events backed by a checkpoint whose values changed.
+
+    A node ran when its output key changed or the revision moved since the
+    previous checkpoint; re-emitting an identical ``(kind, ordinal)`` is a
+    no-op on insert, so erring on the side of emitting is safe.
+    """
+    moved = int(previous.get("revision", 0) or 0) != revision
+    events: list[RunEvent] = []
+
+    def changed(key: str) -> bool:
+        return key in values and (moved or values.get(key) != previous.get(key))
+
+    if changed("changes"):
+        events.append(
+            RunEvent(
+                kind=RunEventKind.DEVELOPER_COMPLETED,
+                ordinal=revision,
+                payload={"files": len((values.get("changes") or {}).get("edits", []))},
+                checkpoint_id=checkpoint_id,
+            )
+        )
+    if changed("developer_checks"):
+        events.append(
+            RunEvent(
+                kind=RunEventKind.DEVELOPER_APPLIED,
+                ordinal=revision,
+                payload={"files": len(values.get("changed_files") or [])},
+                checkpoint_id=checkpoint_id,
+            )
+        )
+    if changed("qa_review"):
+        validation = values.get("validation") or []
+        events.append(
+            RunEvent(
+                kind=RunEventKind.QA_REVIEWED,
+                ordinal=revision,
+                payload={
+                    "approved": bool((values.get("qa_review") or {}).get("approved")),
+                    "issues": len((values.get("qa_review") or {}).get("issues", [])),
+                    "checks": len(validation),
+                    "failed_checks": sum(1 for r in validation if r.get("exit_code") != 0),
+                },
+                checkpoint_id=checkpoint_id,
+            )
+        )
     return events

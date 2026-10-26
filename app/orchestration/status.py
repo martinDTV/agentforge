@@ -10,7 +10,8 @@ snapshot whose tasks are all done but whose next checkpoint does not exist
 yet, and a concurrent reader must see that as work in progress.
 
 1. ``error`` in the state, or a task that raised -> ``failed``.
-2. ``approved`` written by the approval node -> ``approved`` / ``rejected``.
+2. ``completed`` written by a workflow without human decision -> ``completed``;
+   ``approved`` written by the approval node -> ``approved`` / ``rejected``.
 3. A pending ``interrupt()`` -> ``waiting_approval`` (a real pause).
 4. Anything else -> ``running`` while a live lease says someone is driving
    the graph, else ``interrupted``: the process that was driving it went away.
@@ -45,6 +46,8 @@ def has_pending_interrupt(snapshot: StateSnapshot) -> bool:
 def derive_status(snapshot: StateSnapshot, *, in_flight: bool = False) -> RunLifecycleStatus:
     if derive_error(snapshot) is not None:
         return RunLifecycleStatus.FAILED
+    if snapshot.values.get("completed") is True:
+        return RunLifecycleStatus.COMPLETED
     approved = snapshot.values.get("approved")
     if approved is True:
         return RunLifecycleStatus.APPROVED
