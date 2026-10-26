@@ -20,6 +20,7 @@ from .errors import SandboxError
 
 class ProgramId(StrEnum):
     RUFF_CHECK = "ruff_check"
+    RUFF_CHECK_DIFF = "ruff_check_diff"  # the fix ruff would apply, as a unified diff
     RUFF_FORMAT_CHECK = "ruff_format_check"
     PYTEST = "pytest"
 
@@ -41,6 +42,11 @@ PROGRAMS: dict[ProgramId, ProgramSpec] = {
         id=ProgramId.RUFF_CHECK,
         description="ruff check sobre rutas del worktree",
         argv_prefix=("ruff", "check", "--no-cache", "--output-format", "concise"),
+    ),
+    ProgramId.RUFF_CHECK_DIFF: ProgramSpec(
+        id=ProgramId.RUFF_CHECK_DIFF,
+        description="ruff check --diff: muestra la corrección sin aplicarla (código 1 si hay)",
+        argv_prefix=("ruff", "check", "--no-cache", "--diff"),
     ),
     ProgramId.RUFF_FORMAT_CHECK: ProgramSpec(
         id=ProgramId.RUFF_FORMAT_CHECK,
