@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 from agentforge_runner.auth import token_digest
 from agentforge_runner.backend import ContainerState, RunOutcome, RunSpec
 from agentforge_runner.fake_backend import FakeBackend, completed
@@ -147,6 +148,33 @@ def test_backend_outcomes_are_persisted_as_results(tmp_path: Path):
     assert killed["status"] == "killed" and killed["usage"]["oom_killed"] is True
 
 
+def test_cleanup_failure_latches_readiness_and_refuses_more_work(tmp_path: Path):
+    harness = make_harness(tmp_path)
+
+    def failed_cleanup(spec: RunSpec) -> RunOutcome:
+        base = completed(spec)
+        return RunOutcome(
+            **{
+                **base.__dict__,
+                "status": SandboxStatus.FAILED,
+                "exit_code": None,
+                "detail": "container_cleanup_failed",
+            }
+        )
+
+    harness.backend.outcome = failed_cleanup
+    with harness.client() as client:
+        first = post(client, make_request())
+        assert first.status_code == 200
+        assert first.json()["status"] == "failed"
+        health = client.get("/v1/health?refresh=true", headers=AUTH).json()
+        assert health["ready"] is False
+        assert any(c["name"] == "container_cleanup" and not c["ok"] for c in health["checks"])
+        second = post(client, make_request())
+        assert second.status_code == 503 and second.json()["code"] == "isolation_unavailable"
+    assert len(harness.backend.runs) == 1
+
+
 def _crashed_store(tmp_path: Path, container: str) -> tuple[ExecutionStore, object]:
     settings = make_settings(tmp_path, admin_token_sha256=token_digest(ADMIN_TOKEN))
     store = ExecutionStore(settings.state_dir / "executions.sqlite3")
@@ -216,6 +244,21 @@ def test_startup_reconciles_with_engine_evidence_instead_of_guessing(tmp_path: P
             and record2.error_code == "runner_restarted"
         )
         assert backend2.killed == ["agentforge-live"] and "agentforge-live" in backend2.removed
+
+
+def test_startup_refuses_to_report_a_failed_orphan_cleanup_as_success(tmp_path: Path):
+    class Unremovable(FakeBackend):
+        def remove(self, container_name: str) -> bool:
+            return False
+
+    settings = make_settings(tmp_path)
+    store = ExecutionStore(settings.state_dir / "executions.sqlite3")
+    backend = Unremovable()
+    backend.existing = ["agentforge-orphan"]
+    harness = RunnerHarness(settings, backend, store, create_runner_app(settings, backend, store))
+    with pytest.raises(RuntimeError, match="huérfano"):
+        with harness.client():
+            pass
 
 
 def test_operators_inspect_and_close_uncertain_executions_but_never_mark_them_successful(
@@ -299,6 +342,31 @@ def test_operators_inspect_and_close_uncertain_executions_but_never_mark_them_su
         assert client.get("/v1/admin/executions", headers=ADMIN).status_code == 404
 
 
+def test_admin_reconcile_keeps_execution_uncertain_when_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    reopened, (settings, request) = _crashed_store(tmp_path, "agentforge-kept")
+    backend = FakeBackend()
+    harness = RunnerHarness(
+        settings, backend, reopened, create_runner_app(settings, backend, reopened)
+    )  # type: ignore[arg-type]
+    with harness.client() as client:
+        backend.states["agentforge-kept"] = ContainerState(
+            name="agentforge-kept",
+            running=False,
+            exit_code=0,
+            oom_killed=False,
+            finished_at=datetime.now(UTC),
+        )
+        monkeypatch.setattr(backend, "remove", lambda _: False)
+        response = client.post(
+            f"/v1/admin/executions/{request.execution_id}/reconcile", headers=ADMIN
+        )  # type: ignore[attr-defined]
+        assert response.status_code == 503
+        assert response.json()["code"] == "container_cleanup_failed"
+        assert reopened.get(request.execution_id).state == "uncertain"  # type: ignore[union-attr,attr-defined]
+
+
 def test_isolation_that_cannot_be_proven_refuses_all_work(tmp_path: Path):
     harness = make_harness(tmp_path)
     harness.backend.isolation_ok = False
@@ -324,6 +392,8 @@ class ScriptedPodman:
         self.calls: list[list[str]] = []
 
     probe_ok = True
+    remove_exit = 0
+    list_exit = 0
 
     def run(self, argv: Any, *, timeout: float, stdin: bytes | None = None) -> Completed:
         argv = list(argv)
@@ -335,7 +405,11 @@ class ScriptedPodman:
         if argv[1] == "run":  # the isolation probe (never a real workload here)
             assert stdin == b"" and "--network" in argv and "none" in argv
             return Completed(0, json.dumps(probe_payload(ok=self.probe_ok)), "")
-        if argv[1] in ("kill", "rm", "ps"):
+        if argv[1] == "rm":
+            return Completed(self.remove_exit, "", "")
+        if argv[1] == "ps":
+            return Completed(self.list_exit, "", "")
+        if argv[1] == "kill":
             return Completed(0, "", "")
         if argv[1] == "inspect":
             return Completed(0, "false false 0 2026-10-25T00:00:00Z", "")
@@ -395,6 +469,13 @@ def test_podman_preflight_requires_rootless_cgroups_v2_controllers_and_pinned_im
     leaked = PodmanBackend("podman", runner=leaky, uid=1000, gid=1000).preflight({"p": IMAGE})
     assert not leaked.ok
     assert not next(c for c in leaked.checks if c.name == "probe:network_blocked").ok
+    failed_cleanup = ScriptedPodman(ROOTLESS_INFO)
+    failed_cleanup.remove_exit = 125
+    cleanup_report = PodmanBackend("podman", runner=failed_cleanup, uid=1000, gid=1000).preflight(
+        {"p": IMAGE}
+    )
+    assert not cleanup_report.ok
+    assert not next(c for c in cleanup_report.checks if c.name == "probe:cleanup").ok
     assert {c.name for c in report.checks} >= {
         "rootless",
         "cgroups_v2",
@@ -612,3 +693,31 @@ def test_an_engine_side_timeout_is_still_reported_as_a_timeout():
         ).status
         is SandboxStatus.COMPLETED
     )
+
+
+def test_failed_container_cleanup_never_reports_a_completed_run():
+    process = FakeProcess(seconds=0, returncode=0)
+    podman = TimingPodman(process)
+    podman.remove_exit = 125
+    backend = PodmanBackend("podman", runner=podman, uid=1000, gid=1000, probe=False)
+    spec = RunSpec(
+        "agentforge-cleanup",
+        IMAGE,
+        ["ruff"],
+        {},
+        DEFAULT_ARCHIVE,
+        SandboxLimits(wall_seconds=5),
+        100,
+    )
+    outcome = backend.run(spec)
+    assert outcome.status is SandboxStatus.FAILED
+    assert outcome.exit_code is None and outcome.detail == "container_cleanup_failed"
+    assert backend.remove(spec.container_name) is False
+
+
+def test_failed_container_listing_is_not_treated_as_an_empty_list():
+    podman = ScriptedPodman(ROOTLESS_INFO)
+    podman.list_exit = 125
+    backend = PodmanBackend("podman", runner=podman, uid=1000, gid=1000)
+    with pytest.raises(RuntimeError, match="enumerar"):
+        backend.list_containers()

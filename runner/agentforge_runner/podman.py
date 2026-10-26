@@ -363,6 +363,14 @@ class PodmanBackend:
         )
         try:
             info = self._runner.run([self._podman, "info", "--format", "json"], timeout=30)
+            if info.returncode != 0:
+                import logging
+
+                logging.getLogger("agentforge_runner").error(
+                    "podman info failed: exit=%s stderr=%s",
+                    info.returncode,
+                    info.stderr[-500:],
+                )
             data = json.loads(info.stdout) if info.returncode == 0 else {}
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             checks.append(IsolationCheck(name="podman_info", ok=False, detail=type(exc).__name__))
@@ -415,18 +423,23 @@ class PodmanBackend:
         try:
             completed = self._runner.run(argv, timeout=PROBE_LIMITS.wall_seconds + 30, stdin=b"")
         except (OSError, subprocess.TimeoutExpired) as exc:
-            self.remove(name)
-            return [IsolationCheck(name="probe", ok=False, detail=type(exc).__name__)]
-        self.remove(name)
+            removed = self.remove(name)
+            return [
+                IsolationCheck(name="probe", ok=False, detail=type(exc).__name__),
+                IsolationCheck(name="probe:cleanup", ok=removed, detail="podman rm"),
+            ]
+        removed = self.remove(name)
+        cleanup = IsolationCheck(name="probe:cleanup", ok=removed, detail="podman rm")
         if completed.returncode != 0:
             return [
                 IsolationCheck(
                     name="probe",
                     ok=False,
                     detail=f"exit {completed.returncode}: {completed.stderr[-200:]}",
-                )
+                ),
+                cleanup,
             ]
-        return evaluate_probe(completed.stdout, PROBE_LIMITS)
+        return [*evaluate_probe(completed.stdout, PROBE_LIMITS), cleanup]
 
     # -- execution ------------------------------------------------------------------------
 
@@ -471,7 +484,7 @@ class PodmanBackend:
         duration_ms = int(elapsed * 1000)
         finished_at = datetime.now(UTC)
         state = self.inspect(spec.container_name)
-        self.remove(spec.container_name)
+        removed = self.remove(spec.container_name)
         oom_killed = state.oom_killed if state is not None else False
         inspected_exit = state.exit_code if state is not None else None
         exit_code = inspected_exit if inspected_exit is not None else returncode
@@ -480,7 +493,9 @@ class PodmanBackend:
         engine_timed_out = elapsed >= spec.limits.wall_seconds * 0.95 and (
             inspected_exit in (-1, 137) or returncode in (137, 255)
         )
-        if timed_out.is_set() or engine_timed_out:
+        if not removed:
+            status = SandboxStatus.FAILED
+        elif timed_out.is_set() or engine_timed_out:
             status = SandboxStatus.TIMED_OUT
         elif oom_killed:
             status = SandboxStatus.KILLED
@@ -490,6 +505,11 @@ class PodmanBackend:
             status = SandboxStatus.FAILED
         else:
             status = SandboxStatus.COMPLETED
+        detail = (
+            "container_cleanup_failed"
+            if not removed
+            else (err.text[-500:] if status is SandboxStatus.FAILED else "")
+        )
         return RunOutcome(
             status=status,
             exit_code=None if status is SandboxStatus.FAILED else exit_code,
@@ -501,7 +521,7 @@ class PodmanBackend:
             started_at=started_at,
             finished_at=finished_at,
             oom_killed=oom_killed,
-            detail=err.text[-500:] if status is SandboxStatus.FAILED else "",
+            detail=detail,
         )
 
     def kill(self, container_name: str) -> bool:
@@ -548,11 +568,24 @@ class PodmanBackend:
             finished_at=finished,
         )
 
-    def remove(self, container_name: str) -> None:
+    def remove(self, container_name: str) -> bool:
         try:
-            self._runner.run([self._podman, "rm", "-f", "--volumes", container_name], timeout=30)
+            removed = self._runner.run(
+                [self._podman, "rm", "-f", "--volumes", container_name], timeout=30
+            )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("No se pudo eliminar el contenedor %s: %s", container_name, exc)
+            logger.warning(
+                "No se pudo eliminar el contenedor %s: %s", container_name, type(exc).__name__
+            )
+            return False
+        if removed.returncode != 0:
+            logger.warning(
+                "No se pudo eliminar el contenedor %s: podman rm exit=%d",
+                container_name,
+                removed.returncode,
+            )
+            return False
+        return True
 
     def list_containers(self) -> list[str]:
         try:
@@ -568,8 +601,13 @@ class PodmanBackend:
                 ],
                 timeout=30,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return []
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("no se pudieron enumerar los contenedores de AgentForge") from exc
+        if listed.returncode != 0:
+            raise RuntimeError(
+                "no se pudieron enumerar los contenedores de AgentForge: "
+                f"podman ps exit={listed.returncode}"
+            )
         return [n for n in listed.stdout.split() if n.startswith(CONTAINER_PREFIX)]
 
     # -- internals ------------------------------------------------------------------------

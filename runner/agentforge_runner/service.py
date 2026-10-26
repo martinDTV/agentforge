@@ -37,6 +37,7 @@ from .extract import ExtractionLimits, scan_archive, verify_archive
 from .programs import ensure_paths_in_manifest, validate_argv
 from .protocol import (
     ExecutionView,
+    IsolationCheck,
     ResolveRequest,
     ResourceUsage,
     RunnerHealth,
@@ -62,6 +63,12 @@ class RunnerState:
         self.containers: dict[UUID, str] = {}
         self._report: IsolationReport | None = None
         self._report_at = 0.0
+        self._cleanup_failed = False
+
+    def mark_cleanup_failed(self) -> None:
+        with self.lock:
+            self._cleanup_failed = True
+            self._report = None
 
     def isolation(self, *, force: bool = False) -> IsolationReport:
         now = time.monotonic()
@@ -74,6 +81,20 @@ class RunnerState:
             return cached
         report = self.backend.preflight(self.settings.images)
         with self.lock:
+            if self._cleanup_failed:
+                report = IsolationReport(
+                    ok=False,
+                    rootless=report.rootless,
+                    backend=report.backend,
+                    checks=[
+                        *report.checks,
+                        IsolationCheck(
+                            name="container_cleanup",
+                            ok=False,
+                            detail="requiere reconciliación al reiniciar",
+                        ),
+                    ],
+                )
             self._report, self._report_at = report, now
         return report
 
@@ -256,8 +277,12 @@ def create_runner_app(
         if evidence.running:
             backend.kill(evidence.name)
             evidence = backend.inspect(evidence.name) or evidence
+        if not backend.remove(evidence.name):
+            state.mark_cleanup_failed()
+            raise RunnerError(
+                "container_cleanup_failed", "no se pudo eliminar el contenedor", status=503
+            )
         _close_with_evidence(record, evidence, error_code="reconciled")
-        backend.remove(evidence.name)
         logger.warning(
             "Ejecución %s reconciliada con evidencia del motor: %s", execution_id, evidence
         )
@@ -268,6 +293,11 @@ def create_runner_app(
         record = _record(execution_id)
         if record.state != "uncertain":
             raise RunnerError("not_uncertain", f"la ejecución está {record.state}", status=409)
+        if record.container_name and not backend.remove(record.container_name):
+            state.mark_cleanup_failed()
+            raise RunnerError(
+                "container_cleanup_failed", "no se pudo eliminar el contenedor", status=503
+            )
         result = _synthetic(record, SandboxStatus.FAILED, f"operator: {body.reason}")
         store.resolve(
             execution_id,
@@ -275,8 +305,6 @@ def create_runner_app(
             resolution=f"operator:{body.outcome}",
             error_code="resolved_failed",
         )
-        if record.container_name:
-            backend.remove(record.container_name)
         logger.warning(
             "Ejecución %s resuelta por un operador como fallida: %s", execution_id, body.reason
         )
@@ -298,9 +326,13 @@ def create_runner_app(
                 store.mark_uncertain(row.execution_id, "container_missing")
                 continue
             store.mark_uncertain(row.execution_id, "runner_restarted")
-            if evidence.running:
+            was_running = evidence.running
+            if was_running:
                 backend.kill(evidence.name)
                 evidence = backend.inspect(evidence.name) or evidence
+            if not backend.remove(evidence.name):
+                raise RuntimeError("no se pudo eliminar un contenedor durante la reconciliación")
+            if was_running:
                 record = store.get(row.execution_id)
                 if record is not None:
                     _close_with_evidence(
@@ -313,13 +345,13 @@ def create_runner_app(
                 record = store.get(row.execution_id)
                 if record is not None:
                     _close_with_evidence(record, evidence, error_code="reconciled")
-            backend.remove(evidence.name)
         known = {r.container_name for r in store.open_executions()} | {
             r.container_name for r in open_rows
         }
         orphans = [name for name in backend.list_containers() if name not in known]
         for name in orphans:
-            backend.remove(name)
+            if not backend.remove(name):
+                raise RuntimeError("no se pudo eliminar un contenedor huérfano durante el arranque")
         if open_rows or orphans:
             logger.warning(
                 "Arranque: %d ejecuciones abiertas reconciliadas, "
@@ -400,6 +432,8 @@ def create_runner_app(
             output_cap=min(sandbox_request.limits.max_output_bytes, settings.max_output_bytes),
         )
         outcome = backend.run(spec)
+        if outcome.detail == "container_cleanup_failed":
+            state.mark_cleanup_failed()
         latest = store.get(execution_id)
         cancelled = latest.cancel_requested if latest is not None else False
         status = outcome.status

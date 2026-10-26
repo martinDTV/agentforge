@@ -98,11 +98,12 @@ class FakeBackend:
     def inspect(self, container_name: str) -> ContainerState | None:
         return self.states.get(container_name)
 
-    def remove(self, container_name: str) -> None:
+    def remove(self, container_name: str) -> bool:
         self.removed.append(container_name)
         self.states.pop(container_name, None)
         if container_name in self.existing:
             self.existing.remove(container_name)
+        return True
 
     def list_containers(self) -> list[str]:
         return list(self.existing) + [n for n in self.states if n not in self.existing]
