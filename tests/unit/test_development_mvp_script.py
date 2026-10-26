@@ -210,9 +210,11 @@ def test_the_operator_principal_can_create_and_audit_but_not_approve_or_use_tool
     assert principal.kind == "user" and principal.projects == {PROJECT}
     assert policy.has(principal, Permission.RUNS_CREATE)
     assert policy.has(principal, Permission.RUNS_AUDIT_READ)
-    assert not policy.has(principal, Permission.RUNS_APPROVE)
+    assert policy.has(principal, Permission.REPOS_WRITE)  # development runs need it
     assert not policy.has(principal, Permission.TOOLS_EXECUTE)
+    assert not policy.has(principal, Permission.REPOS_PUBLISH)
     assert not policy.has(principal, Permission.PROJECTS_ALL)
+    assert not policy.has(principal, Permission.RECOVERY_SWEEP)
     assert policy.resolve_project_for_create(principal, PROJECT) == PROJECT
 
 

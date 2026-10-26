@@ -18,10 +18,14 @@ yet, and a concurrent reader must see that as work in progress.
    Such a run is recoverable from its last checkpoint.
 """
 
-from langgraph.types import StateSnapshot
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+from langgraph.types import Interrupt, StateSnapshot
 
 from app.contracts.execution import RunError, RunResponse
-from app.contracts.lifecycle import RunLifecycleStatus
+from app.contracts.lifecycle import DecisionStage, RunLifecycleStatus
 from app.contracts.planning import ArchitectureReview, DevelopmentPlan
 
 INTERNAL_ERROR_CODE = "internal_error"
@@ -41,6 +45,57 @@ def derive_error(snapshot: StateSnapshot) -> RunError | None:
 
 def has_pending_interrupt(snapshot: StateSnapshot) -> bool:
     return bool(snapshot.interrupts) or any(task.interrupts for task in snapshot.tasks)
+
+
+_STAGE_BY_KIND: dict[str, DecisionStage] = {
+    "approve_plan": DecisionStage.PLAN,
+    "approve_scope": DecisionStage.SCOPE,
+    "approve_publication": DecisionStage.PUBLISH,
+}
+
+
+@dataclass(frozen=True)
+class PendingDecision:
+    """What the graph is waiting for, read from the interrupt payload (ADR 0009)."""
+
+    stage: DecisionStage
+    scope_digest: str | None
+    deadline: datetime | None
+    payload: dict[str, Any]
+
+
+def _interrupts(snapshot: StateSnapshot) -> list[Interrupt]:
+    found = list(snapshot.interrupts)
+    for task in snapshot.tasks:
+        found.extend(task.interrupts)
+    return found
+
+
+def pending_decision(snapshot: StateSnapshot) -> PendingDecision | None:
+    for interrupt in _interrupts(snapshot):
+        value = interrupt.value
+        if not isinstance(value, dict):
+            continue
+        stage = _STAGE_BY_KIND.get(str(value.get("kind")))
+        if stage is None:
+            continue
+        deadline = value.get("deadline")
+        parsed: datetime | None = None
+        if isinstance(deadline, str):
+            try:
+                parsed = datetime.fromisoformat(deadline)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+            except ValueError:
+                parsed = None
+        digest = value.get("scope_digest")
+        return PendingDecision(
+            stage=stage,
+            scope_digest=str(digest) if isinstance(digest, str) else None,
+            deadline=parsed,
+            payload=dict(value),
+        )
+    return None
 
 
 def derive_status(snapshot: StateSnapshot, *, in_flight: bool = False) -> RunLifecycleStatus:

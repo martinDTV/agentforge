@@ -8,11 +8,13 @@ consulted here and are not changed anywhere.
 """
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from uuid import UUID
 
+from app.contracts.scope import is_canonical_relative_path
 from app.contracts.tools import AgentKind, RiskClass
 
 from .policy import AuthorizationPolicy
@@ -23,18 +25,11 @@ SANDBOX_PREFIX = "sandbox-"
 MAX_WRITABLE_PATHS = 16
 
 
-def canonical_relative_path(path: str) -> bool:
-    """``a/b.py`` form only: relative, normalised, no ``..``, no empty or dot parts."""
-    if not path or len(path) > 1024 or "\x00" in path or path.startswith(("/", "\\", "~")):
-        return False
-    pure = PurePosixPath(path)
-    parts = pure.parts
-    return (
-        bool(parts)
-        and pure.as_posix() == path
-        and all(part not in ("", ".", "..") for part in parts)
-        and not path.endswith("/")
-    )
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+canonical_relative_path = is_canonical_relative_path
 
 
 @dataclass(frozen=True)
@@ -45,6 +40,9 @@ class DevelopmentScope:
     workspace_root: Path
     expires_at: datetime
     writable_paths: frozenset[str]
+    # The clock that decides expiry: the runtime's clock, so a deadline taken
+    # from a checkpoint and the check against it never disagree.
+    clock: Callable[[], datetime] = field(default=_utcnow, repr=False, compare=False)
     _revoked: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -73,7 +71,7 @@ class DevelopmentScope:
     def permits(self, context: ToolContextLike) -> bool:
         return (
             not self.revoked
-            and datetime.now(UTC) < self.expires_at
+            and self.clock() < self.expires_at
             and getattr(context, "run_id", None) == self.run_id
             and context.project_id == self.project_id
             and getattr(context, "workspace_root", None) == self.workspace_root

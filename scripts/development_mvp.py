@@ -67,6 +67,7 @@ from app.orchestration.development import DevelopmentDeps, build_development_gra
 from app.orchestration.policy import RecoveryPolicy
 from app.orchestration.ports import RunProjection, RunRepository
 from app.orchestration.runs import RunService
+from app.projects import ProjectPolicyRegistry, RepositoryPolicy
 from app.sandbox import SandboxPort
 from app.security import AuthorizationPolicy, Principal
 from app.security.development import DevelopmentScope, DevelopmentToolPolicy
@@ -145,12 +146,13 @@ def require_verified_runner(sandbox: SandboxPort) -> str:
 
 
 def operator_principal(project_id: str) -> Principal:
-    """The human operator of this script: may create and audit runs in the sandbox project."""
+    """The human operator of this script: may create development runs, approve their
+    scope and audit them in the sandbox project (``project_operator``, ADR 0009)."""
     return Principal(
         subject=OPERATOR_SUBJECT,
         kind="user",
         issuer=OPERATOR_ISSUER,
-        roles=frozenset({"operator"}),
+        roles=frozenset({"project_operator"}),
         projects=frozenset({project_id}),
     )
 
@@ -771,6 +773,24 @@ async def run_development(
     )
     graph = build_development_graph(graph_deps, checkpointer=deps.checkpointer)
     owner = f"development-mvp:{uuid.uuid4().hex[:8]}"
+    # The operator's explicit file list is the policy of this run: RunService
+    # enforces the same deny-by-default checks the API applies (ADR 0009).
+    policies = ProjectPolicyRegistry(
+        [
+            RepositoryPolicy(
+                repository_id=repository.id,
+                project_id=project_id,
+                writable_globs=sorted(writable_paths),
+                test_paths=list(test_paths),
+                lint_paths=list(lint_paths),
+                max_corrections=budget.max_corrections,
+                wall_seconds=budget.wall_seconds,
+                model_timeout_seconds=min(budget.model_timeout_seconds, budget.wall_seconds),
+                max_reserved_usd=min(budget.max_usd, 50.0),
+                ruff_diff=budget.ruff_diff,
+            )
+        ]
+    )
     service = RunService(
         graph,
         deps.runs,
@@ -778,6 +798,7 @@ async def run_development(
         owner=owner,
         authorization=AuthorizationPolicy(separation_of_duties=False),
         workflow_kind=WorkflowKind.DEVELOPMENT,
+        policies=policies,
     )
     summary = json.dumps(
         {
@@ -810,7 +831,13 @@ async def run_development(
             raise DevelopmentRefused("not_confirmed", "el operador no confirmó la ejecución")
         deps.out(f"run {run_id}: iniciando Developer → QA sobre {repository.id}")
         try:
-            await service.create(task, principal, project_id=project_id, run_id=str(run_id))
+            await service.create(
+                task,
+                principal,
+                project_id=project_id,
+                run_id=str(run_id),
+                repository_id=repository.id,
+            )
         except (asyncio.CancelledError, KeyboardInterrupt):
             await _fail_cancelled(deps.runs, run_id, owner)
             raise

@@ -47,6 +47,13 @@ class RunState(TypedDict, total=False):
     usage: dict[str, Any]
     changed_files: list[str]
     final_diff: dict[str, Any]
+    # Governed development (Fase 7): where the run works and what a human approved.
+    project_id: str
+    repository_id: str
+    workspace_root: str
+    scope_proposal: dict[str, Any]
+    approved_scope: dict[str, Any]
+    development_deadline: str
 
 
 RunGraph = CompiledStateGraph[RunState, None, RunState, RunState]

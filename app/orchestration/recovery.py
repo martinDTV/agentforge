@@ -31,13 +31,14 @@ class RecoveryReport(BaseModel):
     claimed: int = 0
     outcomes: dict[str, int] = Field(default_factory=dict)
     errors: int = 0
+    expired: int = 0  # waiting runs whose decision window passed (Fase 7)
 
     def add(self, outcome: RecoveryOutcome) -> None:
         self.outcomes[outcome.value] = self.outcomes.get(outcome.value, 0) + 1
 
     @property
     def touched(self) -> bool:
-        return self.claimed > 0 or self.errors > 0
+        return self.claimed > 0 or self.errors > 0 or self.expired > 0
 
 
 class RecoveryService:
@@ -88,6 +89,8 @@ class RecoveryService:
         report = RecoveryReport()
         service = self._service
         try:
+            if projects is None:
+                report.expired = len(await service.expire_waiting(limit=service.policy.batch_size))
             claimed = await service.repository.claim_expired_leases(
                 owner=service.owner,
                 ttl_seconds=service.policy.lease_ttl_seconds,

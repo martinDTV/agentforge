@@ -1,7 +1,8 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
@@ -13,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 from app.contracts.execution import RunError, RunResponse
 from app.contracts.lifecycle import (
     TERMINAL_STATUSES,
+    DecisionStage,
     RunEventKind,
     RunLifecycleStatus,
     WorkflowKind,
@@ -20,22 +22,31 @@ from app.contracts.lifecycle import (
 from app.contracts.planning import ArchitectureReview, DevelopmentPlan
 from app.infrastructure.db.errors import DatabaseUnavailableError
 from app.orchestration.events import (
+    attribute,
     events_from_history,
     events_from_update,
     revision_from_update,
     transition_events,
 )
 from app.orchestration.exceptions import (
+    DecisionExpiredError,
+    DecisionStageMismatchError,
+    DecisionStaleError,
     IdempotencyKeyReusedError,
     LeaseLostError,
+    RepositoryNotAuthorizedError,
+    RepositoryRequiredError,
     RunAlreadyDecidedError,
+    RunNotCancellableError,
     RunNotFoundError,
     RunNotResumableError,
     ShuttingDownError,
+    WorkflowUnavailableError,
 )
 from app.orchestration.graph import RunGraph
 from app.orchestration.policy import RecoveryPolicy, new_owner_id
 from app.orchestration.ports import (
+    DecisionRecord,
     LeaseToken,
     PersistedEvent,
     PersistedRun,
@@ -45,13 +56,21 @@ from app.orchestration.ports import (
     RunRepository,
 )
 from app.orchestration.projection import build_projection, projection_differs
-from app.orchestration.status import checkpoint_id_of, derive_status, has_pending_interrupt
-from app.security import AuthorizationPolicy, Permission, Principal
+from app.orchestration.status import (
+    PendingDecision,
+    checkpoint_id_of,
+    derive_status,
+    has_pending_interrupt,
+    pending_decision,
+)
+from app.projects import PolicyError, ProjectPolicyRegistry
+from app.security import AuthorizationPolicy, Permission, PermissionDeniedError, Principal
 
 logger = logging.getLogger(__name__)
 
 ABANDONED_CODE = "abandoned"
 _S = RunLifecycleStatus
+_WAITING = frozenset({_S.WAITING_APPROVAL, _S.RESUME_PENDING})
 
 
 def _config(run_id: UUID) -> RunnableConfig:
@@ -73,6 +92,9 @@ def _response(row: PersistedRun) -> RunResponse:
         owner=row.owner_subject,
         project_id=row.project_id,
         workflow_kind=row.workflow_kind,
+        pending_stage=row.pending_stage,
+        approval_deadline=row.approval_deadline,
+        publication=row.publication,
         revision=row.revision,
         llm_calls=row.llm_calls,
         architect_approved=row.architect_approved,
@@ -122,6 +144,20 @@ class EventListing(BaseModel):
     has_more: bool
 
 
+class DecisionsView(BaseModel):
+    """Decisions already taken for a run and the one it waits for, if any."""
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    status: RunLifecycleStatus
+    pending: PendingDecision | None
+    decisions: list[DecisionRecord]
+
+
+TerminalHook = Callable[[PersistedRun], Awaitable[None]]
+
+
 class RunService:
     """Use cases over a compiled run graph and a ``RunRepository``.
 
@@ -148,9 +184,21 @@ class RunService:
         owner: str | None = None,
         authorization: AuthorizationPolicy | None = None,
         workflow_kind: WorkflowKind = WorkflowKind.PLANNING,
+        graphs: Mapping[WorkflowKind, RunGraph] | None = None,
+        policies: ProjectPolicyRegistry | None = None,
+        on_terminal: TerminalHook | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
+        # ``graph`` reads any run's checkpoint (every workflow shares RunState);
+        # ``graphs`` says which compiled graph may *drive* each workflow kind.
         self._graph = graph
         self._workflow_kind = WorkflowKind(workflow_kind)
+        self._graphs: dict[WorkflowKind, RunGraph] = (
+            dict(graphs) if graphs is not None else {self._workflow_kind: graph}
+        )
+        self._policies = policies
+        self._on_terminal = on_terminal
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._repository = repository
         self._policy = policy or RecoveryPolicy()
         # Deny by default: without an injected policy, separation of duties is
@@ -210,11 +258,30 @@ class RunService:
         project_id: str | None = None,
         run_id: str | None = None,
         idempotency_key: str | None = None,
+        workflow_kind: WorkflowKind | None = None,
+        repository_id: str | None = None,
     ) -> CreateResult:
         self._ensure_accepting()
         # Authorization first: nothing is written until the principal may
         # create in a project it belongs to (403/400 come from the policy).
         project = self._authz.resolve_project_for_create(principal, project_id)
+        kind = WorkflowKind(workflow_kind) if workflow_kind is not None else self._workflow_kind
+        graph = self._graph_for(kind)
+        graph_input: dict[str, Any] = {"task": task, "workflow_kind": kind.value}
+        if kind is WorkflowKind.DEVELOPMENT:
+            # Writing inside a worktree is a separate human permission (ADR 0009)
+            # and the repository must carry an explicit policy for the project.
+            if repository_id is None:
+                raise RepositoryRequiredError()
+            if not self._authz.has(principal, Permission.REPOS_WRITE):
+                raise PermissionDeniedError("Falta el permiso repos:write.")
+            if self._policies is None:
+                raise WorkflowUnavailableError(kind.value)
+            try:
+                self._policies.require(repository_id, project)
+            except PolicyError as exc:
+                raise RepositoryNotAuthorizedError(repository_id, project) from exc
+            graph_input.update(project_id=project, repository_id=repository_id)
         rid = _parse(run_id) if run_id else uuid4()
         # The row (status=running, lease held by us) exists before any LLM work:
         # a crash from here on leaves something to recover, never an orphan.
@@ -226,7 +293,7 @@ class RunService:
             owner_subject=principal.subject,
             project_id=project,
             idempotency_key=idempotency_key,
-            workflow_kind=self._workflow_kind,
+            workflow_kind=kind,
         )
         if not outcome.created:
             # Same key, same principal, same project: reuse only if it is the
@@ -238,9 +305,7 @@ class RunService:
             )
         assert outcome.lease is not None
         async with self._lock(rid):
-            await self._drive(
-                rid, {"task": task, "workflow_kind": self._workflow_kind.value}, outcome.lease
-            )
+            await self._drive(rid, graph_input, outcome.lease, graph=graph)
         return CreateResult(response=await self.get(str(rid), principal), created=True)
 
     async def get(self, run_id: str, principal: Principal) -> RunResponse:
@@ -250,7 +315,22 @@ class RunService:
             row = await self._project(rid, row=row)
         return _response(row)
 
-    async def approve(self, run_id: str, approved: bool, principal: Principal) -> RunResponse:
+    async def approve(
+        self,
+        run_id: str,
+        approved: bool,
+        principal: Principal,
+        *,
+        stage: DecisionStage | None = None,
+        scope_digest: str | None = None,
+    ) -> RunResponse:
+        """Record and apply a human decision for the stage the run waits for.
+
+        ``stage`` is optional for the planning flow (the only stage it has);
+        a ``scope`` decision additionally requires ``repos:write`` and must
+        carry the digest of the exact proposal shown (``409 decision_stale``
+        otherwise), and is refused once its window expired.
+        """
         self._ensure_accepting()
         rid = _parse(run_id)
         async with self._lock(rid):
@@ -259,25 +339,134 @@ class RunService:
             decision = self._authz.decide(principal, Permission.RUNS_APPROVE, row)
             if not decision.allowed:
                 self._authz.raise_for(decision, run_id=run_id)
-            claim = await self._repository.claim_approval(
+            pending = await self._pending(rid, row)
+            pending_stage = pending.stage if pending is not None else None
+            if pending_stage is None and row.workflow_kind is WorkflowKind.PLANNING:
+                pending_stage = DecisionStage.PLAN
+            if stage is not None and pending_stage is not None and stage is not pending_stage:
+                raise DecisionStageMismatchError(run_id, pending_stage.value, stage.value)
+            effective = stage or pending_stage
+            if effective is None:
+                # Nothing pending: the only legitimate call left is an idempotent
+                # replay of the last decision taken, so compare against that stage.
+                taken = await self._repository.list_decisions(rid)
+                effective = taken[-1].stage if taken else DecisionStage.PLAN
+            digest: str | None = None
+            if effective is DecisionStage.SCOPE:
+                if not self._authz.has(principal, Permission.REPOS_WRITE):
+                    raise PermissionDeniedError("Falta el permiso repos:write.")
+                if pending is not None and pending.deadline is not None:
+                    if self._clock() > pending.deadline:
+                        await self._expire(row)
+                        raise DecisionExpiredError(run_id)
+                if pending is not None and (
+                    scope_digest is None or scope_digest != pending.scope_digest
+                ):
+                    raise DecisionStaleError(run_id)
+                digest = pending.scope_digest if pending is not None else scope_digest
+            claim = await self._repository.claim_decision(
                 rid,
+                effective,
                 approved,
                 owner=self._owner,
                 ttl_seconds=self._policy.lease_ttl_seconds,
                 decided_by=principal.subject,
+                scope_digest=digest,
             )
             if claim is None:
                 raise RunNotFoundError(run_id)
             if not claim.claimed:
                 # Same decision again: idempotent replay. Anything else: 409.
-                if claim.existing is not None and claim.existing.approved == approved:
+                if (
+                    claim.existing is not None
+                    and claim.existing.approved == approved
+                    and claim.existing.scope_digest == digest
+                ):
                     return await self.get(run_id, principal)
                 raise RunAlreadyDecidedError(run_id, claim.status)
-            assert claim.lease is not None
+            assert claim.lease is not None and claim.existing is not None
             # The decision (and who made it) is durable from this point; applying
             # it may still fail and be finished later by apply_pending_approval.
-            await self._apply_approval(rid, approved, claim.lease, actor=principal.subject)
+            await self._apply_decision(rid, claim.existing, claim.lease, actor=principal.subject)
         return await self.get(run_id, principal)
+
+    async def cancel(self, run_id: str, principal: Principal) -> RunResponse:
+        """Withdraw a run that waits for a decision or sits interrupted (``runs:cancel``).
+
+        Nothing is resumed: the checkpoint stays, the row becomes ``cancelled``
+        and the worktree is released. A run being driven cannot be cancelled here.
+        """
+        self._ensure_accepting()
+        rid = _parse(run_id)
+        async with self._lock(rid):
+            row = await self._visible_row(rid, principal)
+            decision = self._authz.decide(principal, Permission.RUNS_CANCEL, row)
+            if not decision.allowed:
+                self._authz.raise_for(decision, run_id=run_id)
+            if row.status not in TERMINAL_STATUSES:
+                row = await self._project(rid, row=row)
+            cancelled = await self._repository.cancel_run(rid, actor=principal.subject)
+            if cancelled is None:
+                raise RunNotCancellableError(run_id, row.status.value)
+            await self._finished(cancelled)
+        return _response(cancelled)
+
+    async def decisions(self, run_id: str, principal: Principal) -> DecisionsView:
+        """What was decided and what is pending, for a run the principal may see."""
+        rid = _parse(run_id)
+        row = await self._visible_row(rid, principal)
+        if row.status not in TERMINAL_STATUSES:
+            row = await self._project(rid, row=row)
+        pending = await self._pending(rid, row) if row.status in _WAITING else None
+        return DecisionsView(
+            run_id=str(rid),
+            status=row.status,
+            pending=pending,
+            decisions=await self._repository.list_decisions(rid),
+        )
+
+    async def expire_waiting(self, *, limit: int = 50) -> list[PersistedRun]:
+        """Close runs whose decision window passed (called by the recovery sweep)."""
+        expired = await self._repository.expire_waiting_runs(now=self._clock(), limit=limit)
+        for row in expired:
+            await self._finished(row)
+        return expired
+
+    async def _pending(self, rid: UUID, row: PersistedRun) -> PendingDecision | None:
+        snapshot = await self._reader_for(row.workflow_kind).aget_state(_config(rid))
+        return pending_decision(snapshot)
+
+    async def _expire(self, row: PersistedRun) -> None:
+        expired = await self._repository.expire_waiting_runs(now=self._clock(), limit=50)
+        for item in expired:
+            await self._finished(item)
+
+    async def _finished(self, row: PersistedRun) -> None:
+        """Terminal hook (worktree release and the like); never fails the caller."""
+        if self._on_terminal is None or row.status not in TERMINAL_STATUSES:
+            return
+        try:
+            await self._on_terminal(row)
+        except Exception:  # best effort by contract
+            logger.exception("El gancho terminal de %s falló", row.id)
+
+    def _reader_for(self, kind: WorkflowKind) -> RunGraph:
+        """Graph used to *read* a run's checkpoint: the one of its workflow when this
+        process has it (so its interrupts are seen exactly), else the shared default."""
+        if kind is self._workflow_kind:
+            return self._graph
+        return self._graphs.get(kind, self._graph)
+
+    def _graph_for(self, kind: WorkflowKind) -> RunGraph:
+        # The default workflow drives with ``self.graph`` itself, so a test (or
+        # an operator) that swaps it observes the swap; other kinds come from
+        # the explicit mapping and are refused when not configured.
+        if kind is self._workflow_kind:
+            return self._graph
+        graph = self._graphs.get(kind)
+        if graph is None:
+            raise WorkflowUnavailableError(kind.value)
+        return graph
 
     async def list_runs(
         self,
@@ -337,7 +526,7 @@ class RunService:
             if acquired is None:
                 raise RunNotResumableError(run_id, "otro proceso la está reanudando")
             claimed, lease = acquired
-            snapshot = await self._graph.aget_state(_config(rid))
+            snapshot = await self._reader_for(claimed.workflow_kind).aget_state(_config(rid))
             await self._redrive(rid, claimed, snapshot, lease, actor=principal.subject)
         return await self.get(run_id, principal)
 
@@ -367,11 +556,11 @@ class RunService:
             if acquired is None:
                 return await self._read_unchecked(rid)  # someone holds it, or it moved on
             _, lease = acquired
-            decision = await self._repository.get_approval(rid)
-            if decision is None or decision.applied_at is not None:
+            decision = await self._repository.get_pending_decision(rid)
+            if decision is None:
                 await self._repository.release_lease(rid, lease)
                 return await self._read_unchecked(rid)
-            await self._apply_approval(rid, decision.approved, lease, actor=decision.decided_by)
+            await self._apply_decision(rid, decision, lease, actor=decision.decided_by)
         return await self._read_unchecked(rid)
 
     async def _read_unchecked(self, rid: UUID) -> RunResponse:
@@ -395,11 +584,11 @@ class RunService:
         """
         rid = row.id
         async with self._lock(rid):
-            snapshot = await self._graph.aget_state(_config(rid))
+            snapshot = await self._reader_for(row.workflow_kind).aget_state(_config(rid))
             if row.status is _S.RESUME_PENDING:
-                decision = await self._repository.get_approval(rid)
-                if decision is not None and decision.applied_at is None:
-                    await self._apply_approval(rid, decision.approved, lease)
+                decision = await self._repository.get_pending_decision(rid)
+                if decision is not None:
+                    await self._apply_decision(rid, decision, lease)
                     return RecoveryOutcome.APPROVAL_APPLIED
                 await self._project(rid, lease=lease, release=True)
                 return RecoveryOutcome.REPROJECTED
@@ -453,7 +642,7 @@ class RunService:
             actor=actor,
         )
         graph_input: Any = None if has_checkpoint else {"task": row.task}
-        await self._drive(rid, graph_input, lease)
+        await self._drive(rid, graph_input, lease, graph=self._graph_for(row.workflow_kind))
 
     async def _fail_development_interrupted(self, row: PersistedRun, lease: LeaseToken) -> None:
         error = RunError(
@@ -521,7 +710,13 @@ class RunService:
                 self._idle.set()
 
     async def _drive(
-        self, rid: UUID, graph_input: Any, lease: LeaseToken, *, actor: str | None = None
+        self,
+        rid: UUID,
+        graph_input: Any,
+        lease: LeaseToken,
+        *,
+        actor: str | None = None,
+        graph: RunGraph | None = None,
     ) -> None:
         """Run the graph under ``lease`` until it stops, then project and release.
 
@@ -530,7 +725,7 @@ class RunService:
         this process must not keep advancing a run someone else now owns.
         """
         lost = asyncio.Event()
-        stream = asyncio.create_task(self._stream(rid, graph_input, actor))
+        stream = asyncio.create_task(self._stream(rid, graph_input, actor, graph or self._graph))
         heartbeat = asyncio.create_task(self._heartbeat(rid, lease, lost))
         lost_waiter = asyncio.create_task(lost.wait())
         async with self._driving(rid, stream):
@@ -560,13 +755,17 @@ class RunService:
                     task.cancel()
                 await asyncio.gather(heartbeat, lost_waiter, return_exceptions=True)
 
-    async def _stream(self, rid: UUID, graph_input: Any, actor: str | None = None) -> None:
+    async def _stream(
+        self, rid: UUID, graph_input: Any, actor: str | None, graph: RunGraph
+    ) -> None:
         revision = 0
-        async for update in self._graph.astream(graph_input, _config(rid), stream_mode="updates"):
+        async for update in graph.astream(graph_input, _config(rid), stream_mode="updates"):
             revision = revision_from_update(update, revision)
-            # ``actor`` is set for drives caused by a human decision (resume);
-            # node events of a fresh drive belong to the agents, not to a person.
-            await self._record(rid, events_from_update(update, revision=revision), actor=actor)
+            # ``actor`` is the human whose decision caused this drive. Node events
+            # belong to the agents (``executed_by`` in the payload, no actor);
+            # only the events that decision causes directly carry the human.
+            events = events_from_update(update, revision=revision, approved_by=actor)
+            await self._record(rid, attribute(events, actor=actor))
 
     async def _heartbeat(self, rid: UUID, lease: LeaseToken, lost: asyncio.Event) -> None:
         loop = asyncio.get_running_loop()
@@ -592,21 +791,48 @@ class RunService:
 
     # -- internals: projecting ---------------------------------------------------
 
-    async def _apply_approval(
-        self, rid: UUID, approved: bool, lease: LeaseToken, *, actor: str | None = None
+    async def _apply_decision(
+        self, rid: UUID, decision: DecisionRecord, lease: LeaseToken, *, actor: str | None = None
     ) -> None:
-        snapshot = await self._graph.aget_state(_config(rid))
+        """Resume the graph with a recorded decision and confirm it as applied.
+
+        The resume payload names the stage and, for ``scope``, the digest the
+        human saw: the graph refuses anything that does not match its pending
+        interrupt. Applied is confirmed once the run left the waiting states.
+        """
+        row = await self._repository.get_run(rid)
+        if row is None:
+            raise RunNotFoundError(str(rid))
+        snapshot = await self._reader_for(row.workflow_kind).aget_state(_config(rid))
         if has_pending_interrupt(snapshot):
-            await self._drive(rid, Command(resume={"approved": approved}), lease, actor=actor)
+            resume: dict[str, Any] = {"approved": decision.approved, "stage": decision.stage.value}
+            if decision.scope_digest is not None:
+                resume["scope_digest"] = decision.scope_digest
+            await self._drive(
+                rid,
+                Command(resume=resume),
+                lease,
+                actor=actor,
+                graph=self._graph_for(row.workflow_kind),
+            )
         else:
             # The resume already happened (crash after it): only the projection is missing.
             await self._project(rid, lease=lease, release=True)
-        row = await self._repository.get_run(rid)
-        if row is not None and row.status in (_S.APPROVED, _S.REJECTED):
-            if await self._repository.mark_approval_applied(rid):
+        updated = await self._repository.get_run(rid)
+        if updated is not None and updated.status not in _WAITING:
+            if await self._repository.mark_decision_applied(rid, decision.stage):
                 await self._record(
                     rid,
-                    [RunEvent(kind=RunEventKind.APPROVAL_APPLIED, payload={"approved": approved})],
+                    [
+                        RunEvent(
+                            kind=RunEventKind.APPROVAL_APPLIED,
+                            payload={
+                                "approved": decision.approved,
+                                "stage": decision.stage.value,
+                                ("approved_by" if decision.approved else "rejected_by"): actor,
+                            },
+                        )
+                    ],
                     actor=actor,
                 )
 
@@ -630,7 +856,7 @@ class RunService:
             if release and lease is not None:
                 await self._repository.release_lease(rid, lease)
             return current
-        snapshot = await self._graph.aget_state(_config(rid))
+        snapshot = await self._reader_for(current.workflow_kind).aget_state(_config(rid))
         if "task" not in snapshot.values:
             if release and lease is not None:
                 await self._repository.release_lease(rid, lease)
@@ -655,6 +881,8 @@ class RunService:
                 raise LeaseLostError(str(rid))
             return await self._repository.get_run(rid) or current
         await self._record(rid, transition_events(current.status, updated))
+        if updated.status in TERMINAL_STATUSES and current.status not in TERMINAL_STATUSES:
+            await self._finished(updated)
         return updated
 
     async def _project_status(
@@ -708,7 +936,9 @@ class RunService:
 
     async def _backfill_audit(self, rid: UUID) -> None:
         """Add node events the previous owner never wrote, from checkpoint evidence."""
-        history = [snapshot async for snapshot in self._graph.aget_state_history(_config(rid))]
+        row = await self._repository.get_run(rid)
+        reader = self._reader_for(row.workflow_kind) if row is not None else self._graph
+        history = [snapshot async for snapshot in reader.aget_state_history(_config(rid))]
         history.reverse()  # oldest first
         await self._record(rid, events_from_history(history))
 

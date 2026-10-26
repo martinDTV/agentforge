@@ -1,4 +1,5 @@
-from app.exceptions import ConflictError, NotFoundError, UnavailableError
+from app.exceptions import ConflictError, DomainError, NotFoundError, UnavailableError
+from app.security.errors import PermissionDeniedError
 
 
 class RunNotFoundError(NotFoundError):
@@ -58,3 +59,62 @@ class RunNotResumableError(ConflictError):
 
     def __init__(self, run_id: str, reason: str) -> None:
         super().__init__(f"La ejecución '{run_id}' no se puede reanudar: {reason}.")
+
+
+class DecisionStaleError(ConflictError):
+    code = "decision_stale"
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(
+            f"La decisión para la ejecución '{run_id}' no corresponde al alcance propuesto "
+            "actualmente; consulta las decisiones pendientes y repite con su digest."
+        )
+
+
+class DecisionStageMismatchError(ConflictError):
+    code = "decision_stage_mismatch"
+
+    def __init__(self, run_id: str, pending: str | None, requested: str) -> None:
+        super().__init__(
+            f"La ejecución '{run_id}' espera la etapa '{pending}' y se decidió '{requested}'."
+        )
+
+
+class DecisionExpiredError(ConflictError):
+    code = "decision_expired"
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(f"La ventana de decisión de la ejecución '{run_id}' expiró.")
+
+
+class RunNotCancellableError(ConflictError):
+    code = "run_not_cancellable"
+
+    def __init__(self, run_id: str, status: str) -> None:
+        super().__init__(
+            f"La ejecución '{run_id}' no se puede cancelar en su estado actual ({status})."
+        )
+
+
+class WorkflowUnavailableError(UnavailableError):
+    code = "workflow_unavailable"
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(f"El flujo '{kind}' no está configurado en esta instancia.")
+
+
+class RepositoryRequiredError(DomainError):
+    code = "repository_required"
+
+    def __init__(self) -> None:
+        super().__init__("Una ejecución de desarrollo requiere 'repository_id'.")
+
+
+class RepositoryNotAuthorizedError(PermissionDeniedError):
+    code = "repository_not_authorized"
+
+    def __init__(self, repository_id: str, project_id: str) -> None:
+        super().__init__(
+            f"El repositorio '{repository_id}' no admite ejecuciones de desarrollo "
+            f"en el proyecto '{project_id}'."
+        )

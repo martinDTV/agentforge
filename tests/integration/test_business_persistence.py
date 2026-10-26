@@ -278,10 +278,10 @@ def test_decision_is_durable_before_resume_and_survives_a_crash(
         async def crash(*args: Any, **kwargs: Any) -> None:
             raise RuntimeError("process died before Command(resume=...)")
 
-        original = service._apply_approval
-        service._apply_approval = crash  # type: ignore[method-assign]
+        original = service._apply_decision
+        service._apply_decision = crash  # type: ignore[method-assign]
         assert client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}).status_code == 500
-        service._apply_approval = original  # type: ignore[method-assign]
+        service._apply_decision = original  # type: ignore[method-assign]
 
         assert approval_row(url, run_id) == (True, False)
         assert run_row(url, run_id)["status"] == "resume_pending"
