@@ -4,6 +4,7 @@ import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import app.infrastructure.db.models  # noqa: F401
@@ -22,7 +23,7 @@ def test_upgrade_head_on_a_clean_database_creates_the_business_schema(empty_data
         assert set(inspector.get_table_names()) == BUSINESS_TABLES | {"alembic_version"}
         with engine.connect() as conn:
             version = conn.scalar(text("SELECT version_num FROM alembic_version"))
-        assert version == expected_head_revision() == "0004"
+        assert version == expected_head_revision() == "0005"
     finally:
         engine.dispose()
 
@@ -65,6 +66,7 @@ def test_migrated_schema_has_the_designed_constraints(migrated_database_url: str
         runs_checks = {c["name"] for c in inspector.get_check_constraints("runs")}
         assert runs_checks >= {
             "ck_runs_run_status",
+            "ck_runs_run_workflow_kind",
             "ck_runs_lease_fields_paired",
             "ck_runs_error_fields_paired",
             "ck_runs_revision_non_negative",
@@ -96,7 +98,7 @@ async def test_verify_schema_accepts_head_and_rejects_anything_else(
 ):
     good = create_async_engine(migrated_database_url)
     try:
-        assert await verify_schema(good) == "0004"
+        assert await verify_schema(good) == "0005"
     finally:
         await good.dispose()
 
@@ -113,6 +115,60 @@ async def test_verify_schema_accepts_head_and_rejects_anything_else(
     try:
         with pytest.raises(SchemaMismatchError) as wrong:
             await verify_schema(stale)
-        assert (wrong.value.current, wrong.value.expected) == ("9999", "0004")
+        assert (wrong.value.current, wrong.value.expected) == ("9999", "0005")
     finally:
         await stale.dispose()
+
+
+def test_0005_adds_completed_and_workflow_kind_and_refuses_a_lossy_downgrade(
+    empty_database_url: str,
+):
+    migrate(empty_database_url, "0004")
+    engine = create_engine(empty_database_url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO runs (id, task, status, owner_subject, project_id) "
+                    "VALUES (gen_random_uuid(), 't', 'approved', 'alice', 'alpha')"
+                )
+            )
+        migrate(empty_database_url, "0005")
+        with engine.begin() as conn:
+            # Existing rows are planning runs; the new status is accepted.
+            assert conn.scalar(text("SELECT workflow_kind FROM runs")) == "planning"
+            conn.execute(
+                text(
+                    "INSERT INTO runs (id, task, status, owner_subject, project_id, workflow_kind)"
+                    " VALUES (gen_random_uuid(), 't', 'completed', 'alice', 'sandbox-x', "
+                    "'development')"
+                )
+            )
+        with engine.begin() as conn, pytest.raises(IntegrityError):
+            # In its own transaction: a rejected insert must not undo the row above.
+            if True:
+                conn.execute(
+                    text(
+                        "INSERT INTO runs (id, task, status, owner_subject, project_id, "
+                        "workflow_kind) VALUES (gen_random_uuid(), 't', 'running', 'a', 'p', "
+                        "'other')"
+                    )
+                )
+        with pytest.raises(RuntimeError, match="completed"):
+            downgrade(empty_database_url, "0004")
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM runs WHERE status = 'completed'"))
+        downgrade(empty_database_url, "0004")
+        with engine.connect() as conn:
+            assert conn.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+            columns = {c["name"] for c in inspect(engine).get_columns("runs")}
+            assert "workflow_kind" not in columns
+            with pytest.raises(IntegrityError):
+                conn.execute(
+                    text(
+                        "INSERT INTO runs (id, task, status, owner_subject, project_id) "
+                        "VALUES (gen_random_uuid(), 't', 'completed', 'alice', 'alpha')"
+                    )
+                )
+    finally:
+        engine.dispose()

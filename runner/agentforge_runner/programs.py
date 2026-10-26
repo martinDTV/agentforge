@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
 PREFIXES: dict[ProgramId, tuple[str, ...]] = {
     ProgramId.RUFF_CHECK: ("ruff", "check", "--no-cache", "--output-format", "concise"),
+    # Read-only preview of ruff's fix (never ``--fix``): the diff is the diagnostic.
+    ProgramId.RUFF_CHECK_DIFF: ("ruff", "check", "--no-cache", "--diff"),
     ProgramId.RUFF_FORMAT_CHECK: ("ruff", "format", "--check", "--no-cache"),
     ProgramId.PYTEST: ("python", "-I", "-P", "-m", "pytest", "-q", "-p", "no:cacheprovider"),
 }

@@ -11,7 +11,12 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from app.contracts.execution import RunError
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, can_transition
+from app.contracts.lifecycle import (
+    RunEventKind,
+    RunLifecycleStatus,
+    WorkflowKind,
+    can_transition,
+)
 from app.contracts.tools import InvocationStatus
 from app.orchestration.exceptions import RunAlreadyExistsError
 from app.orchestration.ports import (
@@ -77,6 +82,7 @@ class InMemoryRunRepository:
         owner_subject: str,
         project_id: str,
         idempotency_key: str | None = None,
+        workflow_kind: WorkflowKind = WorkflowKind.PLANNING,
     ) -> CreateOutcome:
         self._enter("create_run")
         if idempotency_key is not None:
@@ -96,6 +102,7 @@ class InMemoryRunRepository:
             status=RunLifecycleStatus.RUNNING,
             owner_subject=owner_subject,
             project_id=project_id,
+            workflow_kind=workflow_kind,
             idempotency_key=idempotency_key,
             attempt=1,
             lease_owner=owner,

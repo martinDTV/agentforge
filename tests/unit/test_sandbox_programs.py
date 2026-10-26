@@ -36,6 +36,11 @@ def tree(tmp_path: Path) -> Path:
 def test_programs_build_exact_argv_from_fixed_prefixes(tree: Path):
     check = build_plan(ProgramId.RUFF_CHECK, [], worktree=tree, authorized_test_paths={"tests"})
     assert check.argv == ["ruff", "check", "--no-cache", "--output-format", "concise", "--", "."]
+    diff = build_plan(
+        ProgramId.RUFF_CHECK_DIFF, ["app"], worktree=tree, authorized_test_paths={"tests"}
+    )
+    assert diff.argv == ["ruff", "check", "--no-cache", "--diff", "--", "app"]
+    assert "--fix" not in diff.argv
     fmt = build_plan(
         ProgramId.RUFF_FORMAT_CHECK,
         ["app", "tests/unit"],

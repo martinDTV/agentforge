@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .lifecycle import RunEventKind, RunLifecycleStatus
+from .lifecycle import RunEventKind, RunLifecycleStatus, WorkflowKind
 from .planning import ArchitectureReview, DevelopmentPlan
 
 # One definition of the run states for API, orchestration and persistence.
@@ -35,6 +35,9 @@ class RunResponse(BaseModel):
     status: RunStatus
     owner: str = Field(description="Sujeto opaco del principal que creó la ejecución")
     project_id: str
+    workflow_kind: WorkflowKind = Field(
+        default=WorkflowKind.PLANNING, description="Graph that drives the run (ADR 0008)"
+    )
     revision: int = Field(default=0, ge=0, description="Plan revisions triggered by the architect")
     llm_calls: int = Field(default=0, ge=0, description="Agent calls consumed by this run")
     architect_approved: bool | None = Field(
@@ -52,6 +55,7 @@ class RunSummary(BaseModel):
     status: RunStatus
     owner: str
     project_id: str
+    workflow_kind: WorkflowKind = WorkflowKind.PLANNING
     revision: int = 0
     llm_calls: int = 0
     architect_approved: bool | None = None

@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
 
-from anyio import fail_after, to_thread
+from anyio import CancelScope, fail_after, get_cancelled_exc_class, to_thread
 from pydantic import BaseModel, ValidationError
 
 from app.contracts.tools import (
@@ -270,12 +270,34 @@ class ToolGateway:
                 # this safe; tools whose work lives elsewhere (a sandbox)
                 # implement ``cancel`` and the gateway calls it below.
                 produced = await to_thread.run_sync(
-                    tool.run, call_context, arguments, abandon_on_cancel=True
+                    tool.run,
+                    call_context,
+                    arguments,
+                    abandon_on_cancel=tool.spec.risk is not RiskClass.WRITE,
                 )
             output, payload_text = self._serialize(tool, produced)
         except TimeoutError:
             error = ToolError(code="timeout", message=f"la herramienta superó {timeout:g}s")
             await self._cancel(tool, call_context)
+        except get_cancelled_exc_class():
+            # A cancelled read did nothing; a cancelled write or sandbox run may
+            # have had its effect: the audit must say so, and a later attempt of
+            # the same step is then refused (``uncertain_effects``).
+            with CancelScope(shield=True):
+                await self._cancel(tool, call_context)
+                await self._audit.transition(
+                    base["id"],
+                    expected=InvocationStatus.RUNNING,
+                    status=(
+                        InvocationStatus.FAILED
+                        if tool.spec.risk is RiskClass.READ
+                        else InvocationStatus.UNCERTAIN
+                    ),
+                    completion=InvocationCompletion(
+                        finished_at=self._clock(), error_code="cancelled"
+                    ),
+                )
+            raise
         except ToolExecutionError as exc:
             error = ToolError(code=exc.code, message=exc.detail)
         except Exception:  # a bug in a tool must not take the run down

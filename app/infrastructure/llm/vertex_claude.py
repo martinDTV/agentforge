@@ -99,6 +99,9 @@ class VertexClaudeAdapter:
         )
         self.model = settings.claude_model
         self.max_repair_attempts = settings.llm_max_repair_attempts
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.provider_requests = 0
 
     def generate(
         self,
@@ -119,9 +122,9 @@ class VertexClaudeAdapter:
         system = (
             f"{system_prompt}\n\n"
             "Devuelve únicamente JSON válido.\n"
-            "No incluyas Markdown ni código.\n"
+            "No incluyas Markdown fuera del JSON.\n"
             "Sé breve y concreto.\n"
-            "No generes implementaciones.\n"
+            "Los contenidos de los campos deben seguir las instrucciones del rol.\n"
             f"Esquema:\n{schema_json}"
         )
         messages: list[MessageParam] = [{"role": "user", "content": user_prompt}]
@@ -154,6 +157,7 @@ class VertexClaudeAdapter:
 
     def _complete(self, system: str, messages: list[MessageParam], max_tokens: int) -> str:
         try:
+            self.provider_requests += 1
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=max_tokens,
@@ -175,6 +179,9 @@ class VertexClaudeAdapter:
         except anthropic.AnthropicError as exc:
             raise LLMError(f"Error del SDK de Anthropic: {type(exc).__name__}.") from exc
 
+        usage = getattr(response, "usage", None)
+        self.input_tokens += getattr(usage, "input_tokens", 0)
+        self.output_tokens += getattr(usage, "output_tokens", 0)
         if response.stop_reason == "max_tokens":
             raise LLMMalformedOutputError(
                 f"Claude superó max_tokens={max_tokens} antes de terminar la respuesta."

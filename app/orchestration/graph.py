@@ -19,6 +19,15 @@ BUDGET_EXCEEDED_CODE = "llm_budget_exceeded"
 
 
 class RunState(TypedDict, total=False):
+    """Every key any workflow writes.
+
+    One shared channel set, on purpose: a process that compiled only the
+    planning graph (the API) must be able to load a development checkpoint,
+    derive its status and back-fill its audit from the history. Keys below
+    ``error`` are written by the development workflow only (ADR 0008).
+    """
+
+    workflow_kind: str
     task: str
     plan: dict[str, Any]
     architecture: dict[str, Any]
@@ -27,7 +36,17 @@ class RunState(TypedDict, total=False):
     llm_calls: Annotated[int, operator.add]
     architect_approved: bool
     approved: bool
+    completed: bool  # workflows without a human decision (development)
     error: dict[str, Any]
+    changes: dict[str, Any]
+    file_hashes: dict[str, str | None]
+    developer_checks: list[dict[str, Any]]
+    qa_review: dict[str, Any]
+    validation: list[dict[str, Any]]
+    prior_validation: list[dict[str, Any]]
+    usage: dict[str, Any]
+    changed_files: list[str]
+    final_diff: dict[str, Any]
 
 
 RunGraph = CompiledStateGraph[RunState, None, RunState, RunState]

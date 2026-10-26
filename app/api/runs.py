@@ -56,6 +56,7 @@ def _summary(row: PersistedRun) -> RunSummary:
         status=row.status,
         owner=row.owner_subject,
         project_id=row.project_id,
+        workflow_kind=row.workflow_kind,
         revision=row.revision,
         llm_calls=row.llm_calls,
         architect_approved=row.architect_approved,

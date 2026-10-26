@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.contracts.execution import RunError
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, sources_for
+from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, WorkflowKind, sources_for
 from app.orchestration.exceptions import RunAlreadyExistsError
 from app.orchestration.ports import (
     ApprovalClaim,
@@ -62,6 +62,7 @@ def _to_run(record: RunRecord, lease_active: bool) -> PersistedRun:
         status=record.status,
         owner_subject=record.owner_subject,
         project_id=record.project_id,
+        workflow_kind=record.workflow_kind,
         revision=record.revision,
         llm_calls=record.llm_calls,
         architect_approved=record.architect_approved,
@@ -134,6 +135,7 @@ class SqlAlchemyRunRepository:
         owner_subject: str,
         project_id: str,
         idempotency_key: str | None = None,
+        workflow_kind: WorkflowKind = WorkflowKind.PLANNING,
     ) -> CreateOutcome:
         async with self._tx() as session:
             stmt = pg_insert(RunRecord).values(
@@ -142,6 +144,7 @@ class SqlAlchemyRunRepository:
                 status=RunLifecycleStatus.RUNNING,
                 owner_subject=owner_subject,
                 project_id=project_id,
+                workflow_kind=workflow_kind,
                 idempotency_key=idempotency_key,
                 attempt=1,
                 lease_owner=owner,

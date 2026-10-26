@@ -100,7 +100,8 @@ uv run agentforge-runner token    # token de administración: el hash va a RUNNE
 ```
 
 - Los tokens solo existen en la API (`SANDBOX_RUNNER_TOKEN`) y en tu gestor de contraseñas para el de administración; la VM guarda únicamente los hashes.
-- Rotación: generar un token nuevo, sustituir el hash en `runner.env`, `systemctl --user restart agentforge-runner`, actualizar la API. Ventana de corte de segundos.
+- Rotación: generar un token nuevo, sustituir el hash en `runner.env`, `systemctl --user restart agentforge-runner`, actualizar la API. Ventana de corte de segundos. `scripts/runner_token_rotation.py` lo hace de forma atómica a partir de un archivo privado con solo los digests.
+- Actualización de módulos del paquete instalado: `uv run python -m scripts.stage_runner_deploy` prepara un directorio con los archivos, un manifiesto de digests (instalado y deseado), los módulos de compatibilidad y un self-test, e imprime los pasos; `deploy_runner_files.py install` se ejecuta una sola vez como el usuario del Runner, verifica que lo instalado coincide con el manifiesto, respalda, reemplaza de forma atómica, reinicia, ejecuta el self-test y revierte si algo falla; `rollback <respaldo>` restaura. La unidad y `runner.env` nunca se escriben.
 - Rotar también la clave del nodo en Tailscale si la VM se considera comprometida; revocar el nodo desde el panel.
 
 Arranque: `systemctl --user daemon-reload && systemctl --user enable --now agentforge-runner`; `journalctl --user -u agentforge-runner -f`.

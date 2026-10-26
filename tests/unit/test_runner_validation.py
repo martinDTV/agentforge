@@ -23,6 +23,8 @@ def post(harness: Any, request: Any, archive: bytes = DEFAULT_ARCHIVE) -> Any:
         (ProgramId.RUFF_CHECK, ["bash", "-c", "id"]),
         (ProgramId.RUFF_CHECK, ["ruff", "check", "--", "src"]),  # prefix altered
         (ProgramId.RUFF_CHECK, [*PREFIXES[ProgramId.RUFF_CHECK], "--fix", "--", "src"]),
+        (ProgramId.RUFF_CHECK_DIFF, [*PREFIXES[ProgramId.RUFF_CHECK_DIFF], "--fix", "--", "src"]),
+        (ProgramId.RUFF_CHECK_DIFF, ["ruff", "check", "--no-cache", "--fix", "--", "src"]),
         (ProgramId.RUFF_CHECK, [*PREFIXES[ProgramId.RUFF_CHECK], "src"]),  # no separator
         (ProgramId.RUFF_CHECK, [*PREFIXES[ProgramId.RUFF_CHECK], "--"]),  # no paths
         (ProgramId.RUFF_CHECK, [*PREFIXES[ProgramId.RUFF_CHECK], "--", "../etc"]),
@@ -45,6 +47,9 @@ def test_argv_that_departs_from_the_allowlist_is_rejected(program: ProgramId, ar
 
 
 def test_argv_that_matches_the_allowlist_yields_its_paths():
+    assert validate_argv(
+        ProgramId.RUFF_CHECK_DIFF, [*PREFIXES[ProgramId.RUFF_CHECK_DIFF], "--", "src", "tests"]
+    ) == ["src", "tests"]
     assert validate_argv(ProgramId.RUFF_CHECK, [*PREFIXES[ProgramId.RUFF_CHECK], "--", "."]) == [
         "."
     ]

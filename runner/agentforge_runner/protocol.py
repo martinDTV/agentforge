@@ -35,6 +35,7 @@ MiB = 1024 * 1024
 
 class ProgramId(StrEnum):
     RUFF_CHECK = "ruff_check"
+    RUFF_CHECK_DIFF = "ruff_check_diff"
     RUFF_FORMAT_CHECK = "ruff_format_check"
     PYTEST = "pytest"
 
