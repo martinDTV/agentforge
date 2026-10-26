@@ -11,3 +11,7 @@ dist/
 build/
 .local/
 .claude/
+
+# Private keys never belong in the repository (GitHub App key lives outside every root).
+*.pem
+*.private-key.*

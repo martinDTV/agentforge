@@ -184,6 +184,15 @@ class Settings(DatabaseSettings):
     sandbox_max_output_bytes: int = Field(default=256_000, ge=4096, le=16 * 1024 * 1024)
     sandbox_max_archive_mb: int = Field(default=50, ge=1, le=1024)
 
+    # GitHub App (Fase 7, Paso 2; ADR 0010). Platform-only credentials: the
+    # private key signs short JWTs that buy read-only installation tokens held
+    # in memory. Only ``app/infrastructure/github`` reads these three fields.
+    github_app_id: int | None = Field(default=None, gt=0)
+    github_app_private_key_file: Path | None = None  # PEM, mode 0600, outside every root
+    github_api_url: str = "https://api.github.com"
+    github_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+    mirror_fetch_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -264,6 +273,29 @@ class Settings(DatabaseSettings):
                 "SANDBOX_RUNNER_ALLOW_PRIVATE_HTTP solo se admite en local y test; "
                 "en staging/production usa https:// o una red superpuesta privada"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _github_app_is_coherent(self) -> "Settings":
+        given = (self.github_app_id, self.github_app_private_key_file)
+        if any(v is not None for v in given) and not all(v is not None for v in given):
+            raise ValueError("La GitHub App requiere GITHUB_APP_ID y GITHUB_APP_PRIVATE_KEY_FILE")
+        if not self.github_api_url.startswith("https://"):
+            raise ValueError("GITHUB_API_URL debe usar https://")
+        key = self.github_app_private_key_file
+        if key is None:
+            return self
+        if not key.is_absolute():
+            raise ValueError("GITHUB_APP_PRIVATE_KEY_FILE debe ser una ruta absoluta")
+        roots = (self.git_repositories_root, self.worktrees_root)
+        for root in roots:
+            if root is not None and root.is_absolute() and key.is_relative_to(root):
+                raise ValueError(
+                    "GITHUB_APP_PRIVATE_KEY_FILE no puede vivir bajo GIT_REPOSITORIES_ROOT "
+                    "ni WORKTREES_ROOT"
+                )
+        if self.git_repositories_file is None:
+            raise ValueError("La GitHub App requiere GIT_REPOSITORIES_FILE y PROJECTS_FILE")
         return self
 
     @model_validator(mode="after")

@@ -1,0 +1,248 @@
+"""Minimal GitHub REST client for what the platform needs and nothing more.
+
+Three calls: mint an installation token, read one repository's identity and
+list the repositories an installation can reach. Responses are parsed into
+small models; bodies are never logged; errors carry a status-derived code and
+no payload. Transient failures (5xx, transport) are retried once.
+"""
+
+import logging
+import time
+from datetime import UTC, datetime
+from typing import Any
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field
+
+from .errors import GitHubError
+
+logger = logging.getLogger(__name__)
+
+API_VERSION = "2022-11-28"
+USER_AGENT = "agentforge-platform"
+DEFAULT_TIMEOUT_SECONDS = 15.0
+RETRY_DELAY_SECONDS = 0.5
+MAX_PAGES = 20
+
+
+class RepositoryIdentity(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    github_id: int = Field(gt=0)
+    owner: str
+    name: str
+    full_name: str
+    default_branch: str
+    private: bool = True
+    archived: bool = False
+    node_id: str | None = None
+
+
+class InstallationInfo(BaseModel):
+    """What ``GET /app/installations/{id}`` reports: how the App is installed."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int = Field(gt=0)
+    app_id: int = Field(gt=0)
+    account: str
+    repository_selection: str  # "selected" is the only acceptable value (ADR 0010)
+    permissions: dict[str, str]
+    suspended: bool = False
+
+
+def _identity(payload: dict[str, Any]) -> RepositoryIdentity:
+    try:
+        owner = payload.get("owner") or {}
+        return RepositoryIdentity(
+            github_id=int(payload["id"]),
+            owner=str(owner.get("login") or str(payload["full_name"]).split("/")[0]),
+            name=str(payload["name"]),
+            full_name=str(payload["full_name"]),
+            default_branch=str(payload.get("default_branch") or "main"),
+            private=bool(payload.get("private", True)),
+            archived=bool(payload.get("archived", False)),
+            node_id=payload.get("node_id"),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GitHubError("github_protocol_error", "respuesta de repositorio ilegible") from exc
+
+
+class GitHubClient:
+    def __init__(
+        self,
+        base_url: str = "https://api.github.com",
+        *,
+        transport: httpx.BaseTransport | None = None,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        sleep: Any = time.sleep,
+    ) -> None:
+        self._client = httpx.Client(
+            base_url=base_url.rstrip("/"),
+            transport=transport,
+            timeout=timeout_seconds,
+            trust_env=False,  # no proxies, no .netrc, no ambient credentials
+            headers={
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": API_VERSION,
+                "User-Agent": USER_AGENT,
+            },
+        )
+        self._sleep = sleep
+
+    def close(self) -> None:
+        self._client.close()
+
+    # -- calls --------------------------------------------------------------------------
+
+    def create_installation_token(
+        self,
+        app_jwt: str,
+        installation_id: int,
+        *,
+        repositories: list[str],
+        permissions: dict[str, str],
+    ) -> tuple[str, datetime]:
+        """``POST /app/installations/{id}/access_tokens`` narrowed to the given
+        repositories and permissions. Returns the token and its expiry."""
+        response = self._request(
+            "POST",
+            f"/app/installations/{int(installation_id)}/access_tokens",
+            bearer=app_jwt,
+            json={"repositories": repositories, "permissions": permissions},
+            purpose="token",
+        )
+        try:
+            body = response.json()
+            token = str(body["token"])
+            expires = datetime.fromisoformat(str(body["expires_at"]).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubError("github_protocol_error", "respuesta de token ilegible") from exc
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+        granted = body.get("permissions")
+        if isinstance(granted, dict):
+            extra = {k: v for k, v in granted.items() if permissions.get(k) != v}
+            if extra:
+                raise GitHubError(
+                    "permission_not_allowed",
+                    f"el token concedido tiene permisos distintos de los pedidos: {sorted(extra)}",
+                )
+        return token, expires
+
+    def installation(self, app_jwt: str, installation_id: int) -> InstallationInfo:
+        """Installation details, authenticated as the App (JWT), not as the installation."""
+        response = self._request(
+            "GET", f"/app/installations/{int(installation_id)}", bearer=app_jwt, purpose="token"
+        )
+        payload = response.json()
+        try:
+            account = payload.get("account") or {}
+            return InstallationInfo(
+                id=int(payload["id"]),
+                app_id=int(payload["app_id"]),
+                account=str(account.get("login", "")),
+                repository_selection=str(payload.get("repository_selection", "")),
+                permissions={str(k): str(v) for k, v in (payload.get("permissions") or {}).items()},
+                suspended=payload.get("suspended_at") is not None,
+            )
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise GitHubError("github_protocol_error", "respuesta de instalación ilegible") from exc
+
+    def branch_head(self, token: str, owner: str, name: str, branch: str) -> str:
+        """Current commit of ``branch`` as GitHub sees it (``contents: read``)."""
+        response = self._request(
+            "GET", f"/repos/{owner}/{name}/branches/{branch}", bearer=token, purpose="repository"
+        )
+        payload = response.json()
+        try:
+            sha = str(payload["commit"]["sha"])
+        except (KeyError, TypeError) as exc:
+            raise GitHubError("github_protocol_error", "respuesta de rama ilegible") from exc
+        if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+            raise GitHubError("github_protocol_error", "SHA de rama ilegible")
+        return sha
+
+    def repository(self, token: str, owner: str, name: str) -> RepositoryIdentity:
+        response = self._request(
+            "GET", f"/repos/{owner}/{name}", bearer=token, purpose="repository"
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise GitHubError("github_protocol_error", "respuesta de repositorio ilegible")
+        return _identity(payload)
+
+    def installation_repositories(self, token: str) -> list[RepositoryIdentity]:
+        """Every repository the installation token can reach (paginated)."""
+        found: list[RepositoryIdentity] = []
+        for page in range(1, MAX_PAGES + 1):
+            response = self._request(
+                "GET",
+                "/installation/repositories",
+                bearer=token,
+                params={"per_page": 100, "page": page},
+                purpose="installation",
+            )
+            payload = response.json()
+            items = payload.get("repositories") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                raise GitHubError("github_protocol_error", "listado de instalación ilegible")
+            found.extend(_identity(item) for item in items if isinstance(item, dict))
+            if len(items) < 100:
+                break
+        return found
+
+    # -- plumbing -----------------------------------------------------------------------
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        bearer: str,
+        purpose: str,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        last: GitHubError | None = None
+        for attempt in range(2):
+            try:
+                response = self._client.request(
+                    method,
+                    path,
+                    json=json,
+                    params=params,
+                    headers={"Authorization": f"Bearer {bearer}"},
+                )
+            except httpx.TransportError as exc:
+                last = GitHubError(
+                    "github_unreachable",
+                    f"GitHub inaccesible: {type(exc).__name__}",
+                    retryable=True,
+                )
+            else:
+                if response.status_code < 400:
+                    return response
+                last = _error_for(response.status_code, purpose)
+                if not last.retryable:
+                    raise last
+            if attempt == 0:
+                self._sleep(RETRY_DELAY_SECONDS)
+        assert last is not None
+        raise last
+
+
+def _error_for(status: int, purpose: str) -> GitHubError:
+    if status == 401:
+        code = "app_auth_failed" if purpose == "token" else "token_invalid"
+        return GitHubError(code, f"GitHub rechazó la credencial ({purpose})")
+    if status == 403:
+        return GitHubError("installation_forbidden", f"GitHub denegó la operación ({purpose})")
+    if status == 404:
+        code = "installation_not_found" if purpose == "token" else "repository_not_found"
+        return GitHubError(code, f"recurso no encontrado en GitHub ({purpose})")
+    if status >= 500:
+        return GitHubError(
+            "github_failed", f"GitHub respondió {status} ({purpose})", retryable=True
+        )
+    return GitHubError("github_failed", f"GitHub respondió {status} ({purpose})")
