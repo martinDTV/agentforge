@@ -19,7 +19,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -105,6 +105,9 @@ class LocalGitAdapter:
         cwd: Path,
         identity: GitIdentity | None = None,
         ok_codes: Sequence[int] = (0,),
+        env_extra: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        config: Sequence[str] = (),
     ) -> subprocess.CompletedProcess[str]:
         command = [
             self._git,
@@ -120,23 +123,27 @@ class LocalGitAdapter:
             "diff.external=",
             "-c",
             "core.fsmonitor=false",
-            *args,
         ]
+        for item in config:
+            command.extend(["-c", item])
+        command.extend(args)
+        env = self._env(identity)
+        if env_extra:
+            env.update(env_extra)
+        limit = timeout if timeout is not None else self._timeout
         try:
             completed = subprocess.run(  # noqa: S603 - argv built here, shell=False
                 command,
                 cwd=str(cwd),
-                env=self._env(identity),
+                env=env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
-                timeout=self._timeout,
+                timeout=limit,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise GitOperationError(
-                "git_timeout", f"git {args[0]} superó {self._timeout:g}s"
-            ) from exc
+            raise GitOperationError("git_timeout", f"git {args[0]} superó {limit:g}s") from exc
         except OSError as exc:
             raise GitOperationError("git_failed", f"no se pudo ejecutar git: {exc}") from exc
         if completed.returncode not in ok_codes:
@@ -297,6 +304,80 @@ class LocalGitAdapter:
             ok_codes=(0, 1),
         )
         return completed.returncode == 0
+
+    # -- bare mirrors (platform only; ADR 0010) --------------------------------------------
+
+    def init_bare(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._run(["init", "--quiet", "--bare", "--", str(path)], cwd=path.parent)
+
+    def remote_url(self, repository_path: Path) -> str | None:
+        completed = self._run(
+            ["remote", "get-url", "--", "origin"], cwd=repository_path, ok_codes=(0, 2, 128)
+        )
+        url = completed.stdout.strip()
+        return url if completed.returncode == 0 and url else None
+
+    def configure_remote(
+        self,
+        repository_path: Path,
+        url: str,
+        *,
+        fetch_refspec: str = "+refs/heads/*:refs/heads/*",
+    ) -> None:
+        """Point ``origin`` at ``url`` and fetch branches only (no tags, no PR refs)."""
+        if url.startswith("-"):
+            raise GitOperationError("ref_invalid", "URL de remoto inválida")
+        if self.remote_url(repository_path) is None:
+            self._run(["remote", "add", "--", "origin", url], cwd=repository_path)
+        else:
+            self._run(["remote", "set-url", "--", "origin", url], cwd=repository_path)
+        self._run(
+            ["config", "--replace-all", "remote.origin.fetch", fetch_refspec], cwd=repository_path
+        )
+        self._run(["config", "remote.origin.tagOpt", "--no-tags"], cwd=repository_path)
+
+    def fetch_heads(
+        self,
+        repository_path: Path,
+        *,
+        credential_env: Mapping[str, str] | None = None,
+        depth: int | None = None,
+        allow_file_remotes: bool = False,
+        timeout: float | None = None,
+    ) -> None:
+        """``git fetch`` of ``refs/heads/*`` from ``origin``, pruning deleted branches.
+
+        Only ``https`` is allowed to speak (``file`` for tests that stand in for
+        the provider with a local repository). The credential, if any, reaches
+        Git through ``GIT_ASKPASS`` only.
+        """
+        protocols = ["protocol.allow=never", "protocol.https.allow=always"]
+        if allow_file_remotes:
+            protocols.append("protocol.file.allow=always")
+        args = ["fetch", "--quiet", "--prune", "--no-tags"]
+        if depth is not None:
+            args += ["--depth", str(int(depth))]
+        args += ["--", "origin", "+refs/heads/*:refs/heads/*"]
+        self._run(
+            args,
+            cwd=repository_path,
+            env_extra=credential_env,
+            timeout=timeout,
+            config=protocols,
+        )
+
+    def branch_heads(self, repository_path: Path) -> dict[str, str]:
+        completed = self._run(
+            ["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads/"],
+            cwd=repository_path,
+        )
+        heads: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            name, _, sha = line.strip().partition(" ")
+            if name and sha:
+                heads[name] = sha
+        return heads
 
     # -- worktrees ----------------------------------------------------------------------
 
