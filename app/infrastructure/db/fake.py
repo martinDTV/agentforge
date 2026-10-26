@@ -8,10 +8,12 @@ to simulate an outage; ``clock`` lets tests expire leases deterministically.
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from app.contracts.execution import RunError
 from app.contracts.lifecycle import (
+    DecisionStage,
     RunEventKind,
     RunLifecycleStatus,
     WorkflowKind,
@@ -23,6 +25,8 @@ from app.orchestration.ports import (
     ApprovalClaim,
     ApprovalDecision,
     CreateOutcome,
+    DecisionClaim,
+    DecisionRecord,
     LeaseToken,
     PersistedEvent,
     PersistedRun,
@@ -39,6 +43,7 @@ class InMemoryRunRepository:
         self.runs: dict[UUID, PersistedRun] = {}
         self.events: dict[UUID, list[PersistedEvent]] = {}
         self.approvals: dict[UUID, ApprovalDecision] = {}
+        self.decisions: dict[UUID, dict[DecisionStage, DecisionRecord]] = {}
         self.fail_with: Exception | None = None
         self.calls: list[str] = []
         self.renewals: list[tuple[UUID, int]] = []
@@ -111,7 +116,16 @@ class InMemoryRunRepository:
             created_at=now,
             updated_at=now,
         )
-        self._append(run_id, [RunEvent(kind=RunEventKind.RUN_CREATED, actor_subject=owner_subject)])
+        self._append(
+            run_id,
+            [
+                RunEvent(
+                    kind=RunEventKind.RUN_CREATED,
+                    payload={"initiated_by": owner_subject},
+                    actor_subject=owner_subject,
+                )
+            ],
+        )
         return CreateOutcome(
             run=self._store(run), created=True, lease=LeaseToken(owner=owner, generation=1)
         )
@@ -176,6 +190,8 @@ class InMemoryRunRepository:
             "architecture": projection.architecture,
             "error": projection.error,
             "last_checkpoint_id": projection.checkpoint_id,
+            "pending_stage": projection.pending_stage,
+            "approval_deadline": projection.approval_deadline,
             "updated_at": self.clock(),
         }
         if release:
@@ -322,18 +338,53 @@ class InMemoryRunRepository:
         ttl_seconds: float,
         decided_by: str | None,
     ) -> ApprovalClaim | None:
-        self._enter("claim_approval")
+        claim = await self.claim_decision(
+            run_id,
+            DecisionStage.PLAN,
+            approved,
+            owner=owner,
+            ttl_seconds=ttl_seconds,
+            decided_by=decided_by,
+        )
+        if claim is None:
+            return None
+        return ApprovalClaim(
+            claimed=claim.claimed,
+            status=claim.status,
+            existing=self.approvals.get(run_id),
+            lease=claim.lease,
+        )
+
+    async def claim_decision(
+        self,
+        run_id: UUID,
+        stage: DecisionStage,
+        approved: bool,
+        *,
+        owner: str,
+        ttl_seconds: float,
+        decided_by: str | None,
+        scope_digest: str | None = None,
+    ) -> DecisionClaim | None:
+        self._enter("claim_decision")
         current = self.runs.get(run_id)
         if current is None:
             return None
         if current.status is not RunLifecycleStatus.WAITING_APPROVAL or not self._lease_free(
             current
         ):
-            return ApprovalClaim(
-                claimed=False, status=current.status, existing=self.approvals.get(run_id)
+            return DecisionClaim(
+                claimed=False,
+                status=current.status,
+                existing=self.decisions.get(run_id, {}).get(stage),
             )
-        decision = ApprovalDecision(
-            approved=approved, decided_at=self.clock(), decided_by=decided_by
+        now = self.clock()
+        decision = DecisionRecord(
+            stage=stage,
+            approved=approved,
+            decided_at=now,
+            decided_by=decided_by,
+            scope_digest=scope_digest,
         )
         generation = current.lease_generation + 1
         self._store(
@@ -341,24 +392,31 @@ class InMemoryRunRepository:
                 update={
                     "status": RunLifecycleStatus.RESUME_PENDING,
                     "lease_owner": owner,
-                    "lease_expires_at": self.clock() + timedelta(seconds=ttl_seconds),
+                    "lease_expires_at": now + timedelta(seconds=ttl_seconds),
                     "lease_generation": generation,
-                    "updated_at": self.clock(),
+                    "updated_at": now,
                 }
             )
         )
-        self.approvals[run_id] = decision
+        self.decisions.setdefault(run_id, {})[stage] = decision
+        if stage is DecisionStage.PLAN:
+            self.approvals[run_id] = ApprovalDecision(
+                approved=approved, decided_at=now, decided_by=decided_by
+            )
+        payload: dict[str, Any] = {"approved": approved, "stage": stage.value}
+        if decided_by is not None:
+            payload["approved_by" if approved else "rejected_by"] = decided_by
+        if scope_digest is not None:
+            payload["scope_digest"] = scope_digest
         self._append(
             run_id,
             [
                 RunEvent(
-                    kind=RunEventKind.APPROVAL_RECORDED,
-                    payload={"approved": approved},
-                    actor_subject=decided_by,
+                    kind=RunEventKind.APPROVAL_RECORDED, payload=payload, actor_subject=decided_by
                 )
             ],
         )
-        return ApprovalClaim(
+        return DecisionClaim(
             claimed=True,
             status=RunLifecycleStatus.RESUME_PENDING,
             existing=decision,
@@ -369,13 +427,98 @@ class InMemoryRunRepository:
         self._enter("get_approval")
         return self.approvals.get(run_id)
 
+    async def get_pending_decision(self, run_id: UUID) -> DecisionRecord | None:
+        self._enter("get_pending_decision")
+        pending = [d for d in self.decisions.get(run_id, {}).values() if d.applied_at is None]
+        if not pending:
+            return None
+        return max(pending, key=lambda d: d.decided_at)
+
+    async def list_decisions(self, run_id: UUID) -> list[DecisionRecord]:
+        self._enter("list_decisions")
+        return sorted(self.decisions.get(run_id, {}).values(), key=lambda d: d.decided_at)
+
+    async def mark_decision_applied(self, run_id: UUID, stage: DecisionStage) -> bool:
+        self._enter("mark_decision_applied")
+        decision = self.decisions.get(run_id, {}).get(stage)
+        if decision is None or decision.applied_at is not None:
+            return False
+        now = self.clock()
+        self.decisions[run_id][stage] = decision.model_copy(update={"applied_at": now})
+        if stage is DecisionStage.PLAN and run_id in self.approvals:
+            self.approvals[run_id] = self.approvals[run_id].model_copy(update={"applied_at": now})
+        return True
+
     async def mark_approval_applied(self, run_id: UUID) -> bool:
         self._enter("mark_approval_applied")
         decision = self.approvals.get(run_id)
         if decision is None or decision.applied_at is not None:
             return False
-        self.approvals[run_id] = decision.model_copy(update={"applied_at": self.clock()})
+        now = self.clock()
+        self.approvals[run_id] = decision.model_copy(update={"applied_at": now})
+        plan = self.decisions.get(run_id, {}).get(DecisionStage.PLAN)
+        if plan is not None and plan.applied_at is None:
+            self.decisions[run_id][DecisionStage.PLAN] = plan.model_copy(update={"applied_at": now})
         return True
+
+    async def cancel_run(self, run_id: UUID, *, actor: str | None) -> PersistedRun | None:
+        self._enter("cancel_run")
+        current = self.runs.get(run_id)
+        if (
+            current is None
+            or current.status
+            not in (RunLifecycleStatus.WAITING_APPROVAL, RunLifecycleStatus.INTERRUPTED)
+            or not self._lease_free(current)
+        ):
+            return None
+        cancelled = self._store(
+            current.model_copy(
+                update={
+                    "status": RunLifecycleStatus.CANCELLED,
+                    "pending_stage": None,
+                    "approval_deadline": None,
+                    "updated_at": self.clock(),
+                }
+            )
+        )
+        self._append(
+            run_id,
+            [
+                RunEvent(
+                    kind=RunEventKind.RUN_CANCELLED,
+                    payload={"cancelled_by": actor} if actor else {},
+                    actor_subject=actor,
+                )
+            ],
+        )
+        return cancelled
+
+    async def expire_waiting_runs(self, *, now: datetime, limit: int) -> list[PersistedRun]:
+        self._enter("expire_waiting_runs")
+        expired: list[PersistedRun] = []
+        for run in sorted(self.runs.values(), key=lambda r: r.approval_deadline or now):
+            if len(expired) >= limit:
+                break
+            if (
+                run.status is RunLifecycleStatus.WAITING_APPROVAL
+                and run.approval_deadline is not None
+                and run.approval_deadline < now
+                and self._lease_free(run)
+            ):
+                expired.append(
+                    self._store(
+                        run.model_copy(
+                            update={
+                                "status": RunLifecycleStatus.EXPIRED,
+                                "pending_stage": None,
+                                "approval_deadline": None,
+                                "updated_at": self.clock(),
+                            }
+                        )
+                    )
+                )
+                self._append(run.id, [RunEvent(kind=RunEventKind.RUN_EXPIRED)])
+        return expired
 
     # -- test helpers ---------------------------------------------------------
 

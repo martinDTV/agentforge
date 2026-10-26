@@ -14,7 +14,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.contracts.execution import RunError
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, WorkflowKind
+from app.contracts.lifecycle import DecisionStage, RunEventKind, RunLifecycleStatus, WorkflowKind
 from app.security import AccessScope
 
 
@@ -49,6 +49,10 @@ class PersistedRun(BaseModel):
     architecture: dict[str, Any] | None = None
     error: RunError | None = None
     last_checkpoint_id: str | None = None
+    # Fase 7: the human decision the run waits for, its deadline, what was published.
+    pending_stage: DecisionStage | None = None
+    approval_deadline: datetime | None = None
+    publication: dict[str, Any] | None = None
     idempotency_key: str | None = None
     attempt: int = 0
     lease_owner: str | None = None
@@ -93,6 +97,8 @@ class RunProjection(BaseModel):
     architecture: dict[str, Any] | None = None
     error: RunError | None = None
     checkpoint_id: str | None = None
+    pending_stage: DecisionStage | None = None
+    approval_deadline: datetime | None = None
 
 
 class RunEvent(BaseModel):
@@ -134,6 +140,30 @@ class ApprovalClaim(BaseModel):
     claimed: bool
     status: RunLifecycleStatus
     existing: ApprovalDecision | None = None
+    lease: LeaseToken | None = None
+
+
+class DecisionRecord(BaseModel):
+    """A human decision for one stage of a run (ADR 0009)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    stage: DecisionStage
+    approved: bool
+    decided_at: datetime
+    applied_at: datetime | None = None
+    decided_by: str | None = None
+    scope_digest: str | None = None
+
+
+class DecisionClaim(BaseModel):
+    """Outcome of the atomic claim of a stage decision."""
+
+    model_config = ConfigDict(frozen=True)
+
+    claimed: bool
+    status: RunLifecycleStatus
+    existing: DecisionRecord | None = None
     lease: LeaseToken | None = None
 
 
@@ -268,6 +298,42 @@ class RunRepository(Protocol):
         ...
 
     async def get_approval(self, run_id: UUID) -> ApprovalDecision | None: ...
+
+    # -- decisions per stage (Fase 7) -------------------------------------------
+
+    async def claim_decision(
+        self,
+        run_id: UUID,
+        stage: DecisionStage,
+        approved: bool,
+        *,
+        owner: str,
+        ttl_seconds: float,
+        decided_by: str | None,
+        scope_digest: str | None = None,
+    ) -> DecisionClaim | None:
+        """Atomic ``waiting_approval -> resume_pending`` plus the decision row for
+        ``stage`` (unique per run and stage). Stage ``plan`` also writes
+        ``run_approvals`` for compatibility. ``None`` when the run does not exist;
+        ``claimed=False`` carries the current status and the existing decision."""
+        ...
+
+    async def get_pending_decision(self, run_id: UUID) -> DecisionRecord | None:
+        """The most recent decision not yet applied to the graph, if any."""
+        ...
+
+    async def list_decisions(self, run_id: UUID) -> list[DecisionRecord]: ...
+
+    async def mark_decision_applied(self, run_id: UUID, stage: DecisionStage) -> bool: ...
+
+    async def cancel_run(self, run_id: UUID, *, actor: str | None) -> PersistedRun | None:
+        """``waiting_approval`` or ``interrupted`` with a free lease -> ``cancelled``,
+        plus the ``run_cancelled`` event. ``None`` when the transition is not possible."""
+        ...
+
+    async def expire_waiting_runs(self, *, now: datetime, limit: int) -> list[PersistedRun]:
+        """``waiting_approval`` rows whose deadline passed -> ``expired`` (plus event)."""
+        ...
 
     async def mark_approval_applied(self, run_id: UUID) -> bool:
         """Set ``applied_at`` once; returns whether this call did it."""

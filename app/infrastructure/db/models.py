@@ -31,7 +31,12 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, WorkflowKind
+from app.contracts.lifecycle import (
+    DecisionStage,
+    RunEventKind,
+    RunLifecycleStatus,
+    WorkflowKind,
+)
 from app.contracts.tools import InvocationStatus
 
 from .base import Base
@@ -87,6 +92,12 @@ class RunRecord(Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
     last_checkpoint_id: Mapped[str | None] = mapped_column(String(64))
+    # Fase 7 (ADR 0009): which human decision the run waits for, until when,
+    # and what was published (Paso 3). NULL for planning runs and for runs
+    # created before migration 0006.
+    pending_stage: Mapped[str | None] = mapped_column(String(16))
+    approval_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    publication: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     # Execution lease: who is driving the graph and until when (heartbeat-renewed).
     # ``lease_generation`` is a monotonic fencing token: every acquisition
@@ -153,6 +164,39 @@ class RunApprovalRecord(Base):
     decided_by: Mapped[str | None] = mapped_column(String(255))
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RunDecisionRecord(Base):
+    """One human decision per stage of a run (ADR 0009): ``plan`` (copied from
+    ``run_approvals`` and double-written while that table exists), ``scope`` and
+    ``publish``. ``(run_id, stage)`` is unique: the INSERT is the atomic claim.
+    ``scope_digest`` binds a ``scope`` decision to the exact proposal shown."""
+
+    __tablename__ = "run_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id", ondelete="CASCADE"))
+    stage: Mapped[DecisionStage] = mapped_column(
+        Enum(
+            DecisionStage,
+            name="run_decision_stage",
+            native_enum=False,
+            length=16,
+            create_constraint=True,
+            validate_strings=True,
+            values_callable=_values,
+        )
+    )
+    approved: Mapped[bool] = mapped_column(Boolean)
+    decided_by: Mapped[str | None] = mapped_column(String(255))
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scope_digest: Mapped[str | None] = mapped_column(String(64))
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "stage", name="uq_run_decisions_run_id_stage"),
+        Index("ix_run_decisions_run_id", "run_id"),
+    )
 
 
 class RunEventRecord(Base):

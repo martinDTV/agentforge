@@ -316,7 +316,11 @@ def test_qa_review_event_is_recorded_even_when_the_limit_ends_the_run():
     kinds = events_from_update(approving, revision=1)
     assert [e.kind for e in kinds] == [RunEventKind.QA_REVIEWED, RunEventKind.RUN_COMPLETED]
     assert kinds[0].payload["approved"] is True
-    assert events[1].payload == {"node": "qa", "code": "correction_limit"}
+    assert events[1].payload == {
+        "node": "qa",
+        "code": "correction_limit",
+        "executed_by": "agentforge:qa",
+    }
     assert revision_from_update({"revise_development": {"revision": 2}}, 1) == 2
     assert revision_from_update({"developer": {"revision": 0, "changes": {}}}, 5) == 0
 
@@ -538,3 +542,34 @@ async def test_preview_disabled_by_default_and_unavailable_on_an_old_runner(tmp_
     assert result["error"]["code"] == "correction_limit"
     ruff_entry = next(v for v in result["validation"] if v["program"] == "ruff_check")
     assert ruff_entry["fix_preview_error"] == "runner_rejected" and "fix_preview" not in ruff_entry
+
+
+async def test_write_creates_missing_parent_directories_inside_the_worktree_only(tmp_path):
+    box, scope, _, _, gateway, ctx, _, _ = setup(
+        tmp_path, writable=frozenset({"src/app.py", "tests/unit/test_new.py"})
+    )
+    result = await gateway.invoke(
+        ctx, write_call(path="tests/unit/test_new.py", content="x = 1\n", previous=None), step="new"
+    )
+    assert result.ok and (scope.workspace_root / "tests/unit/test_new.py").read_text() == "x = 1\n"
+    # A parent that is a symlink out of the tree is still refused, and nothing
+    # lands outside the worktree.
+    from app.infrastructure.db import InMemoryToolInvocationRepository
+    from app.security.development import DevelopmentToolPolicy
+    from app.tools import ToolGateway, ToolRegistry
+    from app.tools.write_file import WriteFileTool
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (scope.workspace_root / "linked").symlink_to(outside)
+    link_scope = replace(scope, writable_paths=frozenset({"linked/evil.py"}))
+    linked_gateway = ToolGateway(
+        ToolRegistry([WriteFileTool(box.manager, link_scope)]),
+        DevelopmentToolPolicy(link_scope),
+        InMemoryToolInvocationRepository(),
+    )
+    denied = await linked_gateway.invoke(
+        ctx, write_call(path="linked/evil.py", content="x\n", previous=None), step="evil"
+    )
+    assert not denied.ok and denied.error.code == "path_denied"
+    assert not (outside / "evil.py").exists()

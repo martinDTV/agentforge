@@ -63,7 +63,12 @@ def test_events_from_planner_architect_interrupt_and_approval_updates():
 
     first_plan = events_from_update({"planner": {"plan": PLAN, "revision": 0}}, revision=0)
     assert [(e.kind, e.ordinal) for e in first_plan] == [(RunEventKind.PLANNER_COMPLETED, 0)]
-    assert first_plan[0].payload == {"revision": 0, "tasks": 2, "risks": 1}
+    assert first_plan[0].payload == {
+        "revision": 0,
+        "tasks": 2,
+        "risks": 1,
+        "executed_by": "agentforge:planner",
+    }
 
     revised = events_from_update({"planner": {"plan": PLAN, "revision": 1}}, revision=1)
     assert [(e.kind, e.ordinal) for e in revised] == [
@@ -82,7 +87,13 @@ def test_events_from_planner_architect_interrupt_and_approval_updates():
         checkpoint_id="cp-3",
     )
     assert review[0].kind is RunEventKind.ARCHITECT_REVIEWED
-    assert review[0].payload == {"revision": 1, "approved": False, "issues": 2, "decisions": 0}
+    assert review[0].payload == {
+        "revision": 1,
+        "approved": False,
+        "issues": 2,
+        "decisions": 0,
+        "executed_by": "agentforge:architect",
+    }
     assert review[0].checkpoint_id == "cp-3"
 
     interrupt = events_from_update(
@@ -93,7 +104,11 @@ def test_events_from_planner_architect_interrupt_and_approval_updates():
 
     failed = events_from_update({"planner": {"error": {"code": "llm_timeout"}}}, revision=0)
     assert failed[0].kind is RunEventKind.RUN_FAILED
-    assert failed[0].payload == {"node": "planner", "code": "llm_timeout"}
+    assert failed[0].payload == {
+        "node": "planner",
+        "code": "llm_timeout",
+        "executed_by": "agentforge:planner",
+    }
 
     approved = events_from_update({"approval": {"approved": True}}, revision=1)
     rejected = events_from_update({"approval": {"approved": False}}, revision=1)

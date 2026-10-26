@@ -73,9 +73,15 @@ class WriteFileTool:
             temporary = f".agentforge-write-{uuid.uuid4().hex}"
             try:
                 for part in relative.parts[:-1]:
-                    next_fd = os.open(
-                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
-                    )
+                    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                    try:
+                        next_fd = os.open(part, flags, dir_fd=directory)
+                    except FileNotFoundError:
+                        # A new file may live in a new directory of the worktree:
+                        # created here, relative to the parent descriptor, never
+                        # through a symlink (O_NOFOLLOW on the reopen).
+                        os.mkdir(part, 0o755, dir_fd=directory)
+                        next_fd = os.open(part, flags, dir_fd=directory)
                     os.close(directory)
                     directory = next_fd
                 name = relative.name
