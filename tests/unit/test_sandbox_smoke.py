@@ -9,6 +9,7 @@ from app.contracts.lifecycle import RunLifecycleStatus
 from app.contracts.tools import AgentKind, RiskClass
 from app.infrastructure.db import InMemoryRunRepository, InMemoryToolInvocationRepository
 from app.infrastructure.sandbox import FakeSandbox, UnconfiguredSandbox
+from app.sandbox import ProgramId, SandboxResult, SandboxStatus
 from app.tools import ExecutionPolicy, ToolLimits
 from app.tools.fake import StubTool
 from scripts.sandbox_smoke import (
@@ -87,16 +88,30 @@ def test_guards_refuse_other_environments_and_projects():
 async def test_the_smoke_runs_once_audits_and_refuses_the_duplicate(tmp_path: Path):
     box = make_sandbox(tmp_path, project="sandbox-demo", repository="sandbox-demo")
     sandbox = FakeSandbox(runner_id="runner-01")
+    sandbox.script(
+        ProgramId.RUFF_CHECK,
+        lambda request: SandboxResult(
+            execution_id=request.execution_id,
+            status=SandboxStatus.COMPLETED,
+            exit_code=1,
+            stdout="src/app.py:1:8: F401 `os` imported but unused\n",
+            duration_ms=5,
+            runner_id="runner-01",
+        ),
+    )
     deps = deps_for(box, sandbox)
     report = await run_smoke(deps, repository_id="sandbox-demo", project_id="sandbox-demo")
     assert succeeded(report)
-    assert report.outcome == "ok" and report.status == "completed" and report.exit_code == 0
+    assert report.outcome == "ok" and report.status == "completed" and report.exit_code == 1
+    assert "F401" in report.stdout_excerpt
     assert report.duplicate_outcome == "denied" and report.duplicate_code == "duplicate_invocation"
+    assert report.path_outcome == "failed" and report.path_code == "path_invalid"
     assert report.runner_id == "runner-01" and report.step == "smoke:ruff_check"
     [(request, _archive)] = sandbox.requests  # exactly one execution reached the runner
     assert request.program.value == "ruff_check" and request.argv[:2] == ["ruff", "check"]
     assert request.project_id == "sandbox-demo" and request.actor_subject == "agentforge:developer"
-    assert report.audit_rows == 1  # the duplicate is refused without a new row
+    assert report.audit_rows == 2  # success and invalid path; duplicate creates no new row
+    assert report.worktree_removed
     run_id = uuid.UUID(report.run_id)
     assert box.manager.get(run_id, "sandbox-demo") is None  # worktree removed
     stored = await deps.runs.get_run(run_id)

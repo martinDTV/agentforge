@@ -23,6 +23,8 @@ Guarantees, each enforced in code:
 - The audit lands in PostgreSQL (``runs`` + ``tool_invocations``) and the run
   row is closed as ``failed`` with code ``sandbox_smoke`` so no sweeper picks it up.
 - A second identical call must be refused as ``duplicate_invocation``.
+- A separate call with ``../etc`` must fail as ``path_invalid`` before reaching
+  the runner. Both outcomes are checked against the PostgreSQL audit.
 """
 
 import argparse
@@ -203,6 +205,8 @@ class SmokeReport:
     error_code: str | None
     duplicate_outcome: str
     duplicate_code: str | None
+    path_outcome: str
+    path_code: str | None
     audit_rows: int
     worktree_removed: bool
 
@@ -217,6 +221,7 @@ async def run_smoke(
     principal = AutomationIdentity().principal_for(SMOKE_AGENT, project_id)
     record = deps.workspaces.ensure(run_id, project_id, repository_id)
     removed = False
+    report: SmokeReport | None = None
     try:
         created = await deps.runs.create_run(
             run_id,
@@ -261,6 +266,13 @@ async def run_smoke(
                 raise SmokeRefused("not_confirmed", "el operador no confirmó la ejecución")
             first = await gateway.invoke(context, call, step=SMOKE_STEP)
             second = await gateway.invoke(context, call, step=SMOKE_STEP)
+            invalid_path = await gateway.invoke(
+                context,
+                ToolCall(
+                    name="exec.run", arguments={"program": SMOKE_PROGRAM, "paths": ["../etc"]}
+                ),
+                step="smoke:path_rejected",
+            )
         finally:
             await deps.runs.project(
                 run_id,
@@ -276,7 +288,7 @@ async def run_smoke(
             )
         rows = await deps.audit.list_for_run(run_id)
         output = first.output or {}
-        return SmokeReport(
+        report = SmokeReport(
             run_id=str(run_id),
             repository_id=repository.id,
             project_id=project_id,
@@ -291,11 +303,16 @@ async def run_smoke(
             error_code=first.error.code if first.error else None,
             duplicate_outcome=second.outcome.value,
             duplicate_code=second.error.code if second.error else None,
+            path_outcome=invalid_path.outcome.value,
+            path_code=invalid_path.error.code if invalid_path.error else None,
             audit_rows=len(rows),
             worktree_removed=False,
         )
+        return report
     finally:
         removed = deps.workspaces.remove(run_id, project_id)
+        if report is not None:
+            report.worktree_removed = removed
         deps.out(f"worktree eliminado: {removed}")
 
 
@@ -303,8 +320,14 @@ def succeeded(report: SmokeReport) -> bool:
     return (
         report.outcome == ToolOutcome.OK.value
         and report.status == "completed"
+        and report.exit_code == 1
+        and "F401" in report.stdout_excerpt
         and report.duplicate_outcome == ToolOutcome.DENIED.value
         and report.duplicate_code == "duplicate_invocation"
+        and report.path_outcome == ToolOutcome.FAILED.value
+        and report.path_code == "path_invalid"
+        and report.audit_rows == 2
+        and report.worktree_removed
     )
 
 
