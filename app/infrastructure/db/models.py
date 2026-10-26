@@ -293,3 +293,40 @@ class ToolInvocationRecord(Base):
             name="finished_when_closed",
         ),
     )
+
+
+class MirrorSyncRecord(Base):
+    """One synchronisation of a local mirror with its GitHub repository (ADR 0010).
+
+    Append-only audit written by the platform (``agentforge:platform``) before a
+    development run and by the operator script. Holds identities, commit SHAs
+    and codes; never a token, a URL with credentials or repository content.
+    """
+
+    __tablename__ = "mirror_syncs"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    repository_id: Mapped[str] = mapped_column(String(64))
+    project_id: Mapped[str] = mapped_column(String(64))
+    operation: Mapped[str] = mapped_column(String(16))
+    result: Mapped[str] = mapped_column(String(8))
+    code: Mapped[str | None] = mapped_column(String(64))
+    base_sha: Mapped[str | None] = mapped_column(String(40))
+    previous_sha: Mapped[str | None] = mapped_column(String(40))
+    changed: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    github_repository_id: Mapped[int | None] = mapped_column(BigInteger)
+    installation_id: Mapped[int | None] = mapped_column(BigInteger)
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    actor_subject: Mapped[str] = mapped_column(
+        String(255), server_default=text("'agentforge:platform'")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('create', 'refresh', 'check')", name="ck_mirror_syncs_operation"
+        ),
+        CheckConstraint("result IN ('ok', 'failed')", name="ck_mirror_syncs_result"),
+        Index("ix_mirror_syncs_repository_id_started_at", "repository_id", "started_at"),
+    )

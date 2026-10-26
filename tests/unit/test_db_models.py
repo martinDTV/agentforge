@@ -13,13 +13,14 @@ approvals = Base.metadata.tables["run_approvals"]
 events = Base.metadata.tables["run_events"]
 
 
-def test_exactly_the_five_business_tables_are_registered():
+def test_exactly_the_six_business_tables_are_registered():
     assert set(Base.metadata.tables) == {
         "runs",
         "run_approvals",
         "run_decisions",
         "run_events",
         "tool_invocations",
+        "mirror_syncs",
     }
 
 
@@ -116,4 +117,4 @@ def test_run_id_is_uuid_and_documents_thread_id():
 
 
 def test_alembic_head_is_the_latest_migration():
-    assert expected_head_revision() == "0006"
+    assert expected_head_revision() == "0007"

@@ -20,6 +20,7 @@ from app.contracts.lifecycle import (
     can_transition,
 )
 from app.contracts.tools import InvocationStatus
+from app.git.mirrors import MirrorSync
 from app.orchestration.exceptions import RunAlreadyExistsError
 from app.orchestration.ports import (
     ApprovalClaim,
@@ -590,3 +591,18 @@ class InMemoryToolInvocationRepository:
             key=lambda r: (r.attempt, r.started_at or datetime.min.replace(tzinfo=UTC), r.step)
         )
         return rows[:limit]
+
+
+class InMemoryMirrorSyncRepository:
+    """Mirror of ``SqlAlchemyMirrorSyncRepository`` for the unit suite."""
+
+    def __init__(self) -> None:
+        self.rows: list[MirrorSync] = []
+
+    async def record(self, sync: MirrorSync) -> int:
+        self.rows.append(sync)
+        return len(self.rows)
+
+    async def list_for_repository(self, repository_id: str, *, limit: int = 50) -> list[MirrorSync]:
+        rows = [r for r in self.rows if r.repository_id == repository_id]
+        return list(reversed(rows))[:limit]
