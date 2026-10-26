@@ -126,6 +126,18 @@ Toda herramienta pasa por `ToolGateway.invoke(context, call)`. El `ToolCall` es 
 
 Límites: `TOOL_MAX_OUTPUT_BYTES` acota la salida serializada, `TOOL_TIMEOUT_SECONDS` el tiempo por invocación y `GIT_TIMEOUT_SECONDS` cada llamada a `git`. Decisiones y limitaciones en el ADR 0006.
 
+## Desarrollo gobernado por la API (Fase 7, Paso 1)
+
+Una ejecución `development` creada por la API queda **bloqueada hasta que un humano autorizado aprueba un alcance concreto**. El agente Scoper, de solo lectura, propone los archivos; la plataforma los filtra con la política del repositorio (globs escribibles y prohibidos, límites) y publica la propuesta filtrada con su digest; `POST /api/v1/runs/{id}/approve` con `stage=scope` y ese `scope_digest` la autoriza. Solo entonces Developer recibe una autoridad efímera de escritura limitada a esa lista y a ese worktree; QA valida en el Runner como en la Fase 6. Decisiones por etapa en `run_decisions` (migración 0006), consulta en `GET /runs/{id}/decisions`, retirada con `POST /runs/{id}/cancel`, caducidad automática. Requisitos: `PROJECTS_FILE` con la política por repositorio, rol `project_operator` (o `admin`) para crear y aprobar, separación de funciones en entornos productivos. Sin remotos ni `push`: la publicación llega en pasos posteriores de la Fase 7 (ADR 0009).
+
+```bash
+curl -s -X POST $API/api/v1/runs -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"task": "...", "project_id": "sandbox-lint", "workflow_kind": "development", "repository_id": "sandbox-lint"}'
+curl -s $API/api/v1/runs/$RUN/decisions -H "Authorization: Bearer $TOKEN"       # propuesta filtrada + digest
+curl -s -X POST $API/api/v1/runs/$RUN/approve -H "Authorization: Bearer $TOKEN2" -H 'Content-Type: application/json' \
+  -d '{"approved": true, "stage": "scope", "scope_digest": "<digest>"}'
+```
+
 ## Flujo Developer + QA (Fase 6, MVP)
 
 El primer flujo multiagente real: Developer edita una lista explícita de archivos en el worktree de la ejecución, QA ejecuta `ruff check`, `ruff format --check` y `pytest` en el Runner remoto y devuelve observaciones, y Developer corrige hasta tres veces. Todo pasa por el Tool Gateway con auditoría por paso; la escritura es la herramienta `workspace.write_file` (archivo completo, ruta en lista, hash esperado, sin enlaces ni secretos). La autoridad es un `DevelopmentScope` efímero ligado a un `run_id`, un proyecto `sandbox-*`, un worktree y una caducidad: las concesiones y la puerta de riesgo del servicio no cambian y la API no concede escritura ni ejecución. Se invoca desde la máquina del operador:
@@ -170,7 +182,9 @@ El grafo ejecuta `planner -> architect -> approval` con retroalimentación:
 
 | Campo | Significado |
 |---|---|
-| `status` | `running`, `waiting_approval`, `resume_pending`, `interrupted`, `approved`, `rejected`, `completed` o `failed` (ver tabla siguiente) |
+| `status` | `running`, `waiting_approval`, `resume_pending`, `interrupted`, `approved`, `rejected`, `completed`, `cancelled`, `expired` o `failed` (ver tabla siguiente) |
+| `pending_stage` | Etapa de decisión humana pendiente: `plan`, `scope` o `publish` (ADR 0009) |
+| `approval_deadline` | Cuándo caduca la decisión pendiente, si caduca |
 | `workflow_kind` | `planning` (Planner → Architect → aprobación humana) o `development` (Developer → QA, Fase 6) |
 | `revision` | Cuántas veces el Architect devolvió el plan al Planner (0 = primer plan) |
 | `llm_calls` | Llamadas a agentes consumidas por el run |
@@ -187,7 +201,9 @@ Estados:
 | `resume_pending` | La decisión humana ya está registrada en la base de datos pero su aplicación al grafo aún no se confirmó. Repetir la misma decisión devuelve `200`; la contraria, `409` |
 | `interrupted` | Hay trabajo pendiente, no hay interrupción y ningún lease vigente: el proceso que lo conducía desapareció. Recuperable desde el último checkpoint; el barrido lo reanuda solo si `RECOVERY_AUTO_RESUME=true` y quedan intentos |
 | `approved` / `rejected` | Decisión humana aplicada. Terminal |
-| `completed` | Un flujo sin decisión humana (`development`) cumplió su criterio de éxito: QA aprobó con `ruff check`, `ruff format --check` y `pytest` en cero. Terminal |
+| `completed` | Un flujo sin decisión humana final (`development`) cumplió su criterio de éxito: QA aprobó con `ruff check`, `ruff format --check` y `pytest` en cero. Terminal |
+| `cancelled` | Un humano con `runs:cancel` retiró una ejecución que esperaba una decisión o estaba interrumpida. Terminal |
+| `expired` | Nadie decidió dentro de la ventana de la etapa pendiente. Terminal |
 | `failed` | Error registrado. Terminal, con `error.code` |
 
 Códigos de `error.code`:
@@ -278,7 +294,7 @@ Consistencia entre checkpoint y proyección:
 
 Aprobaciones durables: `POST /approve` ejecuta en una sola transacción la transición condicional `waiting_approval → resume_pending`, la inserción en `run_approvals` (única por run) y el evento `approval_recorded`. Solo después de confirmar se envía `Command(resume=...)`; `applied_at` se marca cuando el run quedó `approved` o `rejected`. Una caída entre ambas fases no pierde la decisión: `RunService.apply_pending_approval` la aplica más tarde (el barrido que lo invoca llega en el Paso 4).
 
-Auditoría (`run_events`, clave única por run, tipo y ordinal, así los reintentos no duplican): `run_created`, `planner_completed`, `architect_reviewed`, `revision_requested`, `waiting_approval`, `approval_recorded`, `run_approved` / `run_rejected`, `approval_applied`, `run_failed`, `run_interrupted`, `run_resumed` y, en el flujo de desarrollo, `developer_completed`, `developer_applied`, `qa_reviewed` y `run_completed`. Los payloads contienen contadores, códigos y banderas; nunca prompts, planes, credenciales ni datos sensibles. Si el proceso murió entre un checkpoint y su evento, la recuperación reconstruye los eventos de nodo desde el historial de checkpoints, solo con lo que hay evidencia.
+Auditoría (`run_events`, clave única por run, tipo y ordinal, así los reintentos no duplican): `run_created`, `planner_completed`, `architect_reviewed`, `revision_requested`, `waiting_approval`, `approval_recorded`, `run_approved` / `run_rejected`, `approval_applied`, `run_failed`, `run_interrupted`, `run_resumed` y, en el flujo de desarrollo, `scope_proposed`, `developer_completed`, `developer_applied`, `qa_reviewed`, `run_completed`, `run_cancelled` y `run_expired`. Atribución (ADR 0009): `actor` es el humano que causó el evento y es nulo para agentes y sistema; el payload añade `initiated_by`, `approved_by`/`rejected_by`, `cancelled_by` y `executed_by` (`agentforge:<agente>`), expuestos también como campos de `RunEventRead`. Los payloads contienen contadores, códigos y banderas; nunca prompts, planes, credenciales ni datos sensibles. Si el proceso murió entre un checkpoint y su evento, la recuperación reconstruye los eventos de nodo desde el historial de checkpoints, solo con lo que hay evidencia.
 
 Leases y recuperación (`docs/adr/0004`): cada run se conduce bajo un lease en su propia fila (`lease_owner`, `lease_expires_at`, `lease_generation`), renovado por un heartbeat cada tercio de `RUN_LEASE_TTL_SECONDS`. Toda escritura del propietario está cercada por `(owner, generation)` y toda proyección por un `last_checkpoint_id` monotónico. Perder el lease cancela la ejecución local. Un barrido al arrancar y cada `RECOVERY_SWEEP_SECONDS` reclama con `FOR UPDATE SKIP LOCKED` los runs con lease libre o vencido y decide desde el checkpoint: reproyectar, aplicar una decisión pendiente, dejar `interrupted`, reanudar si `RECOVERY_AUTO_RESUME=true`, o `failed`/`abandoned` al agotar `MAX_RUN_ATTEMPTS`. El apagado deja de aceptar trabajo, espera `SHUTDOWN_GRACE_SECONDS`, cancela lo que siga, libera solo sus leases y cierra los pools; nunca marca nada como terminado.
 
@@ -351,7 +367,7 @@ Reglas permanentes del repositorio en `CLAUDE.md`. Decisiones registradas en `do
 - **Fase 3 (completada, v0.3.0)**: PostgreSQL con SQLAlchemy y Alembic, checkpoints persistentes de LangGraph, proyección de negocio y auditoría, aprobaciones durables, leases con heartbeat y fencing, barrido de recuperación, `Idempotency-Key`, apagado ordenado, CI con PostgreSQL. Decisiones en los ADR 0003 y 0004.
 - **Fase 5 (completada, v0.5.0)**: Tool Gateway con auditoría por paso lógico, identidad de automatización y política por agente; adaptador Git administrado y worktrees por ejecución; `SandboxPort`, programas permitidos y `exec.run`; servicio `runner/` con Podman rootless validado en Linux real (ocho pruebas de aislamiento). Decisiones y limitaciones en los ADR 0006 y 0007; despliegue en `docs/runbooks/runner-proxmox.md`. Pendiente: despliegue en una VM persistente, prueba de concurrencia, integración de herramientas con los agentes bajo aprobación humana.
 - **Fase 6 (en curso)**: MVP Developer + QA sobre worktrees aislados con escritura acotada, validación en el Runner y hasta tres correcciones, invocado por el operador sobre repositorios `sandbox-*` (ADR 0008). Pendiente: exposición por API con aprobación humana, estado terminal propio, repositorios reales.
-- **Fase 7**: agentes de QA, seguridad y revisión.
+- **Fase 7 (en curso)**: repositorios reales con política por proyecto, aprobación humana por etapas, worktrees aislados y Pull Requests revisables (ADR 0009). Paso 1 entregado: alcance propuesto por el Scoper, aprobación por digest, autoridad de escritura efímera, estados `cancelled` y `expired`, migración 0006. Pendientes: espejos y GitHub App (Paso 2), Publisher y PR en borrador (Paso 3), primer repositorio real (Paso 4).
 - **Fase 8**: paralelismo entre agentes.
 - **Fase 9**: observabilidad y despliegue.
 
