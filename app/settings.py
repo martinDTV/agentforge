@@ -158,6 +158,9 @@ class Settings(DatabaseSettings):
     git_timeout_seconds: float = Field(default=30.0, gt=0)
     git_repositories_root: Path | None = None  # every registered repository lives under it
     git_repositories_file: Path | None = None  # JSON: {"repositories": [...]}
+    # Fase 7 (ADR 0009): per-repository development policy. Without it the
+    # ``development`` workflow is not offered by the API at all.
+    projects_file: Path | None = None
     worktrees_root: Path | None = None
     worktree_retention_seconds: float = Field(default=3600.0, ge=0)
     worktree_interrupted_retention_seconds: float = Field(default=7 * 24 * 3600.0, ge=0)
@@ -229,6 +232,8 @@ class Settings(DatabaseSettings):
     def _git_storage_is_coherent(self) -> "Settings":
         if self.git_repositories_file is None:
             return self
+        if self.projects_file is not None and not self.projects_file.is_absolute():
+            raise ValueError("PROJECTS_FILE debe ser una ruta absoluta")
         missing = [
             name
             for name, value in (

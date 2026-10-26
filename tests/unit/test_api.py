@@ -127,6 +127,8 @@ def test_api_is_versioned(client: TestClient):
         RUNS,
         f"{RUNS}/{{run_id}}",
         f"{RUNS}/{{run_id}}/approve",
+        f"{RUNS}/{{run_id}}/decisions",
+        f"{RUNS}/{{run_id}}/cancel",
         f"{RUNS}/{{run_id}}/resume",
         f"{RUNS}/{{run_id}}/events",
         "/api/v1/admin/recovery/sweeps",

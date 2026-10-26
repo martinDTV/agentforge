@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from app.api import api_router, health
 from app.api.errors import register_exception_handlers
 from app.api.headers import SecurityHeadersMiddleware
+from app.contracts.lifecycle import WorkflowKind
 from app.git import RepositoryRegistry
 from app.infrastructure.checkpoints import PostgresCheckpointer
 from app.infrastructure.db import (
@@ -23,12 +24,17 @@ from app.infrastructure.git import LocalGitAdapter
 from app.infrastructure.llm import build_llm
 from app.infrastructure.llm.port import LLMPort
 from app.infrastructure.sandbox import RemoteSandboxAdapter, UnconfiguredSandbox
-from app.orchestration.graph import build_graph
+from app.orchestration.graph import RunGraph, build_graph
 from app.orchestration.limits import RunLimits
 from app.orchestration.policy import RecoveryPolicy
-from app.orchestration.ports import RunRepository
+from app.orchestration.ports import PersistedRun, RunRepository
 from app.orchestration.recovery import RecoveryService
 from app.orchestration.runs import RunService
+from app.orchestration.scoped_development import (
+    DevelopmentRuntime,
+    build_scoped_development_graph,
+)
+from app.projects import ProjectPolicyRegistry
 from app.sandbox import SandboxPort
 from app.security import AuthorizationPolicy, JwtVerifier, TokenVerifier, ToolAuthorizationPolicy
 from app.security.tokens import DisabledAuthentication
@@ -99,6 +105,7 @@ def create_app(
     tool_limits: ToolLimits | None = None,
     worktrees: WorktreeManager | None = None,
     sandbox: SandboxPort | None = None,
+    projects: ProjectPolicyRegistry | None = None,
     docs_enabled: bool | None = None,
     shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
     startup_sweep: bool | None = None,
@@ -143,6 +150,7 @@ def create_app(
         limits_for_tools = tool_limits
         manager = worktrees
         sandbox_port = sandbox
+        policies = projects
         execution_policy = ExecutionPolicy()
         if port is None:
             settings = get_settings()
@@ -151,6 +159,8 @@ def create_app(
             execution_policy = ExecutionPolicy.from_settings(settings)
             if sandbox_port is None and settings.sandbox_runner_url is not None:
                 sandbox_port = RemoteSandboxAdapter.from_settings(settings)
+            if policies is None and settings.projects_file is not None:
+                policies = ProjectPolicyRegistry.from_file(settings.projects_file)
             if manager is None and settings.git_repositories_file is not None:
                 assert settings.git_repositories_root is not None  # validated by Settings
                 assert settings.worktrees_root is not None
@@ -189,17 +199,51 @@ def create_app(
             if db is not None
             else InMemoryRunRepository()
         )
+        limits_for_tools = limits_for_tools or ToolLimits()
+        sandbox_port = sandbox_port or UnconfiguredSandbox()
+        planning_graph = build_graph(port, run_limits or RunLimits(), checkpointer=saver)
+        graphs: dict[WorkflowKind, RunGraph] = {WorkflowKind.PLANNING: planning_graph}
+        runtime: DevelopmentRuntime | None = None
+        if policies is not None and manager is not None:
+            # The governed development workflow (ADR 0009) exists only when the
+            # operator configured both repositories and their policies. Agent
+            # authority is derived per run from the approved scope; the global
+            # gateway below stays read-only.
+            runtime = DevelopmentRuntime(
+                policies=policies,
+                workspaces=manager,
+                git=manager.git,
+                sandbox=sandbox_port,
+                audit=tool_audit
+                or (
+                    SqlAlchemyToolInvocationRepository(db.session_factory)
+                    if db is not None
+                    else InMemoryToolInvocationRepository()
+                ),
+                llm=port,
+                limits=limits_for_tools,
+                execution_policy=execution_policy,
+            )
+            graphs[WorkflowKind.DEVELOPMENT] = build_scoped_development_graph(
+                runtime, checkpointer=saver
+            )
+
+        async def release_worktree(row: PersistedRun) -> None:
+            if runtime is not None and row.workflow_kind is WorkflowKind.DEVELOPMENT:
+                await runtime.release(row.id, row.project_id, row.status)
+
         service = RunService(
-            build_graph(port, run_limits or RunLimits(), checkpointer=saver),
+            planning_graph,
             repo,
             run_policy or RecoveryPolicy(),
             # Outside production (tests) the local default allows self-approval,
             # matching a single developer; production derives it from Settings.
             authorization=authz or AuthorizationPolicy(separation_of_duties=False),
+            graphs=graphs,
+            policies=policies,
+            on_terminal=release_worktree,
         )
         recovery = RecoveryService(service)
-        limits_for_tools = limits_for_tools or ToolLimits()
-        sandbox_port = sandbox_port or UnconfiguredSandbox()
         git_tools = (
             GitTools(manager.git, manager, limits_for_tools) if manager is not None else None
         )
@@ -220,6 +264,7 @@ def create_app(
             limits=limits_for_tools,
         )
         app.state.run_service = service
+        app.state.projects = policies
         app.state.tool_gateway = tool_gateway
         app.state.worktrees = manager
         app.state.sandbox = sandbox_port
