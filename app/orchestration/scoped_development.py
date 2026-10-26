@@ -35,15 +35,21 @@ from app.agents.scoper import ScoperAgent
 from app.contracts.scope import ScopeProposal
 from app.contracts.tools import AgentKind, RiskClass, ToolCall, ToolOutcome
 from app.git import GitOperationError, GitRepositoryPort
+from app.git.mirrors import MirrorError, MirrorSyncRepository
+from app.infrastructure.git.mirror import MirrorService, audited
 from app.infrastructure.llm.budget import BudgetedLLM
 from app.infrastructure.llm.errors import LLMError
 from app.infrastructure.llm.port import LLMPort
 from app.projects import (
+    DATA_BOUNDARY_NOTICE,
     PolicyError,
     ProjectPolicyRegistry,
     RepositoryPolicy,
     check_against_policy,
     filter_scope,
+    hidden_from_agents,
+    injection_signals,
+    matches_any,
 )
 from app.sandbox import SandboxPort
 from app.security import (
@@ -101,9 +107,41 @@ class DevelopmentRuntime:
     limits: ToolLimits = field(default_factory=ToolLimits)
     execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
     clock: Callable[[], datetime] = _now
+    # Fase 7, Paso 2 (ADR 0010): synchronises local mirrors of GitHub repositories
+    # before a run starts. Only the platform holds it; agents never see it.
+    mirrors: MirrorService | None = None
+    mirror_syncs: MirrorSyncRepository | None = None
 
     def policy_for(self, state: DevelopmentState) -> RepositoryPolicy:
         return self.policies.require(state["repository_id"], state["project_id"])
+
+    async def refresh_mirror(self, policy: RepositoryPolicy) -> dict[str, Any] | None:
+        """Bring the mirror up to date and describe the base the run starts from.
+
+        ``None`` for purely local repositories. Any identity, remote or fetch
+        problem raises ``MirrorError`` (its code names the cause) and the run
+        fails before any worktree exists.
+        """
+        if policy.remote is None:
+            return None
+        if self.mirrors is None:
+            raise MirrorError(
+                "mirror_unconfigured",
+                f"el repositorio '{policy.repository_id}' requiere la GitHub App configurada",
+            )
+        mirrors = self.mirrors
+        outcome = await audited(
+            self.mirror_syncs,
+            lambda: mirrors.refresh(policy.repository_id, policy.project_id),
+        )
+        return {
+            "repository": policy.remote.full_name,
+            "github_repository_id": policy.remote.github_repository_id,
+            "branch": policy.remote.default_branch,
+            "sha": outcome.record.base_sha,
+            "changed": outcome.changed,
+            "synced_at": outcome.sync.finished_at.isoformat(),
+        }
 
     def budget_for(self, policy: RepositoryPolicy, state: DevelopmentState) -> BudgetedLLM:
         usage = state.get("usage") or {}
@@ -165,6 +203,7 @@ _HANDLED = (
     LLMError,
     PolicyError,
     GitOperationError,
+    MirrorError,
     WorkspaceError,
     TimeoutError,
 )
@@ -190,6 +229,9 @@ def build_scoped_development_graph(
             project_id, repository_id = state["project_id"], state["repository_id"]
             policy = runtime.policies.require(repository_id, project_id)
             budget = runtime.budget_for(policy, state)
+            # Remote repositories: verify identity and fetch *before* the worktree
+            # is cut, so the run starts from a known, recorded base commit.
+            base = await runtime.refresh_mirror(policy)
             record = await asyncio.to_thread(
                 runtime.workspaces.ensure, run_id, project_id, repository_id
             )
@@ -208,9 +250,11 @@ def build_scoped_development_graph(
                 raise DevelopmentFailure(
                     "scope_context_unavailable", "no se pudo listar el worktree"
                 )
+            excluded = policy.all_excluded_context_globs
+            visible, hidden = hidden_from_agents(list(listing.get("matches") or []), excluded)
             key_files: dict[str, str] = {}
             for index, name in enumerate(CONTEXT_FILES):
-                if not (record.path / name).is_file():
+                if not (record.path / name).is_file() or matches_any(name, excluded):
                     continue
                 output = await read(
                     gateway,
@@ -222,12 +266,13 @@ def build_scoped_development_graph(
                 if output is None or output.get("redactions"):
                     continue
                 key_files[name] = str(output.get("content", ""))[:8000]
+            signals = injection_signals(key_files)
             prompt = {
                 "task": state["task"],
                 "repository_id": repository_id,
-                "paths": list(listing.get("matches") or [])[:MAX_LISTING],
-                "listing_truncated": bool(listing.get("truncated"))
-                or len(listing.get("matches") or []) > MAX_LISTING,
+                "data_boundary": DATA_BOUNDARY_NOTICE,
+                "paths": visible[:MAX_LISTING],
+                "listing_truncated": bool(listing.get("truncated")) or len(visible) > MAX_LISTING,
                 "key_files": key_files,
                 "writable_globs": list(policy.writable_globs),
                 "denied_globs": list(policy.all_denied_globs),
@@ -255,6 +300,9 @@ def build_scoped_development_graph(
                     "tests": list(decision.scope.tests),
                     "rejected": [r.model_dump(mode="json") for r in decision.rejected],
                     "digest": decision.scope.digest,
+                    "base": base,
+                    "hidden_paths": hidden,
+                    "signals": [sig.model_dump(mode="json") for sig in signals],
                     "proposed_at": proposed_at.isoformat(),
                     "deadline": deadline.isoformat(),
                     "limits": {
@@ -288,6 +336,9 @@ def build_scoped_development_graph(
                 "rejected": proposal["rejected"],
                 "risks": proposal.get("risks", []),
                 "limits": proposal["limits"],
+                "base": proposal.get("base"),
+                "hidden_paths": proposal.get("hidden_paths", 0),
+                "signals": proposal.get("signals", []),
             }
         )
         if not isinstance(response, dict) or type(response.get("approved")) is not bool:
@@ -314,6 +365,7 @@ def build_scoped_development_graph(
                 "files": proposal["files"],
                 "tests": proposal["tests"],
                 "digest": proposal["digest"],
+                "base_sha": (proposal.get("base") or {}).get("sha"),
                 "approved_at": runtime.clock().isoformat(),
             },
             "development_deadline": deadline.isoformat(),
@@ -352,7 +404,12 @@ def build_scoped_development_graph(
             writable_paths=frozenset(f["path"] for f in approved["files"]),
             clock=runtime.clock,
         )
-        read_paths = [name for name in CONTEXT_FILES if (root / name).is_file()]
+        excluded = policy.all_excluded_context_globs
+        read_paths = [
+            name
+            for name in CONTEXT_FILES
+            if (root / name).is_file() and not matches_any(name, excluded)
+        ]
         read_paths += [f["path"] for f in approved["files"] if f["action"] == "edit"]
         read_paths += [t for t in approved.get("tests", []) if (root / t).is_file()]
         deps = DevelopmentDeps(

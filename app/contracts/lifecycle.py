@@ -116,6 +116,7 @@ class RunEventKind(StrEnum):
     RUN_CANCELLED = "run_cancelled"
     RUN_EXPIRED = "run_expired"
     SCOPE_PROPOSED = "scope_proposed"
+    MIRROR_REFRESHED = "mirror_refreshed"
     RUN_FAILED = "run_failed"
     RUN_INTERRUPTED = "run_interrupted"
     RUN_RESUMED = "run_resumed"

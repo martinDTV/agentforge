@@ -99,6 +99,22 @@ def events_from_update(
             continue
         if node == "scoper":
             proposal = delta.get("scope_proposal") or {}
+            base = proposal.get("base") or {}
+            if base.get("sha"):
+                # The platform, not the Scoper, synchronised the mirror (ADR 0010).
+                events.append(
+                    RunEvent(
+                        kind=RunEventKind.MIRROR_REFRESHED,
+                        ordinal=revision,
+                        payload={
+                            "repository": base.get("repository"),
+                            "branch": base.get("branch"),
+                            "base_sha": base.get("sha"),
+                            "changed": bool(base.get("changed")),
+                            "executed_by": "agentforge:platform",
+                        },
+                    )
+                )
             events.append(
                 RunEvent(
                     kind=RunEventKind.SCOPE_PROPOSED,
@@ -108,6 +124,9 @@ def events_from_update(
                         "rejected": len(proposal.get("rejected") or []),
                         "tests": len(proposal.get("tests") or []),
                         "scope_digest": proposal.get("digest"),
+                        "base_sha": (proposal.get("base") or {}).get("sha"),
+                        "hidden_paths": proposal.get("hidden_paths", 0),
+                        "signals": len(proposal.get("signals") or []),
                         "usage": delta.get("usage", {}),
                     },
                 )

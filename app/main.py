@@ -14,13 +14,21 @@ from app.infrastructure.checkpoints import PostgresCheckpointer
 from app.infrastructure.db import (
     Database,
     DatabaseUnavailableError,
+    InMemoryMirrorSyncRepository,
     InMemoryRunRepository,
     InMemoryToolInvocationRepository,
+    SqlAlchemyMirrorSyncRepository,
     SqlAlchemyRunRepository,
     SqlAlchemyToolInvocationRepository,
     verify_schema,
 )
 from app.infrastructure.git import LocalGitAdapter
+from app.infrastructure.git.mirror import MirrorService
+from app.infrastructure.github import (
+    GitHubAppCredentials,
+    GitHubClient,
+    InstallationTokenProvider,
+)
 from app.infrastructure.llm import build_llm
 from app.infrastructure.llm.port import LLMPort
 from app.infrastructure.sandbox import RemoteSandboxAdapter, UnconfiguredSandbox
@@ -106,6 +114,7 @@ def create_app(
     worktrees: WorktreeManager | None = None,
     sandbox: SandboxPort | None = None,
     projects: ProjectPolicyRegistry | None = None,
+    mirrors: MirrorService | None = None,
     docs_enabled: bool | None = None,
     shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
     startup_sweep: bool | None = None,
@@ -151,6 +160,7 @@ def create_app(
         manager = worktrees
         sandbox_port = sandbox
         policies = projects
+        mirror_service = mirrors
         execution_policy = ExecutionPolicy()
         if port is None:
             settings = get_settings()
@@ -164,16 +174,34 @@ def create_app(
             if manager is None and settings.git_repositories_file is not None:
                 assert settings.git_repositories_root is not None  # validated by Settings
                 assert settings.worktrees_root is not None
+                git_adapter = LocalGitAdapter(
+                    binary=settings.git_binary, timeout_seconds=settings.git_timeout_seconds
+                )
+                registry = RepositoryRegistry.from_file(
+                    settings.git_repositories_root, settings.git_repositories_file
+                )
                 manager = WorktreeManager(
                     settings.worktrees_root,
-                    LocalGitAdapter(
-                        binary=settings.git_binary, timeout_seconds=settings.git_timeout_seconds
-                    ),
-                    RepositoryRegistry.from_file(
-                        settings.git_repositories_root, settings.git_repositories_file
-                    ),
+                    git_adapter,
+                    registry,
                     policy=WorktreePolicy.from_settings(settings),
                 )
+                credentials = GitHubAppCredentials.from_settings(settings)
+                if mirror_service is None and credentials is not None and policies is not None:
+                    # GitHub App (ADR 0010): credentials and installation tokens stay
+                    # inside this service; agents get neither the client nor a token.
+                    github = GitHubClient(
+                        settings.github_api_url, timeout_seconds=settings.github_timeout_seconds
+                    )
+                    mirror_service = MirrorService(
+                        git=git_adapter,
+                        repositories_root=settings.git_repositories_root,
+                        policies=policies,
+                        github=github,
+                        tokens=InstallationTokenProvider(github, credentials),
+                        registry=registry,
+                        fetch_timeout_seconds=settings.mirror_fetch_timeout_seconds,
+                    )
             if verifier is None:
                 verifier = (
                     JwtVerifier.from_settings(settings)
@@ -223,6 +251,12 @@ def create_app(
                 llm=port,
                 limits=limits_for_tools,
                 execution_policy=execution_policy,
+                mirrors=mirror_service,
+                mirror_syncs=(
+                    SqlAlchemyMirrorSyncRepository(db.session_factory)
+                    if db is not None
+                    else InMemoryMirrorSyncRepository()
+                ),
             )
             graphs[WorkflowKind.DEVELOPMENT] = build_scoped_development_graph(
                 runtime, checkpointer=saver
@@ -265,6 +299,7 @@ def create_app(
         )
         app.state.run_service = service
         app.state.projects = policies
+        app.state.mirrors = mirror_service
         app.state.tool_gateway = tool_gateway
         app.state.worktrees = manager
         app.state.sandbox = sandbox_port
