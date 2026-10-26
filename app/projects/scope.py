@@ -51,6 +51,8 @@ def check_against_policy(paths: list[str], policy: RepositoryPolicy) -> list[Rej
             rejected.append(_reject(path, "sensitive_or_reserved"))
         elif matches_any(path, policy.all_denied_globs):
             rejected.append(_reject(path, "denied_by_policy"))
+        elif matches_any(path, policy.all_excluded_context_globs):
+            rejected.append(_reject(path, "excluded_context"))
         elif not matches_any(path, policy.writable_globs):
             rejected.append(_reject(path, "not_writable_by_policy"))
     return rejected
@@ -81,6 +83,10 @@ def filter_scope(
             continue
         if matches_any(path, policy.all_denied_globs):
             rejected.append(_reject(path, "denied_by_policy"))
+            continue
+        if matches_any(path, policy.all_excluded_context_globs):
+            # Agent-instruction files are data about the project, never a target.
+            rejected.append(_reject(path, "excluded_context"))
             continue
         if not matches_any(path, policy.writable_globs):
             rejected.append(_reject(path, "not_writable_by_policy"))

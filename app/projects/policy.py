@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.contracts.scope import MAX_SCOPE_FILES
+from app.git.remote import RemoteSpec
 
 from .errors import PolicyError
 from .globs import compile_glob
@@ -38,6 +39,27 @@ DEFAULT_DENIED_GLOBS: tuple[str, ...] = (
     "terraform/**",
     "deploy/**",
     "agentforge.json",
+)
+
+# Files that tell *agents* what to do. A remote repository can carry them
+# (``AGENTS.md``, ``CLAUDE.md``, Cursor/Copilot rules, ...); AgentForge treats
+# them as data about the project, never as platform instructions, so they are
+# hidden from the Scoper's context and refused as scope entries by default.
+DEFAULT_EXCLUDED_CONTEXT_GLOBS: tuple[str, ...] = (
+    "**/AGENTS.md",
+    "**/CLAUDE.md",
+    "**/CLAUDE.local.md",
+    "**/GEMINI.md",
+    "**/.claude/**",
+    "**/.cursor/**",
+    "**/.cursorrules",
+    "**/.windsurfrules",
+    "**/.clinerules",
+    "**/.aider*",
+    "**/.github/copilot-instructions.md",
+    "**/.github/instructions/**",
+    "**/.agentforge/**",
+    "**/agentforge.json",
 )
 
 PublishMode = Literal["manual"]  # ``after_qa`` is reserved: a human always approves publication
@@ -75,8 +97,14 @@ class RepositoryPolicy(BaseModel):
     sandbox_profile: str = Field(default="python-3.13", pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
     ruff_diff: bool = True
     publish: PublishPolicy = PublishPolicy()
+    # Fase 7, Paso 2 (ADR 0010): the GitHub repository this local mirror stands
+    # for. ``None`` keeps a purely local repository (sandbox-* demos). Content
+    # that arrives through a remote is untrusted data: these globs are never
+    # shown to the Scoper and never writable, whatever ``writable_globs`` says.
+    remote: RemoteSpec | None = None
+    excluded_context_globs: list[str] = Field(default_factory=list, max_length=32)
 
-    @field_validator("writable_globs", "denied_globs")
+    @field_validator("writable_globs", "denied_globs", "excluded_context_globs")
     @classmethod
     def _valid_globs(cls, value: list[str]) -> list[str]:
         for pattern in value:
@@ -97,9 +125,23 @@ class RepositoryPolicy(BaseModel):
             raise ValueError("model_timeout_seconds no puede superar wall_seconds")
         return self
 
+    @model_validator(mode="after")
+    def _remote_matches_publish(self) -> "RepositoryPolicy":
+        if self.remote is not None and self.remote.default_branch != self.publish.base_branch:
+            raise ValueError(
+                "publish.base_branch debe coincidir con remote.default_branch "
+                f"({self.publish.base_branch!r} != {self.remote.default_branch!r})"
+            )
+        return self
+
     @property
     def all_denied_globs(self) -> tuple[str, ...]:
         return DEFAULT_DENIED_GLOBS + tuple(self.denied_globs)
+
+    @property
+    def all_excluded_context_globs(self) -> tuple[str, ...]:
+        """Agent-instruction files and the project's extra exclusions (ADR 0010 §6)."""
+        return DEFAULT_EXCLUDED_CONTEXT_GLOBS + tuple(self.excluded_context_globs)
 
 
 class ProjectPolicyRegistry:
