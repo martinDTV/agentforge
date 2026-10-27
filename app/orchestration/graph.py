@@ -62,6 +62,13 @@ class RunState(TypedDict, total=False):
     publish_decided_by: str
     published: bool
     publication_interrupted: bool
+    # Smart Router: requested mode, route followed, the recorded decision and the
+    # plan verdict of the full route (``approved`` stays the planning workflow's).
+    route_mode: str
+    route: str
+    route_decision: dict[str, Any]
+    route_escalation: dict[str, Any]
+    plan_approved: bool
 
 
 RunGraph = CompiledStateGraph[RunState, None, RunState, RunState]
@@ -70,6 +77,74 @@ RunStateGraph = StateGraph[RunState, None, RunState, RunState]
 
 def _error_payload(exc: LLMError) -> dict[str, Any]:
     return RunError(code=exc.code, message=exc.message).model_dump()
+
+
+class PlanningNodes:
+    """Planner and Architect node functions, shared by the planning graph and the
+    full route of the development graph (Smart Router)."""
+
+    def __init__(self, llm: LLMPort, limits: RunLimits, *, approval: str = "approval") -> None:
+        self.limits = limits
+        self._approval = approval
+        planner = PlannerAgent(llm)
+        architect = ArchitectAgent(llm)
+
+        def budget_exhausted(state: RunState) -> dict[str, Any] | None:
+            if state.get("llm_calls", 0) < limits.max_llm_calls:
+                return None
+            error = RunError(
+                code=BUDGET_EXCEEDED_CODE,
+                message=(
+                    f"Se alcanzó el límite de {limits.max_llm_calls} llamadas al LLM por ejecución."
+                ),
+            )
+            return {"error": error.model_dump()}
+
+        def planner_node(state: RunState) -> dict[str, Any]:
+            if (blocked := budget_exhausted(state)) is not None:
+                return blocked
+            previous = DevelopmentPlan.model_validate(state["plan"]) if "plan" in state else None
+            revision = state.get("revision", 0) + 1 if previous is not None else 0
+            try:
+                plan = planner.execute(
+                    state["task"],
+                    previous_plan=previous,
+                    feedback=state.get("feedback", []),
+                )
+            except LLMError as exc:
+                return {"llm_calls": 1, "error": _error_payload(exc)}
+            return {"plan": plan.model_dump(), "revision": revision, "llm_calls": 1}
+
+        def architect_node(state: RunState) -> dict[str, Any]:
+            if (blocked := budget_exhausted(state)) is not None:
+                return blocked
+            plan = DevelopmentPlan.model_validate(state["plan"])
+            try:
+                review: ArchitectureReview = architect.execute(
+                    task=state["task"], plan=plan, revision=state.get("revision", 0)
+                )
+            except LLMError as exc:
+                return {"llm_calls": 1, "error": _error_payload(exc)}
+            return {
+                "architecture": review.model_dump(),
+                "architect_approved": review.approved,
+                "feedback": review.issues,
+                "llm_calls": 1,
+            }
+
+        self.planner = planner_node
+        self.architect = architect_node
+
+    def route_after_architect(self, state: RunState) -> str:
+        if "error" in state:
+            return END
+        if state.get("architect_approved"):
+            return self._approval
+        revisions_left = state.get("revision", 0) < self.limits.max_revisions
+        round_fits_budget = state.get("llm_calls", 0) + 2 <= self.limits.max_llm_calls
+        # Out of revisions or budget: the human still gets the final say, with
+        # the architect's objections visible in the response.
+        return "planner" if revisions_left and round_fits_budget else self._approval
 
 
 def build_state_graph(llm: LLMPort, limits: RunLimits | None = None) -> RunStateGraph:
@@ -89,51 +164,7 @@ def build_state_graph(llm: LLMPort, limits: RunLimits | None = None) -> RunState
     lets tests compile the same graph shape against a FakeLLMAdapter.
     """
     limits = limits or RunLimits()
-    planner = PlannerAgent(llm)
-    architect = ArchitectAgent(llm)
-
-    def budget_exhausted(state: RunState) -> dict[str, Any] | None:
-        if state.get("llm_calls", 0) < limits.max_llm_calls:
-            return None
-        error = RunError(
-            code=BUDGET_EXCEEDED_CODE,
-            message=(
-                f"Se alcanzó el límite de {limits.max_llm_calls} llamadas al LLM por ejecución."
-            ),
-        )
-        return {"error": error.model_dump()}
-
-    def planner_node(state: RunState) -> dict[str, Any]:
-        if (blocked := budget_exhausted(state)) is not None:
-            return blocked
-        previous = DevelopmentPlan.model_validate(state["plan"]) if "plan" in state else None
-        revision = state.get("revision", 0) + 1 if previous is not None else 0
-        try:
-            plan = planner.execute(
-                state["task"],
-                previous_plan=previous,
-                feedback=state.get("feedback", []),
-            )
-        except LLMError as exc:
-            return {"llm_calls": 1, "error": _error_payload(exc)}
-        return {"plan": plan.model_dump(), "revision": revision, "llm_calls": 1}
-
-    def architect_node(state: RunState) -> dict[str, Any]:
-        if (blocked := budget_exhausted(state)) is not None:
-            return blocked
-        plan = DevelopmentPlan.model_validate(state["plan"])
-        try:
-            review: ArchitectureReview = architect.execute(
-                task=state["task"], plan=plan, revision=state.get("revision", 0)
-            )
-        except LLMError as exc:
-            return {"llm_calls": 1, "error": _error_payload(exc)}
-        return {
-            "architecture": review.model_dump(),
-            "architect_approved": review.approved,
-            "feedback": review.issues,
-            "llm_calls": 1,
-        }
+    nodes = PlanningNodes(llm, limits)
 
     def approval_node(state: RunState) -> dict[str, Any]:
         response = interrupt(
@@ -152,20 +183,9 @@ def build_state_graph(llm: LLMPort, limits: RunLimits | None = None) -> RunState
     def route_after_planner(state: RunState) -> str:
         return END if "error" in state else "architect"
 
-    def route_after_architect(state: RunState) -> str:
-        if "error" in state:
-            return END
-        if state.get("architect_approved"):
-            return "approval"
-        revisions_left = state.get("revision", 0) < limits.max_revisions
-        round_fits_budget = state.get("llm_calls", 0) + 2 <= limits.max_llm_calls
-        # Out of revisions or budget: the human still gets the final say, with
-        # the architect's objections visible in the response.
-        return "planner" if revisions_left and round_fits_budget else "approval"
-
     builder = StateGraph(RunState)
-    builder.add_node("planner", planner_node)
-    builder.add_node("architect", architect_node)
+    builder.add_node("planner", nodes.planner)
+    builder.add_node("architect", nodes.architect)
     builder.add_node("approval", approval_node)
     builder.add_edge(START, "planner")
     builder.add_conditional_edges(
@@ -173,7 +193,7 @@ def build_state_graph(llm: LLMPort, limits: RunLimits | None = None) -> RunState
     )
     builder.add_conditional_edges(
         "architect",
-        route_after_architect,
+        nodes.route_after_architect,
         {"planner": "planner", "approval": "approval", END: END},
     )
     builder.add_edge("approval", END)

@@ -29,6 +29,7 @@ EXECUTED_BY: dict[str, str] = {
     # Publication steps are platform work, never an agent's (ADR 0011).
     "prepare_publication": "agentforge:publisher",
     "publish": "agentforge:publisher",
+    "router": "agentforge:platform",
 }
 # Events that a human decision causes directly: attributed to that human.
 HUMAN_CAUSED: frozenset[RunEventKind] = frozenset(
@@ -100,6 +101,36 @@ def events_from_update(
                 failed["approved_by"] = approved_by
             events.append(RunEvent(kind=RunEventKind.RUN_FAILED, payload=failed))
             continue
+        if node == "router" and delta.get("route_decision"):
+            decision = delta["route_decision"]
+            events.append(
+                RunEvent(
+                    kind=RunEventKind.ROUTE_SELECTED,
+                    payload={
+                        "route": decision.get("route"),
+                        "mode": decision.get("mode"),
+                        "reason": decision.get("reason"),
+                        "policy_version": decision.get("policy_version"),
+                        "confidence": decision.get("confidence"),
+                        "classifier_used": decision.get("classifier_used"),
+                        "executed_by": "agentforge:platform",
+                    },
+                )
+            )
+            continue
+        if node == "scoper" and delta.get("route_escalation"):
+            escalation = delta["route_escalation"]
+            events.append(
+                RunEvent(
+                    kind=RunEventKind.ROUTE_ESCALATED,
+                    payload={
+                        "route": escalation.get("route"),
+                        "escalated_from": escalation.get("escalated_from"),
+                        "reason": escalation.get("reason"),
+                        "executed_by": "agentforge:platform",
+                    },
+                )
+            )
         if node == "scoper":
             proposal = delta.get("scope_proposal") or {}
             base = proposal.get("base") or {}
@@ -201,6 +232,15 @@ def events_from_update(
                 verdict["approved_by" if delta["approved"] else "rejected_by"] = approved_by
             ordinal = DecisionStage.SCOPE.event_ordinal if node == "approve_scope" else 0
             events.append(RunEvent(kind=kind, ordinal=ordinal, payload=verdict))
+        elif node == "approve_plan" and "plan_approved" in delta:
+            decided = bool(delta["plan_approved"])
+            kind = RunEventKind.RUN_APPROVED if decided else RunEventKind.RUN_REJECTED
+            verdict = {"stage": "plan"}
+            if approved_by is not None:
+                verdict["approved_by" if decided else "rejected_by"] = approved_by
+            events.append(
+                RunEvent(kind=kind, ordinal=DecisionStage.PLAN.event_ordinal, payload=verdict)
+            )
         elif node == "approve_publish" and "publish_approved" in delta:
             decided = bool(delta["publish_approved"])
             kind = RunEventKind.RUN_APPROVED if decided else RunEventKind.RUN_REJECTED

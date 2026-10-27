@@ -52,6 +52,14 @@ from app.projects import (
     matches_any,
 )
 from app.publishing import PublicationProgress
+from app.routing import (
+    Route,
+    RouteDecision,
+    RouteDecisionRepository,
+    RouteMode,
+    SmartRouter,
+    escalation_from_scope,
+)
 from app.sandbox import SandboxPort
 from app.security import (
     AgentGrant,
@@ -80,6 +88,8 @@ from .development import (
     DevelopmentState,
     revise,
 )
+from .graph import PlanningNodes
+from .limits import RunLimits
 from .publication import PublicationNodes, PublicationRuntime
 
 SCOPE_STAGE = "scope"
@@ -116,6 +126,17 @@ class DevelopmentRuntime:
     # Fase 7, Paso 3 (ADR 0011): the Publisher. ``None`` = publication disabled:
     # runs on remote repositories end ``completed`` and nothing leaves the host.
     publisher: PublicationRuntime | None = None
+    # Smart Router. ``None`` keeps the historical behaviour: every run goes fast
+    # unless the request asks for ``full``.
+    router: SmartRouter | None = None
+    route_decisions: RouteDecisionRepository | None = None
+    planning_limits: RunLimits = field(
+        default_factory=lambda: RunLimits(max_revisions=1, max_llm_calls=6)
+    )
+
+    async def record_route(self, run_id: UUID, decision: RouteDecision) -> None:
+        if self.route_decisions is not None:
+            await self.route_decisions.record(run_id, decision)
 
     async def runs_set_publication(self, run_id: UUID, progress: PublicationProgress) -> None:
         """Record a non-progressing publication state (unavailable, failed at prepare)."""
@@ -234,6 +255,65 @@ def build_scoped_development_graph(
             return None
         return result.output or {}
 
+    planning = PlanningNodes(runtime.llm, runtime.planning_limits, approval="approve_plan")
+
+    async def router_node(state: DevelopmentState, config: RunnableConfig) -> dict[str, Any]:
+        """Decide fast/full before anything runs; the decision is durable and audited."""
+        try:
+            run_id = _run_id(config)
+            policy = runtime.policy_for(state)
+            mode = RouteMode(str(state.get("route_mode") or RouteMode.AUTO.value))
+            if runtime.router is None:
+                route = Route.FULL if mode is RouteMode.FULL else Route.FAST
+                decision = RouteDecision(
+                    route=route,
+                    mode=mode,
+                    reason="requested_full" if route is Route.FULL else "router_unconfigured",
+                    decided_at=runtime.clock(),
+                )
+                calls = 0
+            else:
+                decision = runtime.router.decide(
+                    state["task"],
+                    mode=mode,
+                    allow_fast=policy.allow_fast_route,
+                    context={"repository_id": policy.repository_id},
+                )
+                calls = 1 if decision.classifier_used else 0
+            await runtime.record_route(run_id, decision)
+            return {
+                "route": decision.route.value,
+                "route_mode": mode.value,
+                "route_decision": decision.model_dump(mode="json"),
+                "llm_calls": calls,
+            }
+        except (PolicyError, LLMError) as exc:
+            return _failure(exc)
+
+    def approve_plan_node(state: DevelopmentState) -> dict[str, Any]:
+        policy = runtime.policy_for(state)
+        deadline = runtime.clock() + timedelta(seconds=policy.scope_approval_ttl_seconds)
+        response = interrupt(
+            {
+                "kind": "approve_plan",
+                "stage": "plan",
+                "deadline": deadline.isoformat(),
+                "repository_id": state["repository_id"],
+                "route": state.get("route"),
+                "plan": state.get("plan"),
+                "architecture": state.get("architecture"),
+                "architect_approved": state.get("architect_approved"),
+                "revision": state.get("revision", 0),
+            }
+        )
+        if not isinstance(response, dict) or type(response.get("approved")) is not bool:
+            return _failure(DevelopmentFailure("decision_invalid", "decisión de plan inválida"))
+        if response.get("stage") not in (None, "plan"):
+            return _failure(
+                DevelopmentFailure("decision_mismatch", "la decisión no corresponde al plan")
+            )
+        return {"plan_approved": bool(response["approved"])}
+
     async def scoper_node(state: DevelopmentState, config: RunnableConfig) -> dict[str, Any]:
         budget: BudgetedLLM | None = None
         try:
@@ -304,7 +384,27 @@ def build_scoped_development_graph(
                 )
             proposed_at = runtime.clock()
             deadline = proposed_at + timedelta(seconds=policy.scope_approval_ttl_seconds)
+            update: dict[str, Any] = {}
+            previous = state.get("route_decision")
+            if previous and state.get("route") == Route.FAST.value and runtime.router is not None:
+                # Before any write: escalate when the proposal reveals more than the
+                # classification assumed (deterministic, ADR-free; see README).
+                escalation = escalation_from_scope(
+                    RouteDecision.model_validate(previous),
+                    proposal,
+                    accepted_files=len(decision.scope.files),
+                    max_files_per_run=policy.max_files_per_run,
+                    clock=runtime.clock,
+                )
+                if escalation is not None:
+                    await runtime.record_route(run_id, escalation)
+                    update.update(
+                        route=Route.FULL.value,
+                        route_escalation=escalation.model_dump(mode="json"),
+                        route_decision=escalation.model_dump(mode="json"),
+                    )
             return {
+                **update,
                 "scope_proposal": {
                     "summary": proposal.summary,
                     "risks": list(proposal.risks),
@@ -460,8 +560,26 @@ def build_scoped_development_graph(
         except (DevelopmentFailure, PolicyError) as exc:
             return _failure(exc)
 
+    def after_router(state: DevelopmentState) -> str:
+        if state.get("error"):
+            return END
+        return "planner" if state.get("route") == Route.FULL.value else "scoper"
+
+    def after_planner(state: DevelopmentState) -> str:
+        return END if state.get("error") else "architect"
+
+    def after_plan_decision(state: DevelopmentState) -> str:
+        if state.get("error") or state.get("plan_approved") is not True:
+            return END
+        # Escalated from fast: the Scoper already proposed; go straight to its approval.
+        return "approve_scope" if state.get("scope_proposal") else "scoper"
+
     def after_scoper(state: DevelopmentState) -> str:
-        return END if state.get("error") else "approve_scope"
+        if state.get("error"):
+            return END
+        if state.get("route_escalation") and state.get("plan_approved") is None:
+            return "planner"
+        return "approve_scope"
 
     def after_approval(state: DevelopmentState) -> str:
         if state.get("error") or state.get("approved") is False or not state.get("approved_scope"):
@@ -488,6 +606,10 @@ def build_scoped_development_graph(
         return "publish"
 
     builder = StateGraph(DevelopmentState)
+    builder.add_node("router", router_node)
+    builder.add_node("planner", planning.planner)
+    builder.add_node("architect", planning.architect)
+    builder.add_node("approve_plan", approve_plan_node)
     builder.add_node("scoper", scoper_node)
     builder.add_node("approve_scope", approve_scope_node)
     builder.add_node("developer", developer_node)
@@ -497,9 +619,25 @@ def build_scoped_development_graph(
     builder.add_node("prepare_publication", publication.prepare_publication)
     builder.add_node("approve_publish", publication.approve_publish)
     builder.add_node("publish", publication.publish)
-    builder.add_edge(START, "scoper")
+    builder.add_edge(START, "router")
     builder.add_conditional_edges(
-        "scoper", after_scoper, {"approve_scope": "approve_scope", END: END}
+        "router", after_router, {"planner": "planner", "scoper": "scoper", END: END}
+    )
+    builder.add_conditional_edges("planner", after_planner, {"architect": "architect", END: END})
+    builder.add_conditional_edges(
+        "architect",
+        planning.route_after_architect,
+        {"planner": "planner", "approve_plan": "approve_plan", END: END},
+    )
+    builder.add_conditional_edges(
+        "approve_plan",
+        after_plan_decision,
+        {"scoper": "scoper", "approve_scope": "approve_scope", END: END},
+    )
+    builder.add_conditional_edges(
+        "scoper",
+        after_scoper,
+        {"approve_scope": "approve_scope", "planner": "planner", END: END},
     )
     builder.add_conditional_edges(
         "approve_scope", after_approval, {"developer": "developer", END: END}

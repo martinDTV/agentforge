@@ -81,6 +81,8 @@ def build_projection(
         checkpoint_id=checkpoint_id_of(snapshot),
         pending_stage=pending.stage if pending else None,
         approval_deadline=pending.deadline if pending else None,
+        route=values.get("route"),
+        route_mode=values.get("route_mode"),
     )
 
 
@@ -96,4 +98,6 @@ def projection_differs(row: PersistedRun, projection: RunProjection) -> bool:
         or row.error != projection.error
         or row.pending_stage != projection.pending_stage
         or row.approval_deadline != projection.approval_deadline
+        or (projection.route is not None and row.route != projection.route)
+        or (projection.route_mode is not None and row.route_mode != projection.route_mode)
     )

@@ -124,6 +124,8 @@ class RepositoryPolicy(BaseModel):
     # shown to the Scoper and never writable, whatever ``writable_globs`` says.
     remote: RemoteSpec | None = None
     excluded_context_globs: list[str] = Field(default_factory=list, max_length=32)
+    # Smart Router: a project may forbid the fast route altogether.
+    allow_fast_route: bool = True
 
     @field_validator("writable_globs", "denied_globs", "excluded_context_globs")
     @classmethod

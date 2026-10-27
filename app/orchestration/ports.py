@@ -53,6 +53,9 @@ class PersistedRun(BaseModel):
     pending_stage: DecisionStage | None = None
     approval_deadline: datetime | None = None
     publication: dict[str, Any] | None = None
+    # Smart Router: route followed (fast/full) and the mode requested (auto/fast/full).
+    route: str | None = None
+    route_mode: str | None = None
     idempotency_key: str | None = None
     attempt: int = 0
     lease_owner: str | None = None
@@ -99,6 +102,8 @@ class RunProjection(BaseModel):
     checkpoint_id: str | None = None
     pending_stage: DecisionStage | None = None
     approval_deadline: datetime | None = None
+    route: str | None = None
+    route_mode: str | None = None
 
 
 class RunEvent(BaseModel):

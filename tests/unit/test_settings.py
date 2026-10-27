@@ -21,6 +21,9 @@ _PREFIXES = (
     "RECOVERY_",
     "AUTH_",
     "OIDC_",
+    "AGENTFORGE_",
+    "NOTIFICATIONS_",
+    "ROUTER_",
 )
 
 
@@ -291,3 +294,32 @@ def test_github_writes_are_off_by_default_and_gated_when_enabled():
     strict = make(**production, publish_allowed_repositories=["sandbox-github"])
     assert strict.publish_distinct_approver is True and strict.separation_of_duties is True
     assert make(authz_publish_distinct_approver=True).publish_distinct_approver is True
+
+
+def test_email_settings_parse_recipients_and_fail_closed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AGENTFORGE_EMAIL_TO", "vazquez@example.com")
+    assert make().agentforge_email_to == ["vazquez@example.com"]
+    monkeypatch.setenv("AGENTFORGE_EMAIL_TO", "a@example.com, b@example.com")
+    assert make().agentforge_email_to == ["a@example.com", "b@example.com"]
+    monkeypatch.setenv("AGENTFORGE_EMAIL_TO", '["c@example.com"]')
+    assert make().agentforge_email_to == ["c@example.com"]
+    monkeypatch.delenv("AGENTFORGE_EMAIL_TO")
+    assert make().agentforge_email_enabled is False and make().agentforge_email_to == []
+    smtp = {
+        "agentforge_email_enabled": True,
+        "agentforge_smtp_username": "notificacione.agentforge@gmail.com",
+        "agentforge_smtp_app_password": "x" * 16,
+        "agentforge_email_from": "notificacione.agentforge@gmail.com",
+        "agentforge_email_to": "ops@example.com",
+    }
+    settings = make(**smtp)
+    assert settings.agentforge_email_to == ["ops@example.com"]
+    assert settings.agentforge_smtp_app_password is not None
+    assert "x" not in repr(settings.agentforge_smtp_app_password)  # SecretStr never prints
+    assert "x" * 16 not in repr(settings) and "x" * 16 not in str(settings.model_dump())
+    with pytest.raises(ValidationError, match="AGENTFORGE_SMTP_APP_PASSWORD"):
+        make(**{**smtp, "agentforge_smtp_app_password": None})
+    with pytest.raises(ValidationError, match="STARTTLS"):
+        make(**smtp, agentforge_smtp_starttls=False)
+    with pytest.raises(ValidationError, match="inválida"):
+        make(**{**smtp, "agentforge_email_to": "not-an-address"})

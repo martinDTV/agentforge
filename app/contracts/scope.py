@@ -10,6 +10,7 @@ import hashlib
 import json
 from enum import StrEnum
 from pathlib import PurePosixPath
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -55,6 +56,10 @@ class ScopeProposal(BaseModel):
     files: list[ScopeFile] = Field(min_length=1, max_length=MAX_SCOPE_FILES)
     tests: list[str] = Field(default_factory=list, max_length=8)
     risks: list[str] = Field(default_factory=list, max_length=8)
+    # Smart Router escalation hints (advisory): the Scoper may flag that the task
+    # is larger than it looked; the platform decides deterministically.
+    complexity: Literal["low", "medium", "high"] = "low"
+    requires_planning: bool = False
 
 
 class RejectedPath(BaseModel):

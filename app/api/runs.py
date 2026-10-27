@@ -136,6 +136,7 @@ async def create_run(
         idempotency_key=idempotency_key,
         workflow_kind=body.workflow_kind,
         repository_id=body.repository_id,
+        route_mode=body.route_mode,
     )
     if not outcome.created:
         response.status_code = status.HTTP_200_OK

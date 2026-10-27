@@ -14,7 +14,7 @@ Coordination lives in the database, never in process memory:
 
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -31,6 +31,7 @@ from app.contracts.lifecycle import (
     WorkflowKind,
     sources_for,
 )
+from app.notifications import NotificationEnqueuer, RunContext
 from app.orchestration.exceptions import RunAlreadyExistsError
 from app.orchestration.ports import (
     ApprovalClaim,
@@ -49,6 +50,7 @@ from app.security import AccessScope
 
 from .errors import as_unavailable
 from .models import RunApprovalRecord, RunDecisionRecord, RunEventRecord, RunRecord
+from .notifications import insert_outbox
 
 _LEASE_FREE = or_(RunRecord.lease_owner.is_(None), RunRecord.lease_expires_at < func.now())
 _LEASE_ACTIVE = and_(RunRecord.lease_owner.is_not(None), RunRecord.lease_expires_at > func.now())
@@ -81,6 +83,8 @@ def _to_run(record: RunRecord, lease_active: bool) -> PersistedRun:
         pending_stage=record.pending_stage,
         approval_deadline=record.approval_deadline,
         publication=record.publication,
+        route=record.route,
+        route_mode=record.route_mode,
         idempotency_key=record.idempotency_key,
         attempt=record.attempt,
         lease_owner=record.lease_owner,
@@ -123,8 +127,36 @@ def _fenced(lease: LeaseToken) -> Any:
 
 
 class SqlAlchemyRunRepository:
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        *,
+        notifications: NotificationEnqueuer | None = None,
+    ) -> None:
         self._sessions = sessions
+        # When configured, every persisted event that deserves a mail also writes
+        # its outbox row in the same transaction (AgentForge Notifications).
+        self._notifications = notifications
+
+    async def _enqueue(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        events: Sequence[tuple[int | None, RunEvent]],
+    ) -> None:
+        if self._notifications is None or not self._notifications.active or not events:
+            return
+        record = await session.get(RunRecord, run_id)
+        if record is None:
+            return
+        context = RunContext(
+            run_id=run_id,
+            project_id=record.project_id,
+            task=record.task,
+            workflow_kind=str(record.workflow_kind),
+        )
+        drafts = self._notifications.drafts(context, events, moment=datetime.now(UTC))
+        await insert_outbox(session, drafts)
 
     @asynccontextmanager
     async def _tx(self) -> AsyncIterator[AsyncSession]:
@@ -201,15 +233,28 @@ class SqlAlchemyRunRepository:
                 if existing is None:  # pragma: no cover - only if the row vanished meanwhile
                     raise RunAlreadyExistsError(str(run_id))
                 return CreateOutcome(run=_to_run(existing[0], bool(existing[1])), created=False)
-            session.add(
-                RunEventRecord(
-                    run_id=run_id,
-                    kind=RunEventKind.RUN_CREATED,
-                    payload={"initiated_by": owner_subject},
-                    actor_subject=owner_subject,
-                )
+            created_event = RunEventRecord(
+                run_id=run_id,
+                kind=RunEventKind.RUN_CREATED,
+                payload={"initiated_by": owner_subject},
+                actor_subject=owner_subject,
             )
+            session.add(created_event)
             await session.flush()
+            await self._enqueue(
+                session,
+                run_id,
+                [
+                    (
+                        int(created_event.id),
+                        RunEvent(
+                            kind=RunEventKind.RUN_CREATED,
+                            payload={"initiated_by": owner_subject},
+                            actor_subject=owner_subject,
+                        ),
+                    )
+                ],
+            )
             run = await self._load(session, run_id)
             assert run is not None
             return CreateOutcome(run=run, created=True, lease=LeaseToken(owner=owner, generation=1))
@@ -299,6 +344,10 @@ class SqlAlchemyRunRepository:
             "approval_deadline": projection.approval_deadline,
             "updated_at": func.now(),
         }
+        if projection.route is not None:
+            values["route"] = projection.route
+        if projection.route_mode is not None:
+            values["route_mode"] = projection.route_mode
         if release:
             values.update(lease_owner=None, lease_expires_at=None)
         async with self._tx() as session:
@@ -499,9 +548,20 @@ class SqlAlchemyRunRepository:
                 .on_conflict_do_nothing(constraint="uq_run_events_run_id_kind_ordinal")
                 # RETURNING only yields the rows actually inserted, which is the
                 # reliable count (rowcount is -1 for batched inserts on psycopg).
-                .returning(RunEventRecord.id)
+                .returning(RunEventRecord.id, RunEventRecord.kind, RunEventRecord.ordinal)
             )
-            inserted = (await session.execute(stmt)).scalars().all()
+            inserted = (await session.execute(stmt)).all()
+            if inserted:
+                by_key = {(event.kind, event.ordinal): event for event in events}
+                await self._enqueue(
+                    session,
+                    run_id,
+                    [
+                        (int(row_id), by_key[(RunEventKind(kind), ordinal)])
+                        for row_id, kind, ordinal in inserted
+                        if (RunEventKind(kind), ordinal) in by_key
+                    ],
+                )
             return len(inserted)
 
     async def list_events(

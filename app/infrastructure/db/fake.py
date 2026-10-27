@@ -21,6 +21,13 @@ from app.contracts.lifecycle import (
 )
 from app.contracts.tools import InvocationStatus
 from app.git.mirrors import MirrorSync
+from app.notifications import (
+    NotificationEnqueuer,
+    OutboxDraft,
+    OutboxItem,
+    OutboxStatus,
+    RunContext,
+)
 from app.orchestration.exceptions import RunAlreadyExistsError
 from app.orchestration.ports import (
     ApprovalClaim,
@@ -36,12 +43,21 @@ from app.orchestration.ports import (
     RunProjection,
 )
 from app.publishing import PublicationRecord
+from app.routing import RouteDecision
 from app.security import AccessScope
 from app.tools.ports import InvocationCompletion, ToolInvocation
 
 
 class InMemoryRunRepository:
-    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], datetime] | None = None,
+        *,
+        notifications: NotificationEnqueuer | None = None,
+        outbox: "InMemoryNotificationOutbox | None" = None,
+    ) -> None:
+        self._notifications = notifications
+        self.outbox = outbox if outbox is not None else InMemoryNotificationOutbox(clock)
         self.runs: dict[UUID, PersistedRun] = {}
         self.events: dict[UUID, list[PersistedEvent]] = {}
         self.approvals: dict[UUID, ApprovalDecision] = {}
@@ -118,6 +134,7 @@ class InMemoryRunRepository:
             created_at=now,
             updated_at=now,
         )
+        stored = self._store(run)
         self._append(
             run_id,
             [
@@ -128,9 +145,7 @@ class InMemoryRunRepository:
                 )
             ],
         )
-        return CreateOutcome(
-            run=self._store(run), created=True, lease=LeaseToken(owner=owner, generation=1)
-        )
+        return CreateOutcome(run=stored, created=True, lease=LeaseToken(owner=owner, generation=1))
 
     async def get_run(self, run_id: UUID) -> PersistedRun | None:
         self._enter("get_run")
@@ -202,6 +217,10 @@ class InMemoryRunRepository:
             "approval_deadline": projection.approval_deadline,
             "updated_at": self.clock(),
         }
+        if projection.route is not None:
+            changes["route"] = projection.route
+        if projection.route_mode is not None:
+            changes["route_mode"] = projection.route_mode
         if release:
             changes.update(lease_owner=None, lease_expires_at=None)
         return self._store(current.model_copy(update=changes))
@@ -342,6 +361,7 @@ class InMemoryRunRepository:
         stored = self.events.setdefault(run_id, [])
         existing = {(e.kind, e.ordinal) for e in stored}
         inserted = 0
+        new: list[tuple[int | None, RunEvent]] = []
         for event in events:
             key = (event.kind, event.ordinal)
             if key in existing:
@@ -352,8 +372,18 @@ class InMemoryRunRepository:
                     id=self._next_event_id, created_at=self.clock(), **event.model_dump()
                 )
             )
+            new.append((self._next_event_id, event))
             self._next_event_id += 1
             inserted += 1
+        run = self.runs.get(run_id)
+        if self._notifications is not None and run is not None and new:
+            context = RunContext(
+                run_id=run_id,
+                project_id=run.project_id,
+                task=run.task,
+                workflow_kind=run.workflow_kind.value,
+            )
+            self.outbox.insert(self._notifications.drafts(context, new, moment=self.clock()))
         return inserted
 
     async def list_events(
@@ -681,3 +711,136 @@ class InMemoryPublicationRepository:
 
     async def list_for_run(self, run_id: UUID) -> list[PublicationRecord]:
         return [r for r in self.rows if r.run_id == run_id]
+
+
+class InMemoryNotificationOutbox:
+    """Mirror of ``SqlAlchemyNotificationOutbox`` for the unit suite."""
+
+    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
+        self.items: dict[int, OutboxItem] = {}
+        self.clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
+        self._next = 1
+
+    def insert(self, drafts: Sequence[OutboxDraft]) -> int:
+        keys = {i.dedup_key for i in self.items.values()}
+        inserted = 0
+        for d in drafts:
+            if d.dedup_key in keys:
+                continue
+            keys.add(d.dedup_key)
+            now = self.clock()
+            self.items[self._next] = OutboxItem(
+                id=self._next,
+                run_id=d.run_context.run_id,
+                event_id=d.event_id,
+                kind=d.kind,
+                recipient=d.recipient,
+                subject=d.subject,
+                text_body=d.text_body,
+                html_body=d.html_body,
+                dedup_key=d.dedup_key,
+                message_id=d.message_id,
+                status=OutboxStatus.PENDING,
+                next_attempt_at=now,
+                created_at=now,
+            )
+            self._next += 1
+            inserted += 1
+        return inserted
+
+    async def claim(self, *, now: datetime, limit: int, lease_seconds: float) -> list[OutboxItem]:
+        due = [
+            i
+            for i in sorted(self.items.values(), key=lambda i: (i.next_attempt_at, i.id))
+            if (
+                i.status in (OutboxStatus.PENDING, OutboxStatus.FAILED) and i.next_attempt_at <= now
+            )
+            or (
+                i.status is OutboxStatus.SENDING
+                and i.lease_until is not None
+                and i.lease_until < now
+            )
+        ][:limit]
+        claimed = []
+        for item in due:
+            updated = item.model_copy(
+                update={
+                    "status": OutboxStatus.SENDING,
+                    "attempts": item.attempts + 1,
+                    "lease_until": now + timedelta(seconds=lease_seconds),
+                }
+            )
+            self.items[item.id] = updated
+            claimed.append(updated)
+        return claimed
+
+    async def mark_sent(self, item_id: int, *, now: datetime) -> bool:
+        item = self.items.get(item_id)
+        if item is None or item.status is not OutboxStatus.SENDING:
+            return False
+        self.items[item_id] = item.model_copy(
+            update={
+                "status": OutboxStatus.SENT,
+                "sent_at": now,
+                "lease_until": None,
+                "last_error": None,
+            }
+        )
+        return True
+
+    async def mark_failed(
+        self,
+        item_id: int,
+        *,
+        now: datetime,
+        error: str,
+        next_attempt_at: datetime | None,
+        dead: bool,
+    ) -> bool:
+        item = self.items.get(item_id)
+        if item is None or item.status is not OutboxStatus.SENDING:
+            return False
+        self.items[item_id] = item.model_copy(
+            update={
+                "status": OutboxStatus.DEAD if dead else OutboxStatus.FAILED,
+                "next_attempt_at": next_attempt_at or now,
+                "lease_until": None,
+                "last_error": error[:512],
+            }
+        )
+        return True
+
+    async def list_items(
+        self, *, statuses: Sequence[OutboxStatus] | None = None, limit: int = 100
+    ) -> list[OutboxItem]:
+        items = sorted(self.items.values(), key=lambda i: i.id, reverse=True)
+        if statuses:
+            items = [i for i in items if i.status in statuses]
+        return items[:limit]
+
+    async def requeue(self, item_id: int, *, now: datetime) -> bool:
+        item = self.items.get(item_id)
+        if item is None or item.status not in (OutboxStatus.DEAD, OutboxStatus.FAILED):
+            return False
+        self.items[item_id] = item.model_copy(
+            update={"status": OutboxStatus.PENDING, "next_attempt_at": now, "last_error": None}
+        )
+        return True
+
+    async def counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in self.items.values():
+            counts[item.status.value] = counts.get(item.status.value, 0) + 1
+        return counts
+
+
+class InMemoryRouteDecisionRepository:
+    def __init__(self) -> None:
+        self.rows: dict[UUID, list[RouteDecision]] = {}
+
+    async def record(self, run_id: UUID, decision: RouteDecision) -> int:
+        self.rows.setdefault(run_id, []).append(decision)
+        return sum(len(v) for v in self.rows.values())
+
+    async def list_for_run(self, run_id: UUID) -> list[RouteDecision]:
+        return list(self.rows.get(run_id, []))

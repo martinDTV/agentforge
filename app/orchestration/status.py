@@ -125,7 +125,7 @@ def derive_status(snapshot: StateSnapshot, *, in_flight: bool = False) -> RunLif
         return RunLifecycleStatus.FAILED
     if values.get("published") is True:
         return RunLifecycleStatus.PUBLISHED
-    if values.get("publish_approved") is False:
+    if values.get("publish_approved") is False or values.get("plan_approved") is False:
         return RunLifecycleStatus.REJECTED
     if has_pending_interrupt(snapshot):
         return RunLifecycleStatus.WAITING_APPROVAL

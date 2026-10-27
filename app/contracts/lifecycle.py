@@ -157,6 +157,9 @@ class RunEventKind(StrEnum):
     RUN_EXPIRED = "run_expired"
     SCOPE_PROPOSED = "scope_proposed"
     MIRROR_REFRESHED = "mirror_refreshed"
+    # Smart Router
+    ROUTE_SELECTED = "route_selected"
+    ROUTE_ESCALATED = "route_escalated"
     # Publication (Fase 7, Paso 3; ADR 0011)
     PUBLICATION_PREPARED = "publication_prepared"
     BRANCH_PUSHED = "branch_pushed"

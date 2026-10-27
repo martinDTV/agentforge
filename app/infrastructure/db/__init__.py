@@ -3,11 +3,14 @@ from .engine import Database
 from .errors import DatabaseUnavailableError, SchemaMismatchError, as_unavailable
 from .fake import (
     InMemoryMirrorSyncRepository,
+    InMemoryNotificationOutbox,
     InMemoryPublicationRepository,
+    InMemoryRouteDecisionRepository,
     InMemoryRunRepository,
     InMemoryToolInvocationRepository,
 )
 from .mirror_syncs import SqlAlchemyMirrorSyncRepository
+from .notifications import SqlAlchemyNotificationOutbox, SqlAlchemyRouteDecisionRepository
 from .publications import SqlAlchemyPublicationRepository
 from .repository import SqlAlchemyRunRepository
 from .schema import expected_head_revision, verify_schema
@@ -18,11 +21,15 @@ __all__ = [
     "Database",
     "DatabaseUnavailableError",
     "InMemoryMirrorSyncRepository",
+    "InMemoryNotificationOutbox",
+    "InMemoryRouteDecisionRepository",
     "InMemoryPublicationRepository",
     "InMemoryRunRepository",
     "InMemoryToolInvocationRepository",
     "SchemaMismatchError",
     "SqlAlchemyMirrorSyncRepository",
+    "SqlAlchemyNotificationOutbox",
+    "SqlAlchemyRouteDecisionRepository",
     "SqlAlchemyPublicationRepository",
     "SqlAlchemyRunRepository",
     "SqlAlchemyToolInvocationRepository",

@@ -20,6 +20,7 @@ from app.contracts.lifecycle import (
     WorkflowKind,
 )
 from app.contracts.planning import ArchitectureReview, DevelopmentPlan
+from app.contracts.routing import RouteMode
 from app.infrastructure.db.errors import DatabaseUnavailableError
 from app.orchestration.events import (
     attribute,
@@ -107,6 +108,8 @@ def _response(row: PersistedRun) -> RunResponse:
         pending_stage=row.pending_stage,
         approval_deadline=row.approval_deadline,
         publication=row.publication,
+        route=row.route,
+        route_mode=row.route_mode,
         revision=row.revision,
         llm_calls=row.llm_calls,
         architect_approved=row.architect_approved,
@@ -200,6 +203,7 @@ class RunService:
         policies: ProjectPolicyRegistry | None = None,
         on_terminal: TerminalHook | None = None,
         clock: Callable[[], datetime] | None = None,
+        default_route_mode: RouteMode = RouteMode.AUTO,
     ) -> None:
         # ``graph`` reads any run's checkpoint (every workflow shares RunState);
         # ``graphs`` says which compiled graph may *drive* each workflow kind.
@@ -210,6 +214,7 @@ class RunService:
         )
         self._policies = policies
         self._on_terminal = on_terminal
+        self._default_route_mode = default_route_mode
         self._clock = clock or (lambda: datetime.now(UTC))
         self._repository = repository
         self._policy = policy or RecoveryPolicy()
@@ -272,6 +277,7 @@ class RunService:
         idempotency_key: str | None = None,
         workflow_kind: WorkflowKind | None = None,
         repository_id: str | None = None,
+        route_mode: RouteMode | None = None,
     ) -> CreateResult:
         self._ensure_accepting()
         # Authorization first: nothing is written until the principal may
@@ -293,7 +299,11 @@ class RunService:
                 self._policies.require(repository_id, project)
             except PolicyError as exc:
                 raise RepositoryNotAuthorizedError(repository_id, project) from exc
-            graph_input.update(project_id=project, repository_id=repository_id)
+            graph_input.update(
+                project_id=project,
+                repository_id=repository_id,
+                route_mode=(route_mode or self._default_route_mode).value,
+            )
         rid = _parse(run_id) if run_id else uuid4()
         # The row (status=running, lease held by us) exists before any LLM work:
         # a crash from here on leaves something to recover, never an orphan.

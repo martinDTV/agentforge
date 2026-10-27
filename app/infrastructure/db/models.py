@@ -98,6 +98,9 @@ class RunRecord(Base):
     pending_stage: Mapped[str | None] = mapped_column(String(16))
     approval_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     publication: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # Smart Router: the route the run follows and the mode that was requested.
+    route: Mapped[str | None] = mapped_column(String(8))
+    route_mode: Mapped[str | None] = mapped_column(String(8))
 
     # Execution lease: who is driving the graph and until when (heartbeat-renewed).
     # ``lease_generation`` is a monotonic fencing token: every acquisition
@@ -373,4 +376,68 @@ class PublicationAuditRecord(Base):
             name="ck_publications_state",
         ),
         Index("ix_publications_run_id_id", "run_id", "id"),
+    )
+
+
+class NotificationOutboxRecord(Base):
+    """Outgoing notification, written in the same transaction as the event that
+    caused it. Holds rendered text only: no credentials, no repository content."""
+
+    __tablename__ = "notification_outbox"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id", ondelete="CASCADE"))
+    event_id: Mapped[int | None] = mapped_column(BigInteger)
+    kind: Mapped[str] = mapped_column(String(48))
+    recipient: Mapped[str] = mapped_column(String(320))
+    subject: Mapped[str] = mapped_column(String(255))
+    text_body: Mapped[str] = mapped_column(Text)
+    html_body: Mapped[str | None] = mapped_column(Text)
+    dedup_key: Mapped[str] = mapped_column(String(512))
+    message_id: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(16), server_default=text("'pending'"))
+    attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(String(512))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("dedup_key", name="uq_notification_outbox_dedup_key"),
+        CheckConstraint(
+            "status IN ('pending', 'sending', 'sent', 'failed', 'dead')",
+            name="ck_notification_outbox_status",
+        ),
+        Index("ix_notification_outbox_status_next_attempt_at", "status", "next_attempt_at"),
+        Index("ix_notification_outbox_run_id", "run_id"),
+    )
+
+
+class RouteDecisionRecord(Base):
+    """Smart Router decision for a run: route, reason, policy version, confidence
+    and classification budget. One row per decision (the initial one and any
+    escalation)."""
+
+    __tablename__ = "route_decisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id", ondelete="CASCADE"))
+    route: Mapped[str] = mapped_column(String(8))
+    mode: Mapped[str] = mapped_column(String(8))
+    reason: Mapped[str] = mapped_column(String(255))
+    policy_version: Mapped[str] = mapped_column(String(32))
+    confidence: Mapped[float | None] = mapped_column()
+    classifier_used: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    mandatory_rules: Mapped[list[str]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    usage: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    escalated_from: Mapped[str | None] = mapped_column(String(8))
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("route IN ('fast', 'full')", name="ck_route_decisions_route"),
+        CheckConstraint("mode IN ('auto', 'fast', 'full')", name="ck_route_decisions_mode"),
+        Index("ix_route_decisions_run_id_id", "run_id", "id"),
     )

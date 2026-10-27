@@ -1,9 +1,10 @@
+import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 Environment = Literal["local", "test", "staging", "production"]
 
@@ -203,6 +204,28 @@ class Settings(DatabaseSettings):
     # None = derive from the environment, like AUTHZ_SEPARATION_OF_DUTIES.
     authz_publish_distinct_approver: bool | None = None
 
+    # Notifications by e-mail (AgentForge Notifications). Off by default. The
+    # app password is a secret read from the environment/.env only; it never
+    # reaches the outbox, logs, audit or checkpoints.
+    agentforge_email_enabled: bool = False
+    agentforge_smtp_host: str = "smtp.gmail.com"
+    agentforge_smtp_port: int = Field(default=587, ge=1, le=65535)
+    agentforge_smtp_starttls: bool = True
+    agentforge_smtp_username: str | None = None
+    agentforge_smtp_app_password: SecretStr | None = None
+    agentforge_email_from: str | None = None
+    agentforge_email_to: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # priority (default): approvals, failures and terminal outcomes; verbose: every stage.
+    notifications_level: Literal["priority", "verbose"] = "priority"
+    notifications_worker_interval_seconds: float = Field(default=15.0, gt=0, le=600)
+    notifications_max_attempts: int = Field(default=6, ge=1, le=20)
+    # Public base URL used in notification links (None = no links).
+    agentforge_public_url: str | None = None
+
+    # Smart Router: default mode when a request does not say one.
+    router_default_mode: Literal["auto", "fast", "full"] = "auto"
+    router_confidence_threshold: float = Field(default=0.7, ge=0.5, le=1.0)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -312,6 +335,40 @@ class Settings(DatabaseSettings):
                 )
         if self.git_repositories_file is None:
             raise ValueError("La GitHub App requiere GIT_REPOSITORIES_FILE y PROJECTS_FILE")
+        return self
+
+    @field_validator("agentforge_email_to", mode="before")
+    @classmethod
+    def _split_recipients(cls, value: object) -> object:
+        """``AGENTFORGE_EMAIL_TO`` is a comma-separated list (or a JSON list)."""
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                return json.loads(text)
+            return [part.strip() for part in text.split(",") if part.strip()]
+        return value
+
+    @model_validator(mode="after")
+    def _email_is_coherent(self) -> "Settings":
+        if not self.agentforge_email_enabled:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("AGENTFORGE_SMTP_USERNAME", self.agentforge_smtp_username),
+                ("AGENTFORGE_SMTP_APP_PASSWORD", self.agentforge_smtp_app_password),
+                ("AGENTFORGE_EMAIL_FROM", self.agentforge_email_from),
+                ("AGENTFORGE_EMAIL_TO", self.agentforge_email_to or None),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(f"AGENTFORGE_EMAIL_ENABLED requiere {', '.join(missing)}")
+        if not self.agentforge_smtp_starttls:
+            raise ValueError("AGENTFORGE_SMTP_STARTTLS debe ser true: el correo solo sale cifrado")
+        for address in [self.agentforge_email_from, *self.agentforge_email_to]:
+            if address is None or "@" not in address or any(ch in address for ch in " \r\n,"):
+                raise ValueError(f"dirección de correo inválida: {address!r}")
         return self
 
     @model_validator(mode="after")

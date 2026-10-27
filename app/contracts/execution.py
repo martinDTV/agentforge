@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 from .lifecycle import DecisionStage, RunEventKind, RunLifecycleStatus, WorkflowKind
 from .planning import ArchitectureReview, DevelopmentPlan
+from .routing import Route, RouteMode
 
 # One definition of the run states for API, orchestration and persistence.
 RunStatus = RunLifecycleStatus
@@ -22,6 +23,14 @@ class CreateRun(BaseModel):
         description="``development`` requires ``repository_id`` and ``repos:write`` (ADR 0009)",
     )
     repository_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    route_mode: RouteMode | None = Field(
+        default=None,
+        description=(
+            "Smart Router: ``auto`` (rules + classifier), ``fast`` (Scoper first; mandatory "
+            "rules may still force ``full``) or ``full`` (Planner and Architect first). "
+            "Development runs only."
+        ),
+    )
 
 
 class Approval(BaseModel):
@@ -92,6 +101,8 @@ class RunResponse(BaseModel):
     publication: dict[str, Any] | None = Field(
         default=None, description="Remote branch and pull request, once published (Fase 7)"
     )
+    route: Route | None = Field(default=None, description="Route followed: fast or full")
+    route_mode: RouteMode | None = Field(default=None, description="Route mode requested")
     revision: int = Field(default=0, ge=0, description="Plan revisions triggered by the architect")
     llm_calls: int = Field(default=0, ge=0, description="Agent calls consumed by this run")
     architect_approved: bool | None = Field(
