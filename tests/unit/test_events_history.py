@@ -58,7 +58,13 @@ def test_history_yields_one_event_per_observed_change():
         (RunEventKind.ARCHITECT_REVIEWED, 1),
         (RunEventKind.WAITING_APPROVAL, 1),
     ]
-    assert events[1].payload == {"revision": 0, "approved": False, "issues": 1, "decisions": 0}
+    assert events[1].payload == {
+        "revision": 0,
+        "approved": False,
+        "issues": 1,
+        "decisions": 0,
+        "executed_by": "agentforge:architect",
+    }
 
 
 def test_history_without_changes_yields_nothing_and_errors_once():
@@ -147,4 +153,10 @@ def test_development_history_yields_node_events_and_completion():
         (RunEventKind.QA_REVIEWED, 1),
         (RunEventKind.RUN_COMPLETED, 0),
     ]
-    assert events[2].payload == {"approved": False, "issues": 1, "checks": 1, "failed_checks": 1}
+    assert events[2].payload == {
+        "approved": False,
+        "issues": 1,
+        "checks": 1,
+        "failed_checks": 1,
+        "executed_by": "agentforge:qa",
+    }

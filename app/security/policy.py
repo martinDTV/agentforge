@@ -33,16 +33,25 @@ class Permission(StrEnum):
     RECOVERY_SWEEP = "recovery:sweep"
     # Crosses project boundaries. Granted only by an explicit global role.
     PROJECTS_ALL = "projects:all"
+    # Withdraw a run that waits for a decision or sits interrupted (Fase 7).
+    RUNS_CANCEL = "runs:cancel"
     # Held only by the automation identity's agents (Fase 5, ``app/security/tools.py``).
     TOOLS_EXECUTE = "tools:execute"
-    # Reserved for the Git adapter of a later step; no role grants it yet.
+    # Create development runs that write inside a worktree and approve their
+    # scope (Fase 7, ADR 0009). Humans only; agents never hold it.
     REPOS_WRITE = "repos:write"
+    # Approve publication to a remote: a branch and a draft pull request (ADR 0011).
+    # Humans only; agents never hold it.
+    REPOS_PUBLISH = "repos:publish"
 
 
 class Role(StrEnum):
     VIEWER = "viewer"
     OPERATOR = "operator"
     APPROVER = "approver"
+    # Humans who may ask AgentForge to write inside a project's repositories
+    # and approve the exact scope of those writes (ADR 0009).
+    PROJECT_OPERATOR = "project_operator"
     ADMIN = "admin"  # every run permission, but only inside the token's projects
     PLATFORM_ADMIN = "platform_admin"  # admin + projects:all
     AGENT = "agent"  # the automation identity: tools only, never runs
@@ -55,15 +64,33 @@ _PROJECT_ADMIN = frozenset(
         _P.RUNS_READ,
         _P.RUNS_APPROVE,
         _P.RUNS_RESUME,
+        _P.RUNS_CANCEL,
         _P.RUNS_AUDIT_READ,
         _P.RECOVERY_SWEEP,
+        _P.REPOS_WRITE,
+        _P.REPOS_PUBLISH,
+    }
+)
+_PROJECT_OPERATOR = frozenset(
+    {
+        _P.RUNS_CREATE,
+        _P.RUNS_READ,
+        _P.RUNS_APPROVE,
+        _P.RUNS_RESUME,
+        _P.RUNS_CANCEL,
+        _P.RUNS_AUDIT_READ,
+        _P.REPOS_WRITE,
+        _P.REPOS_PUBLISH,
     }
 )
 
 DEFAULT_ROLE_PERMISSIONS: Mapping[str, frozenset[Permission]] = {
     Role.VIEWER: frozenset({_P.RUNS_READ, _P.RUNS_AUDIT_READ}),
-    Role.OPERATOR: frozenset({_P.RUNS_READ, _P.RUNS_AUDIT_READ, _P.RUNS_CREATE, _P.RUNS_RESUME}),
+    Role.OPERATOR: frozenset(
+        {_P.RUNS_READ, _P.RUNS_AUDIT_READ, _P.RUNS_CREATE, _P.RUNS_RESUME, _P.RUNS_CANCEL}
+    ),
     Role.APPROVER: frozenset({_P.RUNS_READ, _P.RUNS_AUDIT_READ, _P.RUNS_APPROVE}),
+    Role.PROJECT_OPERATOR: _PROJECT_OPERATOR,
     Role.ADMIN: _PROJECT_ADMIN,
     Role.PLATFORM_ADMIN: _PROJECT_ADMIN | {_P.PROJECTS_ALL},
     Role.AGENT: frozenset({_P.TOOLS_EXECUTE}),
@@ -135,10 +162,16 @@ class AuthorizationPolicy:
         role_permissions: Mapping[str, frozenset[Permission]] | None = None,
         *,
         separation_of_duties: bool = True,
+        publish_distinct_approver: bool | None = None,
         reserved_projects: frozenset[str] = RESERVED_PROJECTS,
     ) -> None:
         self._roles = dict(role_permissions or DEFAULT_ROLE_PERMISSIONS)
         self.separation_of_duties = separation_of_duties
+        # Publication (ADR 0011): besides never approving one's own run, the
+        # publisher must differ from the scope approver (four real eyes).
+        self.publish_distinct_approver = (
+            separation_of_duties if publish_distinct_approver is None else publish_distinct_approver
+        )
         self._reserved = reserved_projects
 
     # -- permissions --------------------------------------------------------------
@@ -181,6 +214,30 @@ class AuthorizationPolicy:
                 return Decision(outcome="forbidden", reason="self_approval")
         return ALLOWED
 
+    def decide_publish(
+        self, principal: Principal, run: OwnedRun, *, scope_approver: str | None
+    ) -> Decision:
+        """May ``principal`` approve the publication of ``run``? (ADR 0011 §2)
+
+        Requires ``runs:approve`` and ``repos:publish`` inside the project, never
+        the run's creator, and, when ``publish_distinct_approver`` is on, never
+        the subject that approved the scope. Agents are never visible principals.
+        """
+        base = self.decide(principal, Permission.RUNS_APPROVE, run)
+        if not base.allowed:
+            return base
+        if not self.has(principal, Permission.REPOS_PUBLISH):
+            return Decision(outcome="forbidden", reason="falta el permiso repos:publish")
+        if run.owner_subject == principal.subject:
+            return Decision(outcome="forbidden", reason="self_approval")
+        if (
+            self.publish_distinct_approver
+            and scope_approver is not None
+            and scope_approver == principal.subject
+        ):
+            return Decision(outcome="forbidden", reason="publish_same_approver")
+        return ALLOWED
+
     def listing_scope(self, principal: Principal) -> AccessScope:
         """Rows visible in a listing: same rule as ``can_see``, expressed as a filter."""
         if self.has(principal, Permission.PROJECTS_ALL):
@@ -216,6 +273,10 @@ class AuthorizationPolicy:
         """Turn a non-allowed decision into the matching domain error."""
         if decision.outcome == "forbidden" and decision.reason == "self_approval":
             raise SelfApprovalForbiddenError()
+        if decision.outcome == "forbidden" and decision.reason == "publish_same_approver":
+            raise PermissionDeniedError(
+                "Quien aprueba la publicación debe ser distinto de quien aprobó el alcance."
+            )
         if decision.outcome == "forbidden":
             raise PermissionDeniedError(decision.reason.capitalize() + ".")
         # "hidden" is raised by the caller as RunNotFoundError: the policy does

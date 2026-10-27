@@ -10,11 +10,31 @@ from typing import Any
 
 from langgraph.types import Interrupt, StateSnapshot
 
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus
+from app.contracts.lifecycle import DecisionStage, RunEventKind, RunLifecycleStatus
 from app.orchestration.ports import PersistedRun, RunEvent
 from app.orchestration.status import checkpoint_id_of, has_pending_interrupt
 
 INTERRUPT_KEY = "__interrupt__"
+
+# Which automation identity executes each node (ADR 0009, attribution). Node
+# events are never attributed to a human: ``actor_subject`` stays NULL and the
+# payload names the agent in ``executed_by``.
+EXECUTED_BY: dict[str, str] = {
+    "planner": "agentforge:planner",
+    "architect": "agentforge:architect",
+    "scoper": "agentforge:scoper",
+    "developer": "agentforge:developer",
+    "apply_changes": "agentforge:developer",
+    "qa": "agentforge:qa",
+    # Publication steps are platform work, never an agent's (ADR 0011).
+    "prepare_publication": "agentforge:publisher",
+    "publish": "agentforge:publisher",
+    "router": "agentforge:platform",
+}
+# Events that a human decision causes directly: attributed to that human.
+HUMAN_CAUSED: frozenset[RunEventKind] = frozenset(
+    {RunEventKind.RUN_APPROVED, RunEventKind.RUN_REJECTED}
+)
 
 
 def revision_from_update(update: dict[str, Any], current: int) -> int:
@@ -29,13 +49,29 @@ def revision_from_update(update: dict[str, Any], current: int) -> int:
 
 
 def events_from_update(
-    update: dict[str, Any], *, revision: int, checkpoint_id: str | None = None
+    update: dict[str, Any],
+    *,
+    revision: int,
+    checkpoint_id: str | None = None,
+    approved_by: str | None = None,
 ) -> list[RunEvent]:
+    """Events for one ``stream_mode="updates"`` item.
+
+    ``approved_by`` is the human whose decision caused this drive (a resume
+    after an approval); it lands in the payload of the terminal events of that
+    drive, never in ``actor_subject`` of node events.
+    """
     events: list[RunEvent] = []
     for node, delta in update.items():
         if node == INTERRUPT_KEY:
             ordinal = _interrupt_revision(delta, revision)
-            events.append(RunEvent(kind=RunEventKind.WAITING_APPROVAL, ordinal=ordinal))
+            events.append(
+                RunEvent(
+                    kind=RunEventKind.WAITING_APPROVAL,
+                    ordinal=ordinal,
+                    payload=_interrupt_payload(delta),
+                )
+            )
             continue
         if not isinstance(delta, dict):
             continue
@@ -58,14 +94,78 @@ def events_from_update(
             )
         if "error" in delta:
             error = delta["error"] or {}
+            failed: dict[str, Any] = {"node": node, "code": error.get("code", "unknown")}
+            if node in EXECUTED_BY:
+                failed["executed_by"] = EXECUTED_BY[node]
+            if approved_by is not None:
+                failed["approved_by"] = approved_by
+            events.append(RunEvent(kind=RunEventKind.RUN_FAILED, payload=failed))
+            continue
+        if node == "router" and delta.get("route_decision"):
+            decision = delta["route_decision"]
             events.append(
                 RunEvent(
-                    kind=RunEventKind.RUN_FAILED,
-                    payload={"node": node, "code": error.get("code", "unknown")},
+                    kind=RunEventKind.ROUTE_SELECTED,
+                    payload={
+                        "route": decision.get("route"),
+                        "mode": decision.get("mode"),
+                        "reason": decision.get("reason"),
+                        "policy_version": decision.get("policy_version"),
+                        "confidence": decision.get("confidence"),
+                        "classifier_used": decision.get("classifier_used"),
+                        "executed_by": "agentforge:platform",
+                    },
                 )
             )
             continue
-        if node == "developer":
+        if node == "scoper" and delta.get("route_escalation"):
+            escalation = delta["route_escalation"]
+            events.append(
+                RunEvent(
+                    kind=RunEventKind.ROUTE_ESCALATED,
+                    payload={
+                        "route": escalation.get("route"),
+                        "escalated_from": escalation.get("escalated_from"),
+                        "reason": escalation.get("reason"),
+                        "executed_by": "agentforge:platform",
+                    },
+                )
+            )
+        if node == "scoper":
+            proposal = delta.get("scope_proposal") or {}
+            base = proposal.get("base") or {}
+            if base.get("sha"):
+                # The platform, not the Scoper, synchronised the mirror (ADR 0010).
+                events.append(
+                    RunEvent(
+                        kind=RunEventKind.MIRROR_REFRESHED,
+                        ordinal=revision,
+                        payload={
+                            "repository": base.get("repository"),
+                            "branch": base.get("branch"),
+                            "base_sha": base.get("sha"),
+                            "changed": bool(base.get("changed")),
+                            "executed_by": "agentforge:platform",
+                        },
+                    )
+                )
+            events.append(
+                RunEvent(
+                    kind=RunEventKind.SCOPE_PROPOSED,
+                    ordinal=revision,
+                    payload={
+                        "files": len(proposal.get("files") or []),
+                        "rejected": len(proposal.get("rejected") or []),
+                        "tests": len(proposal.get("tests") or []),
+                        "scope_digest": proposal.get("digest"),
+                        "base_sha": (proposal.get("base") or {}).get("sha"),
+                        "hidden_paths": proposal.get("hidden_paths", 0),
+                        "signals": len(proposal.get("signals") or []),
+                        "usage": delta.get("usage", {}),
+                    },
+                )
+            )
+        elif node == "developer":
             events.append(
                 RunEvent(
                     kind=RunEventKind.DEVELOPER_COMPLETED,
@@ -86,7 +186,10 @@ def events_from_update(
             )
         elif node == "qa":
             if delta.get("completed") is True:
-                events.append(RunEvent(kind=RunEventKind.RUN_COMPLETED))
+                done: dict[str, Any] = {}
+                if approved_by is not None:
+                    done["approved_by"] = approved_by
+                events.append(RunEvent(kind=RunEventKind.RUN_COMPLETED, payload=done))
         elif node == "planner":
             plan = delta.get("plan") or {}
             if revision > 0:
@@ -122,12 +225,63 @@ def events_from_update(
                     },
                 )
             )
-        elif node == "approval" and "approved" in delta:
+        elif node in ("approval", "approve_scope") and "approved" in delta:
             kind = RunEventKind.RUN_APPROVED if delta["approved"] else RunEventKind.RUN_REJECTED
-            events.append(RunEvent(kind=kind))
+            verdict: dict[str, Any] = {}
+            if approved_by is not None:
+                verdict["approved_by" if delta["approved"] else "rejected_by"] = approved_by
+            ordinal = DecisionStage.SCOPE.event_ordinal if node == "approve_scope" else 0
+            events.append(RunEvent(kind=kind, ordinal=ordinal, payload=verdict))
+        elif node == "approve_plan" and "plan_approved" in delta:
+            decided = bool(delta["plan_approved"])
+            kind = RunEventKind.RUN_APPROVED if decided else RunEventKind.RUN_REJECTED
+            verdict = {"stage": "plan"}
+            if approved_by is not None:
+                verdict["approved_by" if decided else "rejected_by"] = approved_by
+            events.append(
+                RunEvent(kind=kind, ordinal=DecisionStage.PLAN.event_ordinal, payload=verdict)
+            )
+        elif node == "approve_publish" and "publish_approved" in delta:
+            decided = bool(delta["publish_approved"])
+            kind = RunEventKind.RUN_APPROVED if decided else RunEventKind.RUN_REJECTED
+            verdict = {"stage": "publish"}
+            if approved_by is not None:
+                verdict["approved_by" if decided else "rejected_by"] = approved_by
+            events.append(
+                RunEvent(kind=kind, ordinal=DecisionStage.PUBLISH.event_ordinal, payload=verdict)
+            )
     for event in events:
         object.__setattr__(event, "checkpoint_id", checkpoint_id)
+        if event.kind is not RunEventKind.RUN_FAILED:
+            node_name = _node_of(event.kind)
+            if node_name is not None and "executed_by" not in event.payload:
+                event.payload["executed_by"] = EXECUTED_BY[node_name]
     return events
+
+
+_NODE_BY_KIND: dict[RunEventKind, str] = {
+    RunEventKind.PLANNER_COMPLETED: "planner",
+    RunEventKind.REVISION_REQUESTED: "planner",
+    RunEventKind.ARCHITECT_REVIEWED: "architect",
+    RunEventKind.SCOPE_PROPOSED: "scoper",
+    RunEventKind.DEVELOPER_COMPLETED: "developer",
+    RunEventKind.DEVELOPER_APPLIED: "developer",
+    RunEventKind.QA_REVIEWED: "qa",
+}
+
+
+def _node_of(kind: RunEventKind) -> str | None:
+    return _NODE_BY_KIND.get(kind)
+
+
+def attribute(events: list[RunEvent], *, actor: str | None) -> list[RunEvent]:
+    """Attach the human actor only to the events that human caused directly."""
+    if actor is None:
+        return events
+    return [
+        event.model_copy(update={"actor_subject": actor}) if event.kind in HUMAN_CAUSED else event
+        for event in events
+    ]
 
 
 def transition_events(previous: RunLifecycleStatus, updated: PersistedRun) -> list[RunEvent]:
@@ -146,15 +300,64 @@ def transition_events(previous: RunLifecycleStatus, updated: PersistedRun) -> li
         return [RunEvent(kind=RunEventKind.RUN_REJECTED)]
     if status is RunLifecycleStatus.COMPLETED:
         return [RunEvent(kind=RunEventKind.RUN_COMPLETED)]
+    if status is RunLifecycleStatus.PUBLISHED:
+        publication = updated.publication or {}
+        return [
+            RunEvent(
+                kind=RunEventKind.RUN_PUBLISHED,
+                payload={
+                    "remote_branch": publication.get("remote_branch"),
+                    "pr_number": publication.get("pr_number"),
+                    "approved_by": publication.get("approved_by"),
+                    "executed_by": "agentforge:publisher",
+                },
+            )
+        ]
+    if status is RunLifecycleStatus.CANCELLED:
+        return [RunEvent(kind=RunEventKind.RUN_CANCELLED)]
+    if status is RunLifecycleStatus.EXPIRED:
+        return [RunEvent(kind=RunEventKind.RUN_EXPIRED)]
     return []
+
+
+def _interrupt_payload(delta: Any) -> dict[str, Any]:
+    """Stage and scope digest of an interrupt, never the proposal itself."""
+    for item in delta if isinstance(delta, tuple | list) else (delta,):
+        if isinstance(item, Interrupt) and isinstance(item.value, dict):
+            payload: dict[str, Any] = {}
+            for key in ("stage", "scope_digest", "publish_digest", "deadline"):
+                if item.value.get(key) is not None:
+                    payload[key] = item.value[key]
+            return payload
+    return {}
+
+
+def _interrupt_ordinal(value: dict[str, Any], fallback: int) -> int:
+    """Ordinal that keeps ``(run, kind, ordinal)`` unique for ``waiting_approval``:
+    the stage ordinal when the interrupt names a decision stage (development flow),
+    else the planner revision the planning flow puts in its payload."""
+    stage = value.get("stage")
+    if isinstance(stage, str):
+        try:
+            return DecisionStage(stage).event_ordinal
+        except ValueError:
+            pass
+    revision = value.get("revision")
+    return revision if isinstance(revision, int) else fallback
 
 
 def _interrupt_revision(delta: Any, fallback: int) -> int:
     for item in delta if isinstance(delta, tuple | list) else (delta,):
         if isinstance(item, Interrupt) and isinstance(item.value, dict):
-            value = item.value.get("revision")
-            if isinstance(value, int):
-                return value
+            return _interrupt_ordinal(item.value, fallback)
+    return fallback
+
+
+def _snapshot_interrupt_ordinal(snapshot: StateSnapshot, fallback: int) -> int:
+    pending = [*snapshot.interrupts, *(i for task in snapshot.tasks for i in task.interrupts)]
+    for item in pending:
+        if isinstance(item, Interrupt) and isinstance(item.value, dict):
+            return _interrupt_ordinal(item.value, fallback)
     return fallback
 
 
@@ -225,7 +428,7 @@ def events_from_history(history: Sequence[StateSnapshot]) -> list[RunEvent]:
             events.append(
                 RunEvent(
                     kind=RunEventKind.WAITING_APPROVAL,
-                    ordinal=revision,
+                    ordinal=_snapshot_interrupt_ordinal(snapshot, revision),
                     checkpoint_id=checkpoint_id,
                 )
             )
@@ -236,6 +439,10 @@ def events_from_history(history: Sequence[StateSnapshot]) -> list[RunEvent]:
             events.append(RunEvent(kind=RunEventKind.RUN_COMPLETED, checkpoint_id=checkpoint_id))
         previous = dict(values)
         previously_interrupted = interrupted
+    for event in events:
+        node_name = _node_of(event.kind)
+        if node_name is not None and "executed_by" not in event.payload:
+            event.payload["executed_by"] = EXECUTED_BY[node_name]
     return events
 
 
@@ -253,6 +460,24 @@ def _development_events(
 
     def changed(key: str) -> bool:
         return key in values and (moved or values.get(key) != previous.get(key))
+
+    if "scope_proposal" in values and values.get("scope_proposal") != previous.get(
+        "scope_proposal"
+    ):
+        proposal = values.get("scope_proposal") or {}
+        events.append(
+            RunEvent(
+                kind=RunEventKind.SCOPE_PROPOSED,
+                ordinal=0,
+                payload={
+                    "files": len(proposal.get("files") or []),
+                    "rejected": len(proposal.get("rejected") or []),
+                    "tests": len(proposal.get("tests") or []),
+                    "scope_digest": proposal.get("digest"),
+                },
+                checkpoint_id=checkpoint_id,
+            )
+        )
 
     if changed("changes"):
         events.append(

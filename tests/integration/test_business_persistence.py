@@ -126,7 +126,11 @@ def test_errors_and_final_results_are_persisted(
     assert (broken["error_code"], broken["error_message"]) == ("llm_timeout", "sin respuesta")
     assert broken["plan"] is None and broken["llm_calls"] == 1
     assert [e[:2] for e in events(url, failed["run_id"])] == [("run_created", 0), ("run_failed", 0)]
-    assert events(url, failed["run_id"])[-1][2] == {"node": "planner", "code": "llm_timeout"}
+    assert events(url, failed["run_id"])[-1][2] == {
+        "node": "planner",
+        "code": "llm_timeout",
+        "executed_by": "agentforge:planner",
+    }
 
 
 # 3 ---------------------------------------------------------------------------
@@ -166,9 +170,16 @@ def test_audit_trail_of_the_planner_architect_cycle(
         "approved": False,
         "issues": 1,
         "decisions": 0,
+        "executed_by": "agentforge:architect",
     }
-    assert by_kind[("planner_completed", 1)] == {"revision": 1, "tasks": 2, "risks": 0}
-    assert by_kind[("approval_recorded", 0)] == {"approved": True}
+    assert by_kind[("planner_completed", 1)] == {
+        "revision": 1,
+        "tasks": 2,
+        "risks": 0,
+        "executed_by": "agentforge:planner",
+    }
+    assert by_kind[("approval_recorded", 0)]["approved"] is True
+    assert by_kind[("approval_recorded", 0)]["stage"] == "plan"
     flat = str([p for _, _, p in trail])
     for sensitive in (TASK["task"], sample_plan.summary, rejecting_review.issues[0]):
         assert sensitive not in flat
@@ -267,10 +278,10 @@ def test_decision_is_durable_before_resume_and_survives_a_crash(
         async def crash(*args: Any, **kwargs: Any) -> None:
             raise RuntimeError("process died before Command(resume=...)")
 
-        original = service._apply_approval
-        service._apply_approval = crash  # type: ignore[method-assign]
+        original = service._apply_decision
+        service._apply_decision = crash  # type: ignore[method-assign]
         assert client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}).status_code == 500
-        service._apply_approval = original  # type: ignore[method-assign]
+        service._apply_decision = original  # type: ignore[method-assign]
 
         assert approval_row(url, run_id) == (True, False)
         assert run_row(url, run_id)["status"] == "resume_pending"

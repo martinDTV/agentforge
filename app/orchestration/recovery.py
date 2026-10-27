@@ -31,13 +31,14 @@ class RecoveryReport(BaseModel):
     claimed: int = 0
     outcomes: dict[str, int] = Field(default_factory=dict)
     errors: int = 0
+    expired: int = 0  # waiting runs whose decision window passed (Fase 7)
 
     def add(self, outcome: RecoveryOutcome) -> None:
         self.outcomes[outcome.value] = self.outcomes.get(outcome.value, 0) + 1
 
     @property
     def touched(self) -> bool:
-        return self.claimed > 0 or self.errors > 0
+        return self.claimed > 0 or self.errors > 0 or self.expired > 0
 
 
 class RecoveryService:
@@ -88,6 +89,8 @@ class RecoveryService:
         report = RecoveryReport()
         service = self._service
         try:
+            if projects is None:
+                report.expired = len(await service.expire_waiting(limit=service.policy.batch_size))
             claimed = await service.repository.claim_expired_leases(
                 owner=service.owner,
                 ttl_seconds=service.policy.lease_ttl_seconds,
@@ -99,6 +102,18 @@ class RecoveryService:
             logger.warning("Barrido de recuperación sin base de datos: %s", exc.message)
             report.errors += 1
             return report
+        try:
+            # Publications stopped midway or failed transiently (ADR 0011): idempotent
+            # re-drive, no model cost, bounded by max_attempts in ``recover``.
+            if projects is None:
+                claimed = list(claimed) + await service.repository.claim_interrupted_publications(
+                    owner=service.owner,
+                    ttl_seconds=service.policy.lease_ttl_seconds,
+                    limit=service.policy.batch_size,
+                )
+        except DatabaseUnavailableError as exc:
+            logger.warning("Barrido de publicaciones sin base de datos: %s", exc.message)
+            report.errors += 1
         report.claimed = len(claimed)
         for row, lease in claimed:
             try:

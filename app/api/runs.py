@@ -14,14 +14,17 @@ from app.api.security import CurrentPrincipalDep
 from app.contracts import (
     Approval,
     CreateRun,
+    DecisionRead,
     EventPage,
+    PendingDecisionRead,
+    RunDecisions,
     RunEventRead,
     RunPage,
     RunResponse,
     RunSummary,
 )
 from app.contracts.execution import PROJECT_ID_PATTERN
-from app.contracts.lifecycle import RunLifecycleStatus
+from app.contracts.lifecycle import DecisionStage, RunLifecycleStatus
 from app.orchestration.ports import PersistedEvent, PersistedRun
 
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -74,6 +77,9 @@ def _event(event: PersistedEvent) -> RunEventRead:
         payload=event.payload,
         checkpoint_id=event.checkpoint_id,
         actor=event.actor_subject,
+        initiated_by=event.payload.get("initiated_by"),
+        approved_by=event.payload.get("approved_by"),
+        executed_by=event.payload.get("executed_by"),
         created_at=event.created_at,
     )
 
@@ -124,7 +130,13 @@ async def create_run(
     """Create a run in one of the caller's projects. A run that fails inside
     the graph is still created (201) and reports ``status == "failed"``."""
     outcome = await service.create(
-        body.task, principal, project_id=body.project_id, idempotency_key=idempotency_key
+        body.task,
+        principal,
+        project_id=body.project_id,
+        idempotency_key=idempotency_key,
+        workflow_kind=body.workflow_kind,
+        repository_id=body.repository_id,
+        route_mode=body.route_mode,
     )
     if not outcome.created:
         response.status_code = status.HTTP_200_OK
@@ -143,7 +155,74 @@ async def get_run(
 async def approve_run(
     run_id: str, body: Approval, service: RunServiceDep, principal: CurrentPrincipalDep
 ) -> RunResponse:
-    return await service.approve(run_id, body.approved, principal)
+    """Decide the stage the run waits for (``runs:approve``).
+
+    A ``scope`` decision also needs ``repos:write`` and the ``scope_digest`` of
+    the proposal shown by ``GET /runs/{run_id}/decisions``; a ``publish`` decision
+    needs ``repos:publish``, a human distinct from the creator (and from the
+    scope approver where configured) and the ``publish_digest`` of the plan
+    shown. A different or missing digest is ``409 decision_stale``; a wrong
+    stage is ``409 decision_stage_mismatch``; a closed window is
+    ``409 decision_expired``."""
+    return await service.approve(
+        run_id,
+        body.approved,
+        principal,
+        stage=body.stage,
+        scope_digest=body.scope_digest,
+        publish_digest=body.publish_digest,
+    )
+
+
+@router.get("/{run_id}/decisions", response_model=RunDecisions)
+async def list_run_decisions(
+    run_id: str, service: RunServiceDep, principal: CurrentPrincipalDep
+) -> RunDecisions:
+    """Decisions taken so far and the pending one with its proposal (visible runs only)."""
+    view = await service.decisions(run_id, principal)
+    pending = (
+        PendingDecisionRead(
+            stage=view.pending.stage,
+            scope_digest=view.pending.scope_digest,
+            publish_digest=view.pending.publish_digest,
+            deadline=view.pending.deadline,
+            proposal={
+                k: v
+                for k, v in view.pending.payload.items()
+                if k not in ("kind", "stage", "scope_digest", "publish_digest", "deadline")
+            },
+        )
+        if view.pending is not None
+        else None
+    )
+    return RunDecisions(
+        run_id=view.run_id,
+        status=view.status,
+        pending=pending,
+        decisions=[
+            DecisionRead(
+                stage=d.stage,
+                approved=d.approved,
+                decided_by=d.decided_by,
+                decided_at=d.decided_at,
+                applied_at=d.applied_at,
+                scope_digest=d.scope_digest if d.stage is not DecisionStage.PUBLISH else None,
+                publish_digest=d.scope_digest if d.stage is DecisionStage.PUBLISH else None,
+            )
+            for d in view.decisions
+        ],
+    )
+
+
+@router.post("/{run_id}/cancel", response_model=RunResponse)
+async def cancel_run(
+    run_id: str, service: RunServiceDep, principal: CurrentPrincipalDep
+) -> RunResponse:
+    """Withdraw a run that waits for a decision or sits interrupted (``runs:cancel``).
+
+    ``409 run_not_cancellable`` for any other state; a run being driven is not
+    cancelled through the API in this phase."""
+    return await service.cancel(run_id, principal)
 
 
 @router.post("/{run_id}/resume", response_model=RunResponse)

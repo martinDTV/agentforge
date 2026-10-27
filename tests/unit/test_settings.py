@@ -21,6 +21,9 @@ _PREFIXES = (
     "RECOVERY_",
     "AUTH_",
     "OIDC_",
+    "AGENTFORGE_",
+    "NOTIFICATIONS_",
+    "ROUTER_",
 )
 
 
@@ -227,3 +230,96 @@ def test_database_settings_need_neither_llm_nor_authentication():
     with pytest.raises(ValidationError, match="database_url"):
         DatabaseSettings(_env_file=None)  # type: ignore[call-arg]
     assert not hasattr(deploy, "oidc_issuer") and not hasattr(deploy, "anthropic_vertex_project_id")
+
+
+GIT = {
+    "git_repositories_file": "/srv/agentforge/repositories.json",
+    "git_repositories_root": "/srv/agentforge/repos",
+    "worktrees_root": "/srv/agentforge/worktrees",
+    "projects_file": "/srv/agentforge/projects.json",
+}
+
+
+def test_github_app_settings_come_in_pairs_and_the_key_lives_outside_the_roots():
+    settings = make(
+        **GIT, github_app_id=4242, github_app_private_key_file="/etc/agentforge/app.pem"
+    )
+    assert settings.github_app_id == 4242 and settings.github_api_url == "https://api.github.com"
+    assert make().github_app_id is None  # optional: without it no mirror is ever synchronised
+    with pytest.raises(ValidationError, match="GITHUB_APP_ID y GITHUB_APP_PRIVATE_KEY_FILE"):
+        make(**GIT, github_app_id=4242)
+    with pytest.raises(ValidationError, match="GITHUB_APP_ID y GITHUB_APP_PRIVATE_KEY_FILE"):
+        make(**GIT, github_app_private_key_file="/etc/agentforge/app.pem")
+    with pytest.raises(ValidationError, match="ruta absoluta"):
+        make(**GIT, github_app_id=1, github_app_private_key_file="app.pem")
+    with pytest.raises(ValidationError, match="GIT_REPOSITORIES_ROOT"):
+        make(**GIT, github_app_id=1, github_app_private_key_file="/srv/agentforge/repos/app.pem")
+    with pytest.raises(ValidationError, match="WORKTREES_ROOT"):
+        make(**GIT, github_app_id=1, github_app_private_key_file="/srv/agentforge/worktrees/k.pem")
+    with pytest.raises(ValidationError, match="GIT_REPOSITORIES_FILE"):
+        make(github_app_id=1, github_app_private_key_file="/etc/agentforge/app.pem")
+    with pytest.raises(ValidationError, match="https://"):
+        make(**GIT, github_api_url="http://api.github.com")
+    with pytest.raises(ValidationError):
+        make(**GIT, github_app_id=0, github_app_private_key_file="/etc/agentforge/app.pem")
+    assert 0 < make().mirror_fetch_timeout_seconds <= 3600
+
+
+def test_github_writes_are_off_by_default_and_gated_when_enabled():
+    settings = make()
+    assert settings.github_write_enabled is False and settings.publish_allowed_repositories == []
+    assert settings.publish_distinct_approver is False  # local: derived like separation of duties
+    with pytest.raises(ValidationError, match="GITHUB_WRITE_ENABLED requiere"):
+        make(github_write_enabled=True)
+    enabled = make(
+        **GIT,
+        github_app_id=4242,
+        github_app_private_key_file="/etc/agentforge/app.pem",
+        github_write_enabled=True,
+    )
+    assert enabled.github_write_enabled and enabled.publish_push_timeout_seconds == 120.0
+    production = {
+        **GIT,
+        "environment": "production",
+        "auth_mode": "oidc",
+        "oidc_issuer": "https://issuer.example",
+        "oidc_audience": "agentforge",
+        "oidc_jwks_url": "https://issuer.example/.well-known/jwks.json",
+        "github_app_id": 4242,
+        "github_app_private_key_file": "/etc/agentforge/app.pem",
+        "github_write_enabled": True,
+    }
+    with pytest.raises(ValidationError, match="PUBLISH_ALLOWED_REPOSITORIES"):
+        make(**production)
+    strict = make(**production, publish_allowed_repositories=["sandbox-github"])
+    assert strict.publish_distinct_approver is True and strict.separation_of_duties is True
+    assert make(authz_publish_distinct_approver=True).publish_distinct_approver is True
+
+
+def test_email_settings_parse_recipients_and_fail_closed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AGENTFORGE_EMAIL_TO", "vazquez@example.com")
+    assert make().agentforge_email_to == ["vazquez@example.com"]
+    monkeypatch.setenv("AGENTFORGE_EMAIL_TO", "a@example.com, b@example.com")
+    assert make().agentforge_email_to == ["a@example.com", "b@example.com"]
+    monkeypatch.setenv("AGENTFORGE_EMAIL_TO", '["c@example.com"]')
+    assert make().agentforge_email_to == ["c@example.com"]
+    monkeypatch.delenv("AGENTFORGE_EMAIL_TO")
+    assert make().agentforge_email_enabled is False and make().agentforge_email_to == []
+    smtp = {
+        "agentforge_email_enabled": True,
+        "agentforge_smtp_username": "notificacione.agentforge@gmail.com",
+        "agentforge_smtp_app_password": "x" * 16,
+        "agentforge_email_from": "notificacione.agentforge@gmail.com",
+        "agentforge_email_to": "ops@example.com",
+    }
+    settings = make(**smtp)
+    assert settings.agentforge_email_to == ["ops@example.com"]
+    assert settings.agentforge_smtp_app_password is not None
+    assert "x" not in repr(settings.agentforge_smtp_app_password)  # SecretStr never prints
+    assert "x" * 16 not in repr(settings) and "x" * 16 not in str(settings.model_dump())
+    with pytest.raises(ValidationError, match="AGENTFORGE_SMTP_APP_PASSWORD"):
+        make(**{**smtp, "agentforge_smtp_app_password": None})
+    with pytest.raises(ValidationError, match="STARTTLS"):
+        make(**smtp, agentforge_smtp_starttls=False)
+    with pytest.raises(ValidationError, match="inválida"):
+        make(**{**smtp, "agentforge_email_to": "not-an-address"})

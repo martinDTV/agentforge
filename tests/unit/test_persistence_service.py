@@ -116,7 +116,11 @@ async def test_failures_and_final_results_are_persisted(fake_llm: FakeLLMAdapter
     assert row.plan is None and row.llm_calls == 1
     events = await repository.list_events(row.id)
     assert kinds(events)[-1] == ("run_failed", 0)
-    assert events[-1].payload == {"node": "planner", "code": "llm_timeout"}
+    assert events[-1].payload == {
+        "node": "planner",
+        "code": "llm_timeout",
+        "executed_by": "agentforge:planner",
+    }
     with pytest.raises(RunAlreadyDecidedError):
         await service.approve(failed.run_id, True, ADMIN)
 
@@ -162,7 +166,13 @@ async def test_audit_trail_covers_the_revision_cycle_and_the_decision(
     reviews = [
         e for e in await repository.list_events(rid) if e.kind is RunEventKind.ARCHITECT_REVIEWED
     ]
-    assert reviews[0].payload == {"revision": 0, "approved": False, "issues": 1, "decisions": 0}
+    assert reviews[0].payload == {
+        "revision": 0,
+        "approved": False,
+        "issues": 1,
+        "decisions": 0,
+        "executed_by": "agentforge:architect",
+    }
     assert reviews[1].payload["approved"] is True
 
     await service.approve(created.run_id, False, ADMIN)

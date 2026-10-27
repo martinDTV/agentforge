@@ -1,0 +1,111 @@
+# Fase 7, Paso 2: criterios de aceptación y evidencia local
+
+Rama `feat/phase-7-real-repositories` (cambios sin confirmar sobre los seis commits del
+Paso 1), 2026-10-26. Alcance del paso: GitHub App dedicada con credenciales solo en la
+plataforma, identidad estable del repositorio, espejos locales validados, entrega de la
+credencial a un único proceso Git, contenido remoto tratado como dato, auditoría
+`mirror_syncs` (migración 0007) y pruebas con una API de GitHub simulada. **Sin App creada,
+sin repositorio real, sin `push`, sin cambios en el Runner ni en la infraestructura.**
+
+Pruebas ejecutadas al cierre: `uv run ruff check .`, `uv run ruff format --check .`,
+`uv run mypy app`, `uv run mypy runner/agentforge_runner`, `uv run pytest -q`
+(**677 passed**), `uv run pytest tests/integration -q` (**75 passed**, PostgreSQL local),
+`git diff --check`. Los seis commits del Paso 1 (`d067093`…`3310b25`) están intactos y
+`git diff --stat main -- runner/` está vacío.
+
+Convención: la API de GitHub la simula `tests/unit/github_fixtures.py::FakeGitHub`
+(`httpx.MockTransport`: verifica el JWT de la App con la clave pública, acota tokens a
+repositorios y permisos, caduca y revoca tokens, devuelve 401/403/404/422/5xx bajo demanda).
+El endpoint Git lo simula un repositorio local alcanzado por `file://` con
+`allow_file_remotes=True`, exclusivo de pruebas.
+
+| Condición aprobada | Implementación | Evidencia automatizada |
+| --- | --- | --- |
+| 1. Identidad estable por `github_repository_id` además de `owner/name`; pertenencia a la instalación; rechazo de transferencias, sustituciones y cambios de remoto | `app/git/remote.py::RemoteSpec`, `app/infrastructure/github/identity.py::verify_identity`, marcador `<name>.mirror.json`, `MirrorService._same_identity`/`_same_remote` | `test_github_app.py::test_identity_verification_refuses_substitution_transfer_and_branch_changes`, `test_mirror_service.py::test_identity_changes_at_github_are_refused_before_any_fetch` (5 casos), `test_a_repository_outside_the_installation_is_refused`, `test_remote_and_marker_tampering_are_detected`, `test_scoped_development_mirrors.py::test_identity_problems_fail_the_run_before_any_worktree_exists` |
+| 2. Tokens solo en la plataforma, cortos, `contents:read` + `metadata:read`; nunca en argv, URLs, logs, auditoría, checkpoints, archivos ni entornos de agentes | `app/infrastructure/github/credentials.py` (`JWT_TTL_SECONDS=540`, `READ_ONLY_PERMISSIONS`, `InstallationToken.reveal`, renovación al 80 %), `client.py` (`trust_env=False`, errores sin cuerpo), Settings `_github_app_is_coherent`, `from_settings` exige `0600` | `test_the_app_jwt_is_short_lived_and_signed_by_the_app_key`, `test_installation_tokens_are_narrowed_cached_and_renewed_before_expiry`, `test_write_permissions_never_reach_github`, `test_tokens_granted_with_more_than_requested_are_refused`, `test_tokens_never_appear_in_repr_str_or_logs`, `test_credentials_come_only_from_a_private_key_file_with_mode_0600`, `test_mirror_service.py::test_credentials_never_land_on_disk_or_in_logs` (busca cada token en todos los archivos bajo `tmp_path`, en `caplog`, en `MirrorSync` y en el marcador), `test_settings.py::test_github_app_settings_come_in_pairs_and_the_key_lives_outside_the_roots`, `test_github_boundaries.py::test_only_the_platform_reads_the_github_app_secrets` |
+| 3. `GIT_ASKPASS` revisado: credencial solo para el proceso Git autorizado; limpieza y permisos | `app/infrastructure/git/askpass.py` (directorio `0700`, ayudante `0700`, secreto `0600` con `O_EXCL`, `O_NOFOLLOW`, comprobación de UID y modo, sobrescritura y borrado en `finally`); `LocalGitAdapter.fetch_heads` es el único punto con `env_extra`; `protocol.allow=never` salvo `https` | `test_askpass.py` (4 pruebas: modos y limpieza incluso con excepción, tokens inválidos, el ayudante rechaza archivos `0644`, symlinks y prompts desconocidos, y **`git credential fill` real obtiene la credencial a través del ayudante**), `test_github_boundaries.py::test_the_askpass_helper_is_only_wired_by_the_mirror_fetch`, `test_mirror_service.py::test_an_interrupted_fetch_keeps_the_previous_base_and_can_be_retried` (directorio de credenciales vacío tras el fallo) |
+| 4. Scoper, Developer y QA sin GitHub API, tokens ni push; sandbox sin red | Sin cambios en `DEFAULT_AGENT_GRANTS`, `ENABLED_RISK_CLASSES`, `default_registry`, `SandboxRequest` ni Runner; `read_gateway`/`write_gateway` no registran herramientas de GitHub; `push` sigue `push_disabled` | `test_github_boundaries.py` (4 pruebas estáticas), `test_scoped_development_mirrors.py::test_agents_still_have_no_github_tokens_or_push`, `test_tool_policy.py`, `test_sandbox_contracts.py` (existentes); `git diff --stat main -- runner/` vacío |
+| 5. Espejos con validación de repositorio, remoto, rama base y `base_sha`; bloqueos, idempotencia, concurrencia | `app/infrastructure/git/mirror.py::MirrorService` (`create`/`refresh`/`check`, `flock` por repositorio, marcador atómico, `_base_sha`, reintento único tras invalidar token, limpieza de `create` fallido), `LocalGitAdapter.{init_bare,configure_remote,fetch_heads,branch_heads,remote_url}` | `test_create_builds_a_bare_mirror_pinned_to_the_verified_identity` (solo `refs/heads/*`, sin etiquetas, marcador `0600`, remoto derivado), `test_refresh_is_idempotent_tracks_the_remote_head_and_prunes_branches`, `test_concurrent_synchronisations_are_serialised_by_a_per_repository_lock` (cerrojo ajeno + 3 hilos), `test_expired_and_revoked_tokens_are_renewed_once_and_auth_failures_stop_the_sync`, `test_unconfigured_or_misconfigured_mirrors_are_refused` (`mirror_unconfigured`, `mirror_not_remote`, `mirror_path_mismatch`, `mirror_exists`, `mirror_base_missing`), `test_scoped_development_mirrors.py::test_the_mirror_is_refreshed_and_verified_before_the_scoper_runs` (worktree en el último commit remoto, evento `mirror_refreshed`, fila `refresh` en `mirror_syncs`) |
+| 6. Contenido remoto como dato; archivos de instrucciones para agentes excluidos por defecto | `app/projects/untrusted.py` (`DEFAULT_EXCLUDED_CONTEXT_GLOBS` en `policy.py`, `hidden_from_agents`, `injection_signals`, `DATA_BOUNDARY_NOTICE`), `filter_scope`/`check_against_policy` con motivo `excluded_context`, nodo `scoper` y `session_for` | `test_projects_policy.py::test_agent_instruction_files_are_excluded_from_scope_even_when_writable`, `test_untrusted_content_helpers_hide_paths_and_flag_injection_phrases`, `test_scoped_development_mirrors.py::test_agent_instruction_files_are_hidden_and_injection_is_flagged` (`AGENTS.md` y `.cursorrules` ausentes del prompt, README con inyección mostrado como dato y marcado en `signals`, `AGENTS.md` propuesto por el modelo rechazado) |
+| 7. Pruebas unitarias e integración con API simulada: fallos de autenticación, caducidad, cambio de identidad, manipulación del remoto, interrupciones, reintentos, limpieza | Ver filas anteriores; además `test_github_failures_map_to_stable_codes_without_payloads` (401 App, 404 instalación, 422, token revocado, 403, 5xx con reintento, transporte), `test_repository_identity_and_installation_listing_are_parsed`, `test_mirror_script.py`, integración `test_mirror_syncs.py` (migración 0007 arriba/abajo, restricciones `CHECK`, repositorio SQL) | 10 + 11 + 4 + 5 + 2 pruebas nuevas en unidad, 2 en integración; `test_db_models.py` y `test_migrations.py` actualizados a seis tablas y head `0007` |
+| 6 bis. Mecanismo de verificación de instalación, repositorio, remoto y commit base | `scripts/github_preflight.py` (solo lectura: clave, política, registro, App, instalación restringida, token acotado, identidad, `remote_head`, espejo, barrido de tokens en disco y base de datos); `GitHubClient.installation`/`branch_head` | `test_github_preflight.py` (4 pruebas: éxito antes y después del espejo, 12 configuraciones erróneas con su código, barrido de fugas en archivos y filas, rechazo sin configuración), `test_github_app.py::test_installation_details_and_branch_heads_are_read_as_the_app_and_the_installation` |
+| 8. Nada real todavía; todo validable en local | Ninguna credencial ni App creada; Settings opcionales (`github_app_id=None` por defecto); `MirrorService` solo se construye cuando `GITHUB_APP_ID` está definido | `test_settings.py` (`make().github_app_id is None`), `test_mirror_script.py::test_the_script_refuses_without_the_github_app_or_git_configuration`, `test_scoped_development_mirrors.py::test_a_remote_policy_without_the_github_app_fails_closed` |
+| 9. Seis commits del Paso 1 intactos; Paso 2 documentado aparte | Cambios sin confirmar sobre `3310b25`; este documento, ADR 0010 y `docs/runbooks/github-app.md` | `git log --oneline main..HEAD` = 6 commits del Paso 1 |
+| 10. Sin commits, push ni PR | — | `git status` muestra solo cambios de trabajo |
+
+## Inventario de cambios del Paso 2
+
+- Nuevo: `app/git/remote.py`, `app/git/mirrors.py`, `app/infrastructure/github/{__init__,client,credentials,errors,identity}.py`, `app/infrastructure/git/{askpass,mirror}.py`, `app/infrastructure/db/mirror_syncs.py`, `app/projects/untrusted.py`, `migrations/versions/0007_mirror_syncs.py`, `scripts/mirror_repository.py`, `scripts/github_preflight.py`, `docs/adr/0010-github-app-y-espejos-locales.md`, `docs/runbooks/github-app.md`, este documento, pruebas `tests/unit/{github_fixtures,test_github_app,test_askpass,test_mirror_service,test_scoped_development_mirrors,test_github_boundaries,test_mirror_script,test_github_preflight}.py`, `tests/integration/test_mirror_syncs.py`.
+- Modificado: `.gitignore` (`*.pem`, `*.private-key.*`), `app/settings.py` (cinco Settings y validador), `app/projects/{policy,scope,__init__}.py` (`remote`, `excluded_context_globs`, `DEFAULT_EXCLUDED_CONTEXT_GLOBS`, motivo `excluded_context`), `app/infrastructure/git/local.py` (`_run` con `env_extra`/`timeout`/`config`; métodos de espejo), `app/orchestration/scoped_development.py` (`mirrors`, `mirror_syncs`, `refresh_mirror`, contenido oculto, `base`, `signals`), `app/orchestration/events.py` (`mirror_refreshed`, campos de `scope_proposed`), `app/contracts/lifecycle.py` (`MIRROR_REFRESHED`), `app/infrastructure/db/{models,fake,__init__}.py`, `app/main.py` (cableado de la App y el `MirrorService` en `lifespan`), `.env.example`, README, CLAUDE.md, pruebas existentes ajustadas (`test_db_models.py`, `test_migrations.py`, `test_settings.py`, `test_projects_policy.py`).
+
+## Riesgos pendientes
+
+1. **Diferencias con GitHub real**: la simulación sigue la documentación (JWT ≤ 10 min, `repositories`/`permissions` en el canje, `expires_at` ISO-8601 con `Z`, paginación de `/installation/repositories`), pero la primera integración real puede mostrar 422 por nombres, límites de tasa o cabeceras que no se han ejercitado. Se corregirá sobre el sandbox antes de ampliar.
+2. **Un solo host**: el cerrojo del espejo es `flock` local. Si la API se ejecutara en varios hosts con el mismo `GIT_REPOSITORIES_ROOT` compartido, habría que añadir un cerrojo externo (ADR 0010 §5).
+3. **Clave privada en el host de la API**: protegida por modo `0600`, ubicación fuera de las raíces y comprobación al cargar; sigue siendo el secreto más sensible del sistema hasta que exista un gestor de secretos.
+4. **Detección de inyección informativa**: los patrones son pocos y en dos idiomas; un texto malicioso puede no activar ninguno. La defensa real es estructural (alcance aprobado, sin red, sin credenciales).
+5. **Runner no verificado en vivo**: Tailscale en el Mac seguía detenido al cierre del Paso 1; el Runner no se ha tocado ni necesita cambios para este paso, pero la comprobación de salud en vivo sigue pendiente de que el operador levante Tailscale.
+6. **`mypy scripts`** no forma parte de la CI; los scripts `runner_*` existentes muestran avisos de stubs ausentes del paquete instalado `agentforge_runner` que no provienen de este paso.
+
+## Primera integración real (resumen; detalle en `docs/runbooks/github-app.md`)
+
+1. Crear `agentforge-sandbox-demo` privado y anotar su id numérico (`gh api repos/<owner>/agentforge-sandbox-demo --jq .id`).
+2. Crear la GitHub App (`Contents: Read-only`, `Metadata: Read-only`, sin webhook, "Only on this account"), descargar la clave privada, anotar el App ID.
+3. Instalarla con **Only select repositories** → solo el sandbox; anotar `installation_id`.
+4. Instalar la clave con `install -m 0600` fuera de las raíces; definir `GITHUB_APP_ID` y `GITHUB_APP_PRIVATE_KEY_FILE` en el `.env` del host de la API; `uv run alembic upgrade head` (0007).
+5. Añadir el bloque `remote` a la política del repositorio en `PROJECTS_FILE`; crear el espejo con `scripts/mirror_repository.py --create`; añadir la entrada del espejo a `GIT_REPOSITORIES_FILE`; `--check`.
+6. Ejecutar las pruebas de rechazo de la tabla del runbook y comprobar `mirror_syncs`, el marcador y la ausencia de `ghs_` en disco.
+7. Lanzar una ejecución `development` por la API sobre el espejo y revisar `base`, `hidden_paths`, `signals` y el evento `mirror_refreshed` antes de aprobar el alcance.
+
+## Integración real con GitHub (lectura), 2026-10-26
+
+Ejecutada por el operador sobre el repositorio privado y desechable
+`martinDTV/agentforge-sandbox-demo` con la GitHub App `agentforge-sandbox-martindtv`.
+Ningún token ni clave se imprimió; los valores siguientes son públicos.
+
+| Dato | Valor |
+| --- | --- |
+| Repositorio / id numérico | `martinDTV/agentforge-sandbox-demo` / `1435009323` (privado, `main`, no archivado) |
+| App / App ID | `agentforge-sandbox-martindtv` / `5487341`, propietario `martinDTV`, sin webhook ni eventos |
+| Instalación | `175627193`, cuenta `martinDTV`, `repository_selection: selected`, un solo repositorio |
+| Commit base (`main`) | `f7e73dcf46e695f77938dfb38c0e4f3eef9b90ac` ("seed: mailcheck demo", subido por el operador) |
+| Espejo | `GIT_REPOSITORIES_ROOT/sandbox-github/agentforge-sandbox-demo.git`; `origin` = URL derivada sin credenciales; solo `refs/heads/main`; `remote.origin.fetch = +refs/heads/*:refs/heads/*`; `tagOpt = --no-tags`; marcador `0600` con el mismo `base_sha` |
+| Identificadores locales | `repository_id = project_id = sandbox-github` (`sandbox-demo` ya existía en el registro de la Fase 5) |
+
+Secuencia y resultados:
+
+1. **Descubrimiento como App** (`GET /app`, `/app/installations`): la App se había creado sin permisos de repositorio (`permissions: {}`) y la instalación no alcanzaba ningún repositorio; el canje de un token de lectura devolvía 422 "The permissions requested are not granted to this installation". El preflight lo reportó como `installation_restricted` fallido con `missing_permissions: ["contents", "metadata"]` y `github: token_request_rejected`. El operador añadió `Contents` y seleccionó el repositorio.
+2. **Preflight** tras la corrección: `private_key`, `policy`, `registry`, `app_auth`, `installation_token` (acotado a `contents:read` + `metadata:read`, caducidad de una hora), `repository_identity` (id, nombre, rama, privado, alcanzable), `remote_head`, `mirror` y `no_token_leaks` en `ok`. En un primer intento la instalación concedía `contents: write` y `installation_restricted` falló (`unexpected_permissions: {"contents": "write"}`); el operador lo bajó a Read-only y el preflight quedó en **`ok: true`** con `permissions: {"contents": "read", "metadata": "read"}` y `repository_selection: selected`.
+3. **Primera sincronización**: `--create` → `base_sha f7e73dcf…`, `changed: true`, 2,9 s; `--check` y `--refresh` idempotentes (`changed: false`). `mirror_syncs` registró `create`, `check` y `refresh` con `actor_subject = agentforge:platform` y la caducidad del token, nunca el token.
+4. **Pruebas negativas sobre el espejo real** (política o espejo alterados temporalmente, instalación intacta, restaurado y comprobado al final):
+
+   | Prueba | Código |
+   | --- | --- |
+   | App ID distinto con la misma clave | `installation_not_found` |
+   | Clave privada ajena (RSA desechable) con el App ID correcto | `app_auth_failed` |
+   | `installation_id`, `github_repository_id` o rama distintos en la política con espejo existente | `mirror_identity_mismatch` (el marcador local gana antes de llamar a GitHub) |
+   | `name` fuera de la instalación con espejo existente | `mirror_path_mismatch` |
+   | `origin` del espejo cambiado con `git remote set-url` | `mirror_remote_mismatch` |
+   | Marcador editado (otro id) | `mirror_identity_mismatch` |
+   | `contents:write`, `pull_requests:write`, `workflows:write`, `administration:read` pedidos a la plataforma | `permission_not_allowed` en local, sin petición a GitHub |
+   | `workflows:write` y `administration:read` pedidos directamente a GitHub | `token_request_rejected` (422) |
+
+   Las mismas variantes sobre una raíz vacía (sin marcador), para que sea GitHub quien rechace: `installation_not_found`, `repository_substituted` ("ya no es el repositorio 1435009324"), `token_request_rejected` (nombre fuera de la instalación) y `default_branch_changed`; la política correcta creó el espejo de control (`ok`).
+5. **Ejecuciones gobernadas por la API** (Claude `claude-sonnet-4-6` vía Vertex, Runner de Proxmox `agentforge-runner-01`, `podman-rootless`, `verified/ready/rootless = true`):
+   - `ed70edb8-258f-46d5-92c0-654971c9f2c9` (Tailscale detenido en el Mac): `mirror_refreshed` por la plataforma, propuesta con `base`, `hidden_paths: 1` (`AGENTS.md`), aprobación por digest, Developer escribió los dos archivos aprobados y la ejecución terminó `failed` con `runner_unreachable` en `apply_changes`. Útil como evidencia de fallo cerrado sin Runner.
+   - `89484248-d461-4b4a-8def-62a62db649bb` (Tailscale conectado): mismo `base_sha f7e73dcf…` (`changed: false`), mismo digest `23567a52…`, `omar` aprobó; Developer escribió `src/mailcheck/validator.py` y `tests/test_validator.py`; QA ejecutó `ruff check`, `ruff format --check` y `pytest` en el Runner (primera ronda: 3 comprobaciones, 2 fallidas, 4 observaciones; Developer corrigió; segunda ronda: 3 comprobaciones, 0 fallidas, aprobado) y la ejecución terminó **`completed`** en 69 s con `revision 1` y 5 llamadas al modelo. Auditoría: 11 `exec.run` (Developer y QA) en `ok` entre 289 y 624 ms, 4 `workspace.write_file` todos dentro del alcance, `git.diff` de QA, ninguna invocación de red. El worktree quedó en la rama `run/89484248…` sobre `f7e73dcf…` con `AGENTS.md` idéntico al original; el espejo conserva `refs/heads/main` en `f7e73dcf…` más la rama local `run/<run_id>` que crea el worktree; `main` en GitHub no cambió. **Ningún `push`.**
+6. **Barrido de credenciales** tras ambas ejecuciones: `no_token_leaks` en `ok` con `--scan-db` y los logs de la API: 0 archivos bajo las raíces de Git y worktrees, 0 filas en `run_events`, `mirror_syncs`, `tool_invocations`, `runs`, `checkpoints`, `checkpoint_blobs` y `checkpoint_writes`; los logs de la API no contienen `ghs_`, `x-access-token`, cabeceras `Authorization` ni URLs con credenciales; `origin` del espejo sin usuario ni token. El Runner no recibe variables `GITHUB_*` ni `GIT_*` (contrato del `SandboxRequest`) y siguió `ready` tras la ejecución.
+
+Correcciones hechas durante la integración (sin confirmar en la rama):
+
+- `installation_restricted` fallaba en silencio con permisos vacíos: ahora exige exactamente `contents:read` + `metadata:read` (`missing_permissions`).
+- El 422 del canje tiene código propio `token_request_rejected` (antes `github_failed`).
+- Los scripts se ejecutan como `uv run python -m scripts.<nombre>` (convención del proyecto); el runbook y las docstrings decían `python scripts/<archivo>.py`, que no encuentra `app`.
+- `PROJECTS_FILE` no estaba en el `.env` del host (la demostración del Paso 1 lo pasaba por entorno); añadido junto a `GITHUB_APP_ID` y `GITHUB_APP_PRIVATE_KEY_FILE`.
+
+Limitaciones abiertas tras la integración real:
+
+1. `repository_transferred` y `repository_archived` solo están cubiertos por la API simulada: no se renombró ni archivó el repositorio real.
+2. El preflight no enumera qué otros repositorios tiene seleccionados la instalación (el token se acota a uno); la exclusividad se confirmó con un token sin acotar en el descubrimiento inicial (`total_count` de la instalación) y en la interfaz de GitHub por el operador.
+3. La conexión del Mac a la red privada depende de que Tailscale esté activo; sin ella la ejecución falla cerrada con `runner_unreachable` después de escribir dentro del alcance aprobado (no antes): el worktree local queda con los cambios y el espejo intacto.
+4. En `/tmp` de la VM del Runner hay tres directorios `agentforge-cleanup-*` anteriores a este paso (trabajo de la Fase 6); no se tocaron ni se crearon nuevos; la cuenta SSH del operador no tiene `sudo` sin contraseña, por lo que la ausencia de contenedores residuales no se comprobó desde aquí en esta sesión.

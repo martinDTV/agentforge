@@ -40,6 +40,8 @@ class BudgetedLLM:
         max_reserved_tokens: int = 150_000,
         max_usd: float = 3.0,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        calls: int = 0,
+        reserved_tokens: int = 0,
     ) -> None:
         if max_calls < 1 or max_reserved_tokens < 1 or max_usd <= 0 or max_output_tokens < 256:
             raise ValueError("presupuesto de desarrollo inválido")
@@ -48,8 +50,12 @@ class BudgetedLLM:
         self.max_reserved_tokens = max_reserved_tokens
         self.max_usd = max_usd
         self.max_output_tokens = max_output_tokens
-        self.calls = 0
-        self.reserved_tokens = 0
+        if calls < 0 or reserved_tokens < 0:
+            raise ValueError("contadores de presupuesto inválidos")
+        # Counters may be restored from a checkpoint: a run resumed after a
+        # human decision keeps paying for what it already consumed.
+        self.calls = calls
+        self.reserved_tokens = reserved_tokens
         self._lock = threading.Lock()
         # Adapters that accept ``max_tokens`` (the Vertex adapter) get the
         # output bound explicitly; fakes and other ports keep their signature.

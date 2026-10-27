@@ -14,7 +14,7 @@ Coordination lives in the database, never in process memory:
 
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -24,12 +24,21 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.contracts.execution import RunError
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, WorkflowKind, sources_for
+from app.contracts.lifecycle import (
+    DecisionStage,
+    RunEventKind,
+    RunLifecycleStatus,
+    WorkflowKind,
+    sources_for,
+)
+from app.notifications import NotificationEnqueuer, RunContext
 from app.orchestration.exceptions import RunAlreadyExistsError
 from app.orchestration.ports import (
     ApprovalClaim,
     ApprovalDecision,
     CreateOutcome,
+    DecisionClaim,
+    DecisionRecord,
     LeaseToken,
     PersistedEvent,
     PersistedRun,
@@ -40,7 +49,8 @@ from app.orchestration.ports import (
 from app.security import AccessScope
 
 from .errors import as_unavailable
-from .models import RunApprovalRecord, RunEventRecord, RunRecord
+from .models import RunApprovalRecord, RunDecisionRecord, RunEventRecord, RunRecord
+from .notifications import insert_outbox
 
 _LEASE_FREE = or_(RunRecord.lease_owner.is_(None), RunRecord.lease_expires_at < func.now())
 _LEASE_ACTIVE = and_(RunRecord.lease_owner.is_not(None), RunRecord.lease_expires_at > func.now())
@@ -70,6 +80,11 @@ def _to_run(record: RunRecord, lease_active: bool) -> PersistedRun:
         architecture=record.architecture,
         error=error,
         last_checkpoint_id=record.last_checkpoint_id,
+        pending_stage=record.pending_stage,
+        approval_deadline=record.approval_deadline,
+        publication=record.publication,
+        route=record.route,
+        route_mode=record.route_mode,
         idempotency_key=record.idempotency_key,
         attempt=record.attempt,
         lease_owner=record.lease_owner,
@@ -78,6 +93,19 @@ def _to_run(record: RunRecord, lease_active: bool) -> PersistedRun:
         lease_active=lease_active,
         created_at=record.created_at,
         updated_at=record.updated_at,
+    )
+
+
+def _to_decision_record(record: RunDecisionRecord | None) -> DecisionRecord | None:
+    if record is None:
+        return None
+    return DecisionRecord(
+        stage=record.stage,
+        approved=record.approved,
+        decided_at=record.decided_at,
+        applied_at=record.applied_at,
+        decided_by=record.decided_by,
+        scope_digest=record.scope_digest,
     )
 
 
@@ -99,8 +127,36 @@ def _fenced(lease: LeaseToken) -> Any:
 
 
 class SqlAlchemyRunRepository:
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        *,
+        notifications: NotificationEnqueuer | None = None,
+    ) -> None:
         self._sessions = sessions
+        # When configured, every persisted event that deserves a mail also writes
+        # its outbox row in the same transaction (AgentForge Notifications).
+        self._notifications = notifications
+
+    async def _enqueue(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        events: Sequence[tuple[int | None, RunEvent]],
+    ) -> None:
+        if self._notifications is None or not self._notifications.active or not events:
+            return
+        record = await session.get(RunRecord, run_id)
+        if record is None:
+            return
+        context = RunContext(
+            run_id=run_id,
+            project_id=record.project_id,
+            task=record.task,
+            workflow_kind=str(record.workflow_kind),
+        )
+        drafts = self._notifications.drafts(context, events, moment=datetime.now(UTC))
+        await insert_outbox(session, drafts)
 
     @asynccontextmanager
     async def _tx(self) -> AsyncIterator[AsyncSession]:
@@ -177,15 +233,28 @@ class SqlAlchemyRunRepository:
                 if existing is None:  # pragma: no cover - only if the row vanished meanwhile
                     raise RunAlreadyExistsError(str(run_id))
                 return CreateOutcome(run=_to_run(existing[0], bool(existing[1])), created=False)
-            session.add(
-                RunEventRecord(
-                    run_id=run_id,
-                    kind=RunEventKind.RUN_CREATED,
-                    payload={},
-                    actor_subject=owner_subject,
-                )
+            created_event = RunEventRecord(
+                run_id=run_id,
+                kind=RunEventKind.RUN_CREATED,
+                payload={"initiated_by": owner_subject},
+                actor_subject=owner_subject,
             )
+            session.add(created_event)
             await session.flush()
+            await self._enqueue(
+                session,
+                run_id,
+                [
+                    (
+                        int(created_event.id),
+                        RunEvent(
+                            kind=RunEventKind.RUN_CREATED,
+                            payload={"initiated_by": owner_subject},
+                            actor_subject=owner_subject,
+                        ),
+                    )
+                ],
+            )
             run = await self._load(session, run_id)
             assert run is not None
             return CreateOutcome(run=run, created=True, lease=LeaseToken(owner=owner, generation=1))
@@ -241,6 +310,16 @@ class SqlAlchemyRunRepository:
             RunRecord.id == run_id,
             RunRecord.status.in_(list(sources_for(projection.status))),
         ]
+        if projection.status is RunLifecycleStatus.WAITING_APPROVAL:
+            # A recorded decision never goes back to the same wait; it may only
+            # advance to the next stage's wait (scope -> publish, ADR 0011).
+            next_stage = projection.pending_stage.value if projection.pending_stage else None
+            conditions.append(
+                or_(
+                    RunRecord.status != RunLifecycleStatus.RESUME_PENDING,
+                    RunRecord.pending_stage.is_distinct_from(next_stage),
+                )
+            )
         if projection.checkpoint_id is not None:
             # Checkpoint ids are time-ordered (uuid6): never write an older one.
             conditions.append(
@@ -261,8 +340,14 @@ class SqlAlchemyRunRepository:
             "error_code": projection.error.code if projection.error else None,
             "error_message": projection.error.message if projection.error else None,
             "last_checkpoint_id": projection.checkpoint_id,
+            "pending_stage": projection.pending_stage.value if projection.pending_stage else None,
+            "approval_deadline": projection.approval_deadline,
             "updated_at": func.now(),
         }
+        if projection.route is not None:
+            values["route"] = projection.route
+        if projection.route_mode is not None:
+            values["route_mode"] = projection.route_mode
         if release:
             values.update(lease_owner=None, lease_expires_at=None)
         async with self._tx() as session:
@@ -398,6 +483,47 @@ class SqlAlchemyRunRepository:
                     claimed.append((run, LeaseToken(owner=owner, generation=int(generation))))
             return claimed
 
+    async def claim_interrupted_publications(
+        self, *, owner: str, ttl_seconds: float, limit: int
+    ) -> list[tuple[PersistedRun, LeaseToken]]:
+        state = RunRecord.publication["state"].astext
+        retryable = RunRecord.publication["retryable"].astext
+        candidates = (
+            select(RunRecord.id)
+            .where(
+                RunRecord.status == RunLifecycleStatus.INTERRUPTED,
+                _LEASE_FREE,
+                or_(
+                    state.in_(["prepared", "approved", "pushed", "opened"]),
+                    and_(state == "failed", retryable == "true"),
+                ),
+            )
+            .order_by(RunRecord.updated_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+            .cte("publication_candidates")
+        )
+        async with self._tx() as session:
+            rows = (
+                await session.execute(
+                    update(RunRecord)
+                    .where(RunRecord.id == candidates.c.id)
+                    .values(
+                        lease_owner=owner,
+                        lease_expires_at=_expiry(ttl_seconds),
+                        lease_generation=RunRecord.lease_generation + 1,
+                        updated_at=func.now(),
+                    )
+                    .returning(RunRecord.id, RunRecord.lease_generation)
+                )
+            ).all()
+            claimed: list[tuple[PersistedRun, LeaseToken]] = []
+            for run_id, generation in rows:
+                run = await self._load(session, run_id)
+                if run is not None:
+                    claimed.append((run, LeaseToken(owner=owner, generation=int(generation))))
+            return claimed
+
     # -- audit ----------------------------------------------------------------
 
     async def append_events(self, run_id: UUID, events: Sequence[RunEvent]) -> int:
@@ -422,9 +548,20 @@ class SqlAlchemyRunRepository:
                 .on_conflict_do_nothing(constraint="uq_run_events_run_id_kind_ordinal")
                 # RETURNING only yields the rows actually inserted, which is the
                 # reliable count (rowcount is -1 for batched inserts on psycopg).
-                .returning(RunEventRecord.id)
+                .returning(RunEventRecord.id, RunEventRecord.kind, RunEventRecord.ordinal)
             )
-            inserted = (await session.execute(stmt)).scalars().all()
+            inserted = (await session.execute(stmt)).all()
+            if inserted:
+                by_key = {(event.kind, event.ordinal): event for event in events}
+                await self._enqueue(
+                    session,
+                    run_id,
+                    [
+                        (int(row_id), by_key[(RunEventKind(kind), ordinal)])
+                        for row_id, kind, ordinal in inserted
+                        if (RunEventKind(kind), ordinal) in by_key
+                    ],
+                )
             return len(inserted)
 
     async def list_events(
@@ -462,6 +599,41 @@ class SqlAlchemyRunRepository:
         ttl_seconds: float,
         decided_by: str | None,
     ) -> ApprovalClaim | None:
+        claim = await self.claim_decision(
+            run_id,
+            DecisionStage.PLAN,
+            approved,
+            owner=owner,
+            ttl_seconds=ttl_seconds,
+            decided_by=decided_by,
+        )
+        if claim is None:
+            return None
+        existing = (
+            ApprovalDecision(
+                approved=claim.existing.approved,
+                decided_at=claim.existing.decided_at,
+                applied_at=claim.existing.applied_at,
+                decided_by=claim.existing.decided_by,
+            )
+            if claim.existing is not None
+            else None
+        )
+        return ApprovalClaim(
+            claimed=claim.claimed, status=claim.status, existing=existing, lease=claim.lease
+        )
+
+    async def claim_decision(
+        self,
+        run_id: UUID,
+        stage: DecisionStage,
+        approved: bool,
+        *,
+        owner: str,
+        ttl_seconds: float,
+        decided_by: str | None,
+        scope_digest: str | None = None,
+    ) -> DecisionClaim | None:
         async with self._tx() as session:
             generation = (
                 await session.execute(
@@ -486,29 +658,165 @@ class SqlAlchemyRunRepository:
                 if record is None:
                     return None
                 existing = await session.scalar(
-                    select(RunApprovalRecord).where(RunApprovalRecord.run_id == run_id)
+                    select(RunDecisionRecord).where(
+                        RunDecisionRecord.run_id == run_id, RunDecisionRecord.stage == stage
+                    )
                 )
-                return ApprovalClaim(
-                    claimed=False, status=record.status, existing=_to_decision(existing)
+                return DecisionClaim(
+                    claimed=False, status=record.status, existing=_to_decision_record(existing)
                 )
-            approval = RunApprovalRecord(run_id=run_id, approved=approved, decided_by=decided_by)
-            session.add(approval)
+            decision = RunDecisionRecord(
+                run_id=run_id,
+                stage=stage,
+                approved=approved,
+                decided_by=decided_by,
+                scope_digest=scope_digest,
+            )
+            session.add(decision)
+            if stage is DecisionStage.PLAN:
+                # Compatibility: the planning approval keeps its historical table.
+                session.add(
+                    RunApprovalRecord(run_id=run_id, approved=approved, decided_by=decided_by)
+                )
+            payload: dict[str, Any] = {"approved": approved, "stage": stage.value}
+            if decided_by is not None:
+                payload["approved_by" if approved else "rejected_by"] = decided_by
+            if scope_digest is not None:
+                payload["scope_digest"] = scope_digest
             session.add(
                 RunEventRecord(
                     run_id=run_id,
                     kind=RunEventKind.APPROVAL_RECORDED,
-                    payload={"approved": approved},
+                    ordinal=stage.event_ordinal,
+                    payload=payload,
                     actor_subject=decided_by,
                 )
             )
             await session.flush()
-            await session.refresh(approval)
-            return ApprovalClaim(
+            await session.refresh(decision)
+            return DecisionClaim(
                 claimed=True,
                 status=RunLifecycleStatus.RESUME_PENDING,
-                existing=_to_decision(approval),
+                existing=_to_decision_record(decision),
                 lease=LeaseToken(owner=owner, generation=int(generation)),
             )
+
+    async def get_pending_decision(self, run_id: UUID) -> DecisionRecord | None:
+        async with self._tx() as session:
+            record = await session.scalar(
+                select(RunDecisionRecord)
+                .where(RunDecisionRecord.run_id == run_id, RunDecisionRecord.applied_at.is_(None))
+                .order_by(RunDecisionRecord.decided_at.desc(), RunDecisionRecord.id.desc())
+                .limit(1)
+            )
+            return _to_decision_record(record)
+
+    async def list_decisions(self, run_id: UUID) -> list[DecisionRecord]:
+        async with self._tx() as session:
+            rows = (
+                await session.scalars(
+                    select(RunDecisionRecord)
+                    .where(RunDecisionRecord.run_id == run_id)
+                    .order_by(RunDecisionRecord.decided_at, RunDecisionRecord.id)
+                )
+            ).all()
+            return [d for d in (_to_decision_record(r) for r in rows) if d is not None]
+
+    async def mark_decision_applied(self, run_id: UUID, stage: DecisionStage) -> bool:
+        async with self._tx() as session:
+            result = await session.execute(
+                update(RunDecisionRecord)
+                .where(
+                    RunDecisionRecord.run_id == run_id,
+                    RunDecisionRecord.stage == stage,
+                    RunDecisionRecord.applied_at.is_(None),
+                )
+                .values(applied_at=func.now())
+                .returning(RunDecisionRecord.id)
+            )
+            marked = result.scalar_one_or_none() is not None
+            if marked and stage is DecisionStage.PLAN:
+                await session.execute(
+                    update(RunApprovalRecord)
+                    .where(
+                        RunApprovalRecord.run_id == run_id, RunApprovalRecord.applied_at.is_(None)
+                    )
+                    .values(applied_at=func.now())
+                )
+            return marked
+
+    async def cancel_run(self, run_id: UUID, *, actor: str | None) -> PersistedRun | None:
+        async with self._tx() as session:
+            updated = (
+                await session.execute(
+                    update(RunRecord)
+                    .where(
+                        RunRecord.id == run_id,
+                        RunRecord.status.in_(
+                            [RunLifecycleStatus.WAITING_APPROVAL, RunLifecycleStatus.INTERRUPTED]
+                        ),
+                        _LEASE_FREE,
+                    )
+                    .values(
+                        status=RunLifecycleStatus.CANCELLED,
+                        pending_stage=None,
+                        approval_deadline=None,
+                        updated_at=func.now(),
+                    )
+                    .returning(RunRecord.id)
+                )
+            ).scalar_one_or_none()
+            if updated is None:
+                return None
+            session.add(
+                RunEventRecord(
+                    run_id=run_id,
+                    kind=RunEventKind.RUN_CANCELLED,
+                    payload={"cancelled_by": actor} if actor else {},
+                    actor_subject=actor,
+                )
+            )
+            await session.flush()
+            return await self._load(session, run_id)
+
+    async def expire_waiting_runs(self, *, now: datetime, limit: int) -> list[PersistedRun]:
+        candidates = (
+            select(RunRecord.id)
+            .where(
+                RunRecord.status == RunLifecycleStatus.WAITING_APPROVAL,
+                RunRecord.approval_deadline.is_not(None),
+                RunRecord.approval_deadline < now,
+                _LEASE_FREE,
+            )
+            .order_by(RunRecord.approval_deadline)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+            .cte("expired_candidates")
+        )
+        async with self._tx() as session:
+            ids = (
+                await session.execute(
+                    update(RunRecord)
+                    .where(RunRecord.id == candidates.c.id)
+                    .values(
+                        status=RunLifecycleStatus.EXPIRED,
+                        pending_stage=None,
+                        approval_deadline=None,
+                        updated_at=func.now(),
+                    )
+                    .returning(RunRecord.id)
+                )
+            ).scalars()
+            expired: list[PersistedRun] = []
+            for run_id in list(ids):
+                session.add(
+                    RunEventRecord(run_id=run_id, kind=RunEventKind.RUN_EXPIRED, payload={})
+                )
+                await session.flush()
+                run = await self._load(session, run_id)
+                if run is not None:
+                    expired.append(run)
+            return expired
 
     async def get_approval(self, run_id: UUID) -> ApprovalDecision | None:
         async with self._tx() as session:
@@ -516,6 +824,32 @@ class SqlAlchemyRunRepository:
                 select(RunApprovalRecord).where(RunApprovalRecord.run_id == run_id)
             )
             return _to_decision(record)
+
+    async def set_publication(
+        self,
+        run_id: UUID,
+        publication: dict[str, Any],
+        *,
+        expected_state: str | None = None,
+        expect_absent: bool = False,
+    ) -> PersistedRun | None:
+        conditions: list[Any] = [RunRecord.id == run_id]
+        if expect_absent:
+            conditions.append(RunRecord.publication.is_(None))
+        elif expected_state is not None:
+            conditions.append(RunRecord.publication["state"].astext == expected_state)
+        async with self._tx() as session:
+            updated = (
+                await session.execute(
+                    update(RunRecord)
+                    .where(*conditions)
+                    .values(publication=publication, updated_at=func.now())
+                    .returning(RunRecord.id)
+                )
+            ).scalar_one_or_none()
+            if updated is None:
+                return None
+            return await self._load(session, run_id)
 
     async def mark_approval_applied(self, run_id: UUID) -> bool:
         async with self._tx() as session:
@@ -528,4 +862,15 @@ class SqlAlchemyRunRepository:
                 .values(applied_at=func.now())
                 .returning(RunApprovalRecord.id)
             )
-            return result.scalar_one_or_none() is not None
+            marked = result.scalar_one_or_none() is not None
+            if marked:
+                await session.execute(
+                    update(RunDecisionRecord)
+                    .where(
+                        RunDecisionRecord.run_id == run_id,
+                        RunDecisionRecord.stage == DecisionStage.PLAN,
+                        RunDecisionRecord.applied_at.is_(None),
+                    )
+                    .values(applied_at=func.now())
+                )
+            return marked

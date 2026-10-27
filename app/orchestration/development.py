@@ -10,7 +10,8 @@ Flow (every edge is explicit, every loop is bounded):
   model for the complete content of the files it may write.
 - ``apply_changes`` writes those files through ``workspace.write_file`` with
   the hash observed at read time (a changed file is a conflict, never an
-  overwrite) and runs the Developer's own lint checks in the remote sandbox.
+  overwrite), enforces the per-file and per-run size limits and runs the
+  Developer's own lint checks in the remote sandbox.
 - ``qa`` re-reads the files, takes the diff, runs ruff check, ruff format
   --check and pytest in the remote sandbox and asks the model for a review.
   A review can never turn a failed technical check into an approval: the
@@ -23,11 +24,17 @@ Flow (every edge is explicit, every loop is bounded):
 
 Any tool failure, model failure, budget exhaustion, timeout or cancellation
 ends the run with an explicit error; nothing is retried implicitly.
+
+``DevelopmentSession`` holds the per-run pieces (scope, gateway, budget) so the
+same node logic serves the operator graph of Fase 6 (one session per graph)
+and the governed graph of Fase 7 (one session rebuilt per node from the
+checkpoint, after a human approved the scope).
 """
 
 import asyncio
 import hashlib
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,7 +60,7 @@ DEVELOPER_PROGRAMS: tuple[str, ...] = ("ruff_check", "ruff_format_check")
 QA_PROGRAMS: tuple[str, ...] = ("ruff_check", "ruff_format_check", "pytest")
 RUFF_DIFF_PROGRAM = "ruff_check_diff"
 FIX_PREVIEW_CHARS = 4000
-
+MAX_WRITE_BYTES = 32_768  # the hard limit of workspace.write_file
 
 # The development keys live in ``RunState`` so the API's planning graph can
 # read a development checkpoint (status, recovery, audit back-fill).
@@ -87,6 +94,9 @@ class DevelopmentDeps:
     # allowlist knows ``ruff_check_diff``; an older runner refuses it and the
     # preview is simply reported as unavailable.
     ruff_diff: bool = False
+    # Size limits of one revision (ADR 0009): per file and for all files together.
+    max_file_bytes: int = MAX_WRITE_BYTES
+    max_change_bytes: int = 4 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if not 0 <= self.max_corrections <= MAX_CORRECTIONS:
@@ -95,47 +105,73 @@ class DevelopmentDeps:
             raise ValueError("límites de tiempo inválidos")
         if not self.read_paths or not self.lint_paths or not self.test_paths:
             raise ValueError("read_paths, lint_paths y test_paths no pueden estar vacíos")
+        if not 0 < self.max_file_bytes <= MAX_WRITE_BYTES or self.max_change_bytes <= 0:
+            raise ValueError("límites de tamaño inválidos")
 
     @property
     def writable_paths(self) -> tuple[str, ...]:
         return tuple(sorted(self.scope.writable_paths))
 
 
-def build_development_graph(
-    deps: DevelopmentDeps, checkpointer: BaseCheckpointSaver[Any] | None = None
-) -> Any:
-    developer, qa = DeveloperAgent(deps.llm), QAAgent(deps.llm)
-    identity = AutomationIdentity()
-    started: list[float] = []  # wall clock starts with the first node, not at build time
+class DevelopmentSession:
+    """Node logic bound to one run's scope, gateway and budget.
 
-    def remaining() -> float:
-        if not started:
-            started.append(time.monotonic())
-        left = started[0] + deps.wall_seconds - time.monotonic()
+    ``deadline`` is an absolute epoch second; when omitted the wall clock starts
+    with the first call (the operator graph), otherwise it comes from the
+    checkpoint (the governed graph) and survives process restarts.
+    """
+
+    def __init__(
+        self,
+        deps: DevelopmentDeps,
+        *,
+        deadline: float | None = None,
+        now: Callable[[], float] = time.time,
+    ) -> None:
+        self.deps = deps
+        self.developer = DeveloperAgent(deps.llm)
+        self.qa = QAAgent(deps.llm)
+        self.identity = AutomationIdentity()
+        self._deadline = deadline
+        self._now = now
+
+    # -- limits -------------------------------------------------------------------
+
+    def remaining(self) -> float:
+        if self._deadline is None:
+            self._deadline = self._now() + self.deps.wall_seconds
+        left = self._deadline - self._now()
         if left <= 0:
             raise DevelopmentFailure("development_timeout", "se agotó el tiempo de ejecución")
         return left
 
-    def context(agent: AgentKind) -> ToolContext:
+    # -- gateway --------------------------------------------------------------------
+
+    def context(self, agent: AgentKind) -> ToolContext:
+        scope = self.deps.scope
         return ToolContext(
-            run_id=deps.scope.run_id,
-            project_id=deps.scope.project_id,
+            run_id=scope.run_id,
+            project_id=scope.project_id,
             agent=agent,
-            principal=identity.principal_for(agent, deps.scope.project_id),
-            workspace_root=deps.scope.workspace_root,
+            principal=self.identity.principal_for(agent, scope.project_id),
+            workspace_root=scope.workspace_root,
         )
 
-    async def call(agent: AgentKind, name: str, args: dict[str, Any], step: str) -> ToolResult:
-        remaining()
+    async def call(
+        self, agent: AgentKind, name: str, args: dict[str, Any], step: str
+    ) -> ToolResult:
+        self.remaining()
         return await asyncio.wait_for(
-            deps.gateway.invoke(context(agent), ToolCall(name=name, arguments=args), step=step),
-            timeout=remaining(),
+            self.deps.gateway.invoke(
+                self.context(agent), ToolCall(name=name, arguments=args), step=step
+            ),
+            timeout=self.remaining(),
         )
 
     async def invoke(
-        agent: AgentKind, name: str, args: dict[str, Any], step: str
+        self, agent: AgentKind, name: str, args: dict[str, Any], step: str
     ) -> dict[str, Any]:
-        result = await call(agent, name, args, step)
+        result = await self.call(agent, name, args, step)
         if result.outcome is not ToolOutcome.OK:
             raise DevelopmentFailure(
                 result.error.code if result.error else "tool_failed",
@@ -144,7 +180,7 @@ def build_development_graph(
         return result.output or {}
 
     async def files(
-        agent: AgentKind, revision: int
+        self, agent: AgentKind, revision: int
     ) -> tuple[dict[str, str], dict[str, str | None]]:
         """Contents and hashes of the context files plus the writable ones.
 
@@ -152,13 +188,14 @@ def build_development_graph(
         reported with hash ``None``: the write will then require that it is
         still absent (``expected_sha256=None``).
         """
+        deps = self.deps
         contents: dict[str, str] = {}
         hashes: dict[str, str | None] = {}
         ordered = list(deps.read_paths) + [
             p for p in deps.writable_paths if p not in deps.read_paths
         ]
         for index, path in enumerate(ordered):
-            result = await call(
+            result = await self.call(
                 agent,
                 "workspace.read_file",
                 {"path": path},
@@ -179,9 +216,11 @@ def build_development_graph(
             hashes[path] = hashlib.sha256(output["content"].encode("utf-8")).hexdigest()
         return contents, hashes
 
-    async def fix_preview(agent: AgentKind, revision: int, paths: list[str]) -> dict[str, Any]:
+    async def fix_preview(
+        self, agent: AgentKind, revision: int, paths: list[str]
+    ) -> dict[str, Any]:
         """Best effort: ruff's own fix as a diff. Never changes the run's outcome."""
-        result = await call(
+        result = await self.call(
             agent,
             "exec.run",
             {"program": RUFF_DIFF_PROGRAM, "paths": paths},
@@ -194,12 +233,13 @@ def build_development_graph(
         return {"fix_preview": str(output.get("stdout", ""))[:FIX_PREVIEW_CHARS]}
 
     async def checks(
-        agent: AgentKind, revision: int, programs: tuple[str, ...], *, preview: bool = False
+        self, agent: AgentKind, revision: int, programs: tuple[str, ...], *, preview: bool = False
     ) -> list[dict[str, Any]]:
+        deps = self.deps
         results = []
         for program in programs:
             paths = list(deps.test_paths if program == "pytest" else deps.lint_paths)
-            result = await invoke(
+            result = await self.invoke(
                 agent,
                 "exec.run",
                 {"program": program, "paths": paths},
@@ -215,18 +255,21 @@ def build_development_graph(
                     f"{program} terminó en {result.get('status')} o con salida truncada",
                 )
             if preview and deps.ruff_diff and program == "ruff_check" and result.get("exit_code"):
-                result = {**result, **(await fix_preview(agent, revision, paths))}
+                result = {**result, **(await self.fix_preview(agent, revision, paths))}
             results.append(result)
         return results
 
-    def failure(exc: BaseException) -> dict[str, Any]:
+    # -- helpers ---------------------------------------------------------------------
+
+    def failure(self, exc: BaseException) -> dict[str, Any]:
         if isinstance(exc, TimeoutError):
             code, message = "development_timeout", "se agotó el tiempo autorizado"
         else:
             code = str(getattr(exc, "code", "development_failed"))
-            message = str(getattr(exc, "message", exc))
-        return {"error": {"code": code, "message": message}, "usage": deps.llm.usage()}
+            message = str(getattr(exc, "message", getattr(exc, "detail", exc)))
+        return {"error": {"code": code, "message": message}, "usage": self.deps.llm.usage()}
 
+    @staticmethod
     def technical_summary(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """What the model and the audit see: bounded, no raw payload duplication."""
         return [
@@ -243,6 +286,7 @@ def build_development_graph(
             for r in results
         ]
 
+    @staticmethod
     def repeated_failures(state: DevelopmentState) -> list[str]:
         """Programs whose QA output failed identically in the last two QA rounds.
 
@@ -259,10 +303,13 @@ def build_development_graph(
             and by_program[r.get("program")].get("stdout") == r.get("stdout")
         )
 
-    async def developer_node(state: DevelopmentState) -> dict[str, Any]:
+    # -- nodes -----------------------------------------------------------------------
+
+    async def developer_node(self, state: DevelopmentState) -> dict[str, Any]:
+        deps = self.deps
         try:
             revision = state.get("revision", 0)
-            contents, hashes = await files(AgentKind.DEVELOPER, revision)
+            contents, hashes = await self.files(AgentKind.DEVELOPER, revision)
             prompt = {
                 "task": state["task"],
                 "revision": revision,
@@ -273,11 +320,11 @@ def build_development_graph(
                 "previous_summary": (state.get("changes") or {}).get("summary"),
                 "previous_qa": state.get("qa_review"),
                 "previous_validation": state.get("validation"),
-                "repeated_failures": repeated_failures(state),
+                "repeated_failures": self.repeated_failures(state),
             }
             changes = await asyncio.wait_for(
-                asyncio.to_thread(developer.execute, prompt),
-                timeout=min(remaining(), deps.model_timeout_seconds),
+                asyncio.to_thread(self.developer.execute, prompt),
+                timeout=min(self.remaining(), deps.model_timeout_seconds),
             )
             denied = [e.path for e in changes.edits if e.path not in deps.scope.writable_paths]
             if denied:
@@ -292,40 +339,51 @@ def build_development_graph(
                 "revision": revision,
             }
         except (DevelopmentFailure, LLMError, TimeoutError) as exc:
-            return failure(exc)
+            return self.failure(exc)
 
-    async def apply_node(state: DevelopmentState) -> dict[str, Any]:
+    async def apply_node(self, state: DevelopmentState) -> dict[str, Any]:
+        deps = self.deps
         try:
             revision = state.get("revision", 0)
-            for index, edit in enumerate(state["changes"]["edits"]):
-                await invoke(
+            edits = state["changes"]["edits"]
+            sizes = [len(str(edit["content"]).encode("utf-8")) for edit in edits]
+            if any(size > deps.max_file_bytes for size in sizes) or sum(sizes) > (
+                deps.max_change_bytes
+            ):
+                raise DevelopmentFailure(
+                    "change_too_large",
+                    f"el cambio supera los límites del proyecto ({deps.max_file_bytes} bytes por "
+                    f"archivo, {deps.max_change_bytes} bytes en total)",
+                )
+            for index, edit in enumerate(edits):
+                await self.invoke(
                     AgentKind.DEVELOPER,
                     "workspace.write_file",
                     {**edit, "expected_sha256": state["file_hashes"].get(edit["path"])},
                     f"developer:{revision}:write:{index}",
                 )
-            results = await checks(AgentKind.DEVELOPER, revision, DEVELOPER_PROGRAMS)
+            results = await self.checks(AgentKind.DEVELOPER, revision, DEVELOPER_PROGRAMS)
             return {
-                "developer_checks": technical_summary(results),
+                "developer_checks": self.technical_summary(results),
                 "changed_files": sorted(
-                    set(state.get("changed_files", []))
-                    | {edit["path"] for edit in state["changes"]["edits"]}
+                    set(state.get("changed_files", [])) | {edit["path"] for edit in edits}
                 ),
             }
         except (DevelopmentFailure, TimeoutError) as exc:
-            return failure(exc)
+            return self.failure(exc)
 
-    async def qa_node(state: DevelopmentState) -> dict[str, Any]:
+    async def qa_node(self, state: DevelopmentState) -> dict[str, Any]:
+        deps = self.deps
         try:
             revision = state.get("revision", 0)
-            contents, _ = await files(AgentKind.QA, revision)
-            diff = await invoke(AgentKind.QA, "git.diff", {}, f"qa:{revision}:diff")
-            results = technical_summary(
-                await checks(AgentKind.QA, revision, QA_PROGRAMS, preview=True)
+            contents, _ = await self.files(AgentKind.QA, revision)
+            diff = await self.invoke(AgentKind.QA, "git.diff", {}, f"qa:{revision}:diff")
+            results = self.technical_summary(
+                await self.checks(AgentKind.QA, revision, QA_PROGRAMS, preview=True)
             )
             review = await asyncio.wait_for(
                 asyncio.to_thread(
-                    qa.execute,
+                    self.qa.execute,
                     {
                         "task": state["task"],
                         "revision": revision,
@@ -336,7 +394,7 @@ def build_development_graph(
                         "developer_summary": state["changes"]["summary"],
                     },
                 ),
-                timeout=min(remaining(), deps.model_timeout_seconds),
+                timeout=min(self.remaining(), deps.model_timeout_seconds),
             )
             failed = [r for r in results if r.get("exit_code") != 0]
             if failed:
@@ -378,28 +436,30 @@ def build_development_graph(
                 }
             return update
         except (DevelopmentFailure, LLMError, TimeoutError) as exc:
-            return failure(exc)
+            return self.failure(exc)
 
-    def revise(state: DevelopmentState) -> dict[str, Any]:
-        return {"revision": state.get("revision", 0) + 1}
 
-    def after_developer(state: DevelopmentState) -> str:
-        return END if state.get("error") else "apply_changes"
+def revise(state: DevelopmentState) -> dict[str, Any]:
+    return {"revision": state.get("revision", 0) + 1}
 
-    def after_apply(state: DevelopmentState) -> str:
-        return END if state.get("error") else "qa"
 
-    def after_qa(state: DevelopmentState) -> str:
-        if state.get("error") or state.get("completed"):
-            return END
-        return "revise_development"
+def after_developer(state: DevelopmentState) -> str:
+    return END if state.get("error") else "apply_changes"
 
-    builder = StateGraph(DevelopmentState)
-    builder.add_node("developer", developer_node)
-    builder.add_node("apply_changes", apply_node)
-    builder.add_node("qa", qa_node)
-    builder.add_node("revise_development", revise)
-    builder.add_edge(START, "developer")
+
+def after_apply(state: DevelopmentState) -> str:
+    return END if state.get("error") else "qa"
+
+
+def after_qa(state: DevelopmentState) -> str:
+    if state.get("error") or state.get("completed"):
+        return END
+    return "revise_development"
+
+
+def add_development_edges(builder: StateGraph, *, entry: str) -> None:  # type: ignore[type-arg]
+    """The Developer -> apply -> QA -> revise loop, entered from ``entry``."""
+    builder.add_edge(entry, "developer")
     builder.add_conditional_edges(
         "developer", after_developer, {"apply_changes": "apply_changes", END: END}
     )
@@ -408,4 +468,17 @@ def build_development_graph(
         "qa", after_qa, {"revise_development": "revise_development", END: END}
     )
     builder.add_edge("revise_development", "developer")
+
+
+def build_development_graph(
+    deps: DevelopmentDeps, checkpointer: BaseCheckpointSaver[Any] | None = None
+) -> Any:
+    """The operator graph of Fase 6: one session with a scope fixed before the run."""
+    session = DevelopmentSession(deps)
+    builder = StateGraph(DevelopmentState)
+    builder.add_node("developer", session.developer_node)
+    builder.add_node("apply_changes", session.apply_node)
+    builder.add_node("qa", session.qa_node)
+    builder.add_node("revise_development", revise)
+    add_development_edges(builder, entry=START)
     return builder.compile(checkpointer=checkpointer or InMemorySaver())

@@ -13,8 +13,18 @@ approvals = Base.metadata.tables["run_approvals"]
 events = Base.metadata.tables["run_events"]
 
 
-def test_exactly_the_four_business_tables_are_registered():
-    assert set(Base.metadata.tables) == {"runs", "run_approvals", "run_events", "tool_invocations"}
+def test_exactly_the_nine_business_tables_are_registered():
+    assert set(Base.metadata.tables) == {
+        "runs",
+        "run_approvals",
+        "run_decisions",
+        "run_events",
+        "tool_invocations",
+        "mirror_syncs",
+        "publications",
+        "notification_outbox",
+        "route_decisions",
+    }
 
 
 def test_metadata_uses_the_naming_convention():
@@ -36,6 +46,9 @@ def test_api_and_persistence_share_one_status_definition():
         RunLifecycleStatus.APPROVED,
         RunLifecycleStatus.REJECTED,
         RunLifecycleStatus.COMPLETED,
+        RunLifecycleStatus.CANCELLED,
+        RunLifecycleStatus.EXPIRED,
+        RunLifecycleStatus.PUBLISHED,
         RunLifecycleStatus.FAILED,
     }
 
@@ -108,4 +121,4 @@ def test_run_id_is_uuid_and_documents_thread_id():
 
 
 def test_alembic_head_is_the_latest_migration():
-    assert expected_head_revision() == "0005"
+    assert expected_head_revision() == "0009"

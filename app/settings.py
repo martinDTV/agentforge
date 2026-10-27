@@ -1,9 +1,10 @@
+import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 Environment = Literal["local", "test", "staging", "production"]
 
@@ -158,6 +159,9 @@ class Settings(DatabaseSettings):
     git_timeout_seconds: float = Field(default=30.0, gt=0)
     git_repositories_root: Path | None = None  # every registered repository lives under it
     git_repositories_file: Path | None = None  # JSON: {"repositories": [...]}
+    # Fase 7 (ADR 0009): per-repository development policy. Without it the
+    # ``development`` workflow is not offered by the API at all.
+    projects_file: Path | None = None
     worktrees_root: Path | None = None
     worktree_retention_seconds: float = Field(default=3600.0, ge=0)
     worktree_interrupted_retention_seconds: float = Field(default=7 * 24 * 3600.0, ge=0)
@@ -181,12 +185,59 @@ class Settings(DatabaseSettings):
     sandbox_max_output_bytes: int = Field(default=256_000, ge=4096, le=16 * 1024 * 1024)
     sandbox_max_archive_mb: int = Field(default=50, ge=1, le=1024)
 
+    # GitHub App (Fase 7, Paso 2; ADR 0010). Platform-only credentials: the
+    # private key signs short JWTs that buy read-only installation tokens held
+    # in memory. Only ``app/infrastructure/github`` reads these three fields.
+    github_app_id: int | None = Field(default=None, gt=0)
+    github_app_private_key_file: Path | None = None  # PEM, mode 0600, outside every root
+    github_api_url: str = "https://api.github.com"
+    github_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+    mirror_fetch_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    # Publication (Fase 7, Paso 3; ADR 0011). Off by default: without it no
+    # write-scoped installation token is ever requested and runs on remote
+    # repositories end ``completed`` without leaving the host.
+    github_write_enabled: bool = False
+    # Repositories (repository_id) that may be published. Required and
+    # non-empty in staging/production when writes are enabled.
+    publish_allowed_repositories: list[str] = Field(default_factory=list)
+    publish_push_timeout_seconds: float = Field(default=120.0, gt=0, le=1800)
+    # None = derive from the environment, like AUTHZ_SEPARATION_OF_DUTIES.
+    authz_publish_distinct_approver: bool | None = None
+
+    # Notifications by e-mail (AgentForge Notifications). Off by default. The
+    # app password is a secret read from the environment/.env only; it never
+    # reaches the outbox, logs, audit or checkpoints.
+    agentforge_email_enabled: bool = False
+    agentforge_smtp_host: str = "smtp.gmail.com"
+    agentforge_smtp_port: int = Field(default=587, ge=1, le=65535)
+    agentforge_smtp_starttls: bool = True
+    agentforge_smtp_username: str | None = None
+    agentforge_smtp_app_password: SecretStr | None = None
+    agentforge_email_from: str | None = None
+    agentforge_email_to: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # priority (default): approvals, failures and terminal outcomes; verbose: every stage.
+    notifications_level: Literal["priority", "verbose"] = "priority"
+    notifications_worker_interval_seconds: float = Field(default=15.0, gt=0, le=600)
+    notifications_max_attempts: int = Field(default=6, ge=1, le=20)
+    # Public base URL used in notification links (None = no links).
+    agentforge_public_url: str | None = None
+
+    # Smart Router: default mode when a request does not say one.
+    router_default_mode: Literal["auto", "fast", "full"] = "auto"
+    router_confidence_threshold: float = Field(default=0.7, ge=0.5, le=1.0)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
     def separation_of_duties(self) -> bool:
         if self.authz_separation_of_duties is not None:
             return self.authz_separation_of_duties
+        return self.is_production_like
+
+    @property
+    def publish_distinct_approver(self) -> bool:
+        if self.authz_publish_distinct_approver is not None:
+            return self.authz_publish_distinct_approver
         return self.is_production_like
 
     @field_validator("oidc_algorithms")
@@ -229,6 +280,8 @@ class Settings(DatabaseSettings):
     def _git_storage_is_coherent(self) -> "Settings":
         if self.git_repositories_file is None:
             return self
+        if self.projects_file is not None and not self.projects_file.is_absolute():
+            raise ValueError("PROJECTS_FILE debe ser una ruta absoluta")
         missing = [
             name
             for name, value in (
@@ -258,6 +311,76 @@ class Settings(DatabaseSettings):
             raise ValueError(
                 "SANDBOX_RUNNER_ALLOW_PRIVATE_HTTP solo se admite en local y test; "
                 "en staging/production usa https:// o una red superpuesta privada"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _github_app_is_coherent(self) -> "Settings":
+        given = (self.github_app_id, self.github_app_private_key_file)
+        if any(v is not None for v in given) and not all(v is not None for v in given):
+            raise ValueError("La GitHub App requiere GITHUB_APP_ID y GITHUB_APP_PRIVATE_KEY_FILE")
+        if not self.github_api_url.startswith("https://"):
+            raise ValueError("GITHUB_API_URL debe usar https://")
+        key = self.github_app_private_key_file
+        if key is None:
+            return self
+        if not key.is_absolute():
+            raise ValueError("GITHUB_APP_PRIVATE_KEY_FILE debe ser una ruta absoluta")
+        roots = (self.git_repositories_root, self.worktrees_root)
+        for root in roots:
+            if root is not None and root.is_absolute() and key.is_relative_to(root):
+                raise ValueError(
+                    "GITHUB_APP_PRIVATE_KEY_FILE no puede vivir bajo GIT_REPOSITORIES_ROOT "
+                    "ni WORKTREES_ROOT"
+                )
+        if self.git_repositories_file is None:
+            raise ValueError("La GitHub App requiere GIT_REPOSITORIES_FILE y PROJECTS_FILE")
+        return self
+
+    @field_validator("agentforge_email_to", mode="before")
+    @classmethod
+    def _split_recipients(cls, value: object) -> object:
+        """``AGENTFORGE_EMAIL_TO`` is a comma-separated list (or a JSON list)."""
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                return json.loads(text)
+            return [part.strip() for part in text.split(",") if part.strip()]
+        return value
+
+    @model_validator(mode="after")
+    def _email_is_coherent(self) -> "Settings":
+        if not self.agentforge_email_enabled:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("AGENTFORGE_SMTP_USERNAME", self.agentforge_smtp_username),
+                ("AGENTFORGE_SMTP_APP_PASSWORD", self.agentforge_smtp_app_password),
+                ("AGENTFORGE_EMAIL_FROM", self.agentforge_email_from),
+                ("AGENTFORGE_EMAIL_TO", self.agentforge_email_to or None),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(f"AGENTFORGE_EMAIL_ENABLED requiere {', '.join(missing)}")
+        if not self.agentforge_smtp_starttls:
+            raise ValueError("AGENTFORGE_SMTP_STARTTLS debe ser true: el correo solo sale cifrado")
+        for address in [self.agentforge_email_from, *self.agentforge_email_to]:
+            if address is None or "@" not in address or any(ch in address for ch in " \r\n,"):
+                raise ValueError(f"dirección de correo inválida: {address!r}")
+        return self
+
+    @model_validator(mode="after")
+    def _publication_is_coherent(self) -> "Settings":
+        if not self.github_write_enabled:
+            return self
+        if self.github_app_id is None:
+            raise ValueError("GITHUB_WRITE_ENABLED requiere la GitHub App configurada")
+        if self.is_production_like and not self.publish_allowed_repositories:
+            raise ValueError(
+                "GITHUB_WRITE_ENABLED en staging/production requiere "
+                "PUBLISH_ALLOWED_REPOSITORIES con al menos un repositorio"
             )
         return self
 

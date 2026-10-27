@@ -24,6 +24,7 @@ from app.orchestration.development import DevelopmentDeps, build_development_gra
 from app.orchestration.graph import build_graph
 from app.orchestration.policy import RecoveryPolicy
 from app.orchestration.runs import RecoveryOutcome, RunService
+from app.projects import ProjectPolicyRegistry, RepositoryPolicy
 from app.security import AuthorizationPolicy, Principal
 from app.security.development import DevelopmentScope, DevelopmentToolPolicy
 from app.tools import ExecRunTool, GitTools, ToolGateway, ToolLimits, default_registry
@@ -41,7 +42,7 @@ def operator_principal(project_id: str) -> Principal:
         subject="operator:development-mvp",
         kind="user",
         issuer="agentforge:operator",
-        roles=frozenset({"operator"}),
+        roles=frozenset({"project_operator"}),
         projects=frozenset({project_id}),
     )
 
@@ -100,9 +101,20 @@ async def test_a_development_run_is_persisted_end_to_end(
             RecoveryPolicy(),
             authorization=AuthorizationPolicy(separation_of_duties=False),
             workflow_kind=WorkflowKind.DEVELOPMENT,
+            policies=ProjectPolicyRegistry(
+                [
+                    RepositoryPolicy(
+                        repository_id=REPOSITORY, project_id=PROJECT, writable_globs=["src/**"]
+                    )
+                ]
+            ),
         )
         result = await service.create(
-            "implement value", operator_principal(PROJECT), project_id=PROJECT, run_id=str(run_id)
+            "implement value",
+            operator_principal(PROJECT),
+            project_id=PROJECT,
+            run_id=str(run_id),
+            repository_id=REPOSITORY,
         )
         await service.shutdown(1.0)
         assert result.created and result.response.status is S.COMPLETED
