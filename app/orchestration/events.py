@@ -10,7 +10,7 @@ from typing import Any
 
 from langgraph.types import Interrupt, StateSnapshot
 
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus
+from app.contracts.lifecycle import DecisionStage, RunEventKind, RunLifecycleStatus
 from app.orchestration.ports import PersistedRun, RunEvent
 from app.orchestration.status import checkpoint_id_of, has_pending_interrupt
 
@@ -199,14 +199,17 @@ def events_from_update(
             verdict: dict[str, Any] = {}
             if approved_by is not None:
                 verdict["approved_by" if delta["approved"] else "rejected_by"] = approved_by
-            events.append(RunEvent(kind=kind, payload=verdict))
+            ordinal = DecisionStage.SCOPE.event_ordinal if node == "approve_scope" else 0
+            events.append(RunEvent(kind=kind, ordinal=ordinal, payload=verdict))
         elif node == "approve_publish" and "publish_approved" in delta:
             decided = bool(delta["publish_approved"])
             kind = RunEventKind.RUN_APPROVED if decided else RunEventKind.RUN_REJECTED
             verdict = {"stage": "publish"}
             if approved_by is not None:
                 verdict["approved_by" if decided else "rejected_by"] = approved_by
-            events.append(RunEvent(kind=kind, ordinal=1, payload=verdict))
+            events.append(
+                RunEvent(kind=kind, ordinal=DecisionStage.PUBLISH.event_ordinal, payload=verdict)
+            )
     for event in events:
         object.__setattr__(event, "checkpoint_id", checkpoint_id)
         if event.kind is not RunEventKind.RUN_FAILED:
@@ -289,12 +292,32 @@ def _interrupt_payload(delta: Any) -> dict[str, Any]:
     return {}
 
 
+def _interrupt_ordinal(value: dict[str, Any], fallback: int) -> int:
+    """Ordinal that keeps ``(run, kind, ordinal)`` unique for ``waiting_approval``:
+    the stage ordinal when the interrupt names a decision stage (development flow),
+    else the planner revision the planning flow puts in its payload."""
+    stage = value.get("stage")
+    if isinstance(stage, str):
+        try:
+            return DecisionStage(stage).event_ordinal
+        except ValueError:
+            pass
+    revision = value.get("revision")
+    return revision if isinstance(revision, int) else fallback
+
+
 def _interrupt_revision(delta: Any, fallback: int) -> int:
     for item in delta if isinstance(delta, tuple | list) else (delta,):
         if isinstance(item, Interrupt) and isinstance(item.value, dict):
-            value = item.value.get("revision")
-            if isinstance(value, int):
-                return value
+            return _interrupt_ordinal(item.value, fallback)
+    return fallback
+
+
+def _snapshot_interrupt_ordinal(snapshot: StateSnapshot, fallback: int) -> int:
+    pending = [*snapshot.interrupts, *(i for task in snapshot.tasks for i in task.interrupts)]
+    for item in pending:
+        if isinstance(item, Interrupt) and isinstance(item.value, dict):
+            return _interrupt_ordinal(item.value, fallback)
     return fallback
 
 
@@ -365,7 +388,7 @@ def events_from_history(history: Sequence[StateSnapshot]) -> list[RunEvent]:
             events.append(
                 RunEvent(
                     kind=RunEventKind.WAITING_APPROVAL,
-                    ordinal=revision,
+                    ordinal=_snapshot_interrupt_ordinal(snapshot, revision),
                     checkpoint_id=checkpoint_id,
                 )
             )

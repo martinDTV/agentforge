@@ -448,7 +448,10 @@ class InMemoryRunRepository:
             run_id,
             [
                 RunEvent(
-                    kind=RunEventKind.APPROVAL_RECORDED, payload=payload, actor_subject=decided_by
+                    kind=RunEventKind.APPROVAL_RECORDED,
+                    ordinal=stage.event_ordinal,
+                    payload=payload,
+                    actor_subject=decided_by,
                 )
             ],
         )

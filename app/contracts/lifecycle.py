@@ -55,6 +55,21 @@ class DecisionStage(StrEnum):
     SCOPE = "scope"
     PUBLISH = "publish"
 
+    @property
+    def event_ordinal(self) -> int:
+        """Ordinal of this stage's decision events (``waiting_approval``,
+        ``approval_recorded``, ``approval_applied``, ``run_approved``/``run_rejected``).
+
+        ``run_events`` is unique on ``(run_id, kind, ordinal)`` and a development run takes
+        up to three decisions, so each stage owns an ordinal in decision order: ``plan`` 0
+        (the planning workflow's only decision keeps its historical ordinal), ``scope`` 1,
+        ``publish`` 2.
+        """
+        return _STAGE_EVENT_ORDINAL[self]
+
+
+_STAGE_EVENT_ORDINAL = {"plan": 0, "scope": 1, "publish": 2}
+
 
 class WorkflowKind(StrEnum):
     """Which graph drives a run; stored with the row so recovery never guesses."""

@@ -209,3 +209,78 @@ async def test_stage_decisions_are_claimed_once_cancelled_and_expired_in_sql(
         )
     finally:
         await database.dispose()
+
+
+async def test_two_decisions_on_one_run_keep_their_own_event_ordinals(
+    checkpoint_database_url: str,
+):
+    """Regression (first real publication, 2026-10-27): ``run_events`` is unique on
+    ``(run_id, kind, ordinal)``; recording the ``publish`` decision after the ``scope``
+    one used to raise ``UniqueViolation`` on ``approval_recorded``/``approval_applied``
+    and rolled the approval back. Each stage now owns an ordinal."""
+    from app.contracts.lifecycle import RunEventKind
+    from app.orchestration.ports import RunEvent
+
+    database = Database(checkpoint_database_url)
+    repository = SqlAlchemyRunRepository(database.session_factory)
+    try:
+        run_id = uuid.uuid4()
+        await repository.create_run(
+            run_id,
+            "task",
+            owner="p",
+            ttl_seconds=60,
+            owner_subject="agentforge-operator",
+            project_id=PROJECT,
+            workflow_kind=WorkflowKind.DEVELOPMENT,
+        )
+
+        async def wait_for(stage: str) -> None:
+            async with database.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE runs SET status='waiting_approval', pending_stage=:stage, "
+                        "approval_deadline = now() + interval '1 hour', lease_owner=NULL, "
+                        "lease_expires_at=NULL WHERE id=:id"
+                    ),
+                    {"id": run_id, "stage": stage},
+                )
+
+        for stage, digest in ((DecisionStage.SCOPE, "a" * 64), (DecisionStage.PUBLISH, "b" * 64)):
+            await wait_for(stage.value)
+            claim = await repository.claim_decision(
+                run_id,
+                stage,
+                True,
+                owner="api",
+                ttl_seconds=30,
+                decided_by="martin",
+                scope_digest=digest,
+            )
+            assert claim is not None and claim.claimed, stage
+            assert await repository.mark_decision_applied(run_id, stage)
+            assert (
+                await repository.append_events(
+                    run_id,
+                    [
+                        RunEvent(
+                            kind=RunEventKind.APPROVAL_APPLIED,
+                            ordinal=stage.event_ordinal,
+                            payload={"approved": True, "stage": stage.value},
+                        )
+                    ],
+                )
+                == 1
+            )
+        assert [d.stage for d in await repository.list_decisions(run_id)] == [
+            DecisionStage.SCOPE,
+            DecisionStage.PUBLISH,
+        ]
+        events = await repository.list_events(run_id, after_id=None, limit=100)
+        recorded = [(e.kind, e.ordinal, e.payload.get("stage")) for e in events]
+        assert (RunEventKind.APPROVAL_RECORDED, 1, "scope") in recorded
+        assert (RunEventKind.APPROVAL_RECORDED, 2, "publish") in recorded
+        assert (RunEventKind.APPROVAL_APPLIED, 1, "scope") in recorded
+        assert (RunEventKind.APPROVAL_APPLIED, 2, "publish") in recorded
+    finally:
+        await database.dispose()

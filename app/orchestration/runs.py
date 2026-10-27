@@ -904,6 +904,7 @@ class RunService:
                     [
                         RunEvent(
                             kind=RunEventKind.APPROVAL_APPLIED,
+                            ordinal=decision.stage.event_ordinal,
                             payload={
                                 "approved": decision.approved,
                                 "stage": decision.stage.value,

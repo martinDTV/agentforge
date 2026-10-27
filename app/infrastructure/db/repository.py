@@ -627,6 +627,7 @@ class SqlAlchemyRunRepository:
                 RunEventRecord(
                     run_id=run_id,
                     kind=RunEventKind.APPROVAL_RECORDED,
+                    ordinal=stage.event_ordinal,
                     payload=payload,
                     actor_subject=decided_by,
                 )
