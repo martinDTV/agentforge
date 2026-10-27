@@ -66,11 +66,32 @@ PublishMode = Literal["manual"]  # ``after_qa`` is reserved: a human always appr
 
 
 class PublishPolicy(BaseModel):
+    """How a run may leave the host (ADR 0011): always a human decision, always a draft."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     mode: PublishMode = "manual"
     base_branch: str = Field(default="main", min_length=1, max_length=200)
     draft: Literal[True] = True
+    # Reserved namespace of the branches AgentForge creates: ``<prefix><run_id>``.
+    branch_prefix: str = Field(default="agentforge/", min_length=2, max_length=50)
+    approval_ttl_seconds: float = Field(default=3 * 86_400.0, gt=0, le=30 * 86_400)
+    wall_seconds: float = Field(default=300.0, gt=0, le=1800)
+    title_prefix: str = Field(default="[AgentForge]", min_length=1, max_length=32)
+
+    @field_validator("branch_prefix")
+    @classmethod
+    def _reserved_prefix(cls, value: str) -> str:
+        from app.publishing.plan import validate_branch_prefix
+
+        return validate_branch_prefix(value)
+
+    @field_validator("title_prefix")
+    @classmethod
+    def _plain_title_prefix(cls, value: str) -> str:
+        if any(ch in value for ch in "\r\n@`") or value != value.strip():
+            raise ValueError("title_prefix no admite saltos de línea, '@' ni acentos graves")
+        return value
 
 
 class RepositoryPolicy(BaseModel):

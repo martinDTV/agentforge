@@ -401,3 +401,26 @@ def test_untrusted_content_helpers_hide_paths_and_flag_injection_phrases():
         ("notes.md", "platform_named", 2),
     ]
     assert injection_signals({"clean.py": "def f():\n    return 1\n"}) == []
+
+
+def test_publish_policy_pins_a_reserved_branch_prefix_and_bounded_windows():
+    default = policy().publish
+    assert (default.mode, default.draft, default.branch_prefix) == ("manual", True, "agentforge/")
+    assert default.approval_ttl_seconds == 3 * 86_400 and default.title_prefix == "[AgentForge]"
+    custom = policy(publish={"branch_prefix": "agentforge-bot/", "approval_ttl_seconds": 3600})
+    assert custom.publish.branch_prefix == "agentforge-bot/"
+    for bad in (
+        {"branch_prefix": "run/"},
+        {"branch_prefix": "release/"},
+        {"branch_prefix": "main/"},
+        {"branch_prefix": "agentforge"},
+        {"branch_prefix": "-x/"},
+        {"title_prefix": "[Agent\nForge]"},
+        {"title_prefix": "@AgentForge"},
+        {"draft": False},
+        {"mode": "after_qa"},
+        {"approval_ttl_seconds": 0},
+        {"wall_seconds": 7200},
+    ):
+        with pytest.raises(ValidationError):
+            policy(publish=bad)
