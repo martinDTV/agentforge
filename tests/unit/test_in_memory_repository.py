@@ -120,3 +120,60 @@ async def test_claim_is_a_compare_and_set_with_one_decision_per_run():
     assert await repo.mark_approval_applied(run_id) is False
     applied = await repo.get_approval(run_id)
     assert applied is not None and applied.applied_at is not None
+
+
+async def test_two_stages_record_distinct_ordinals_and_a_duplicate_is_refused_like_postgres():
+    from app.contracts.lifecycle import DecisionStage, WorkflowKind
+
+    repo = InMemoryRunRepository()
+    run_id = uuid.uuid4()
+    await repo.create_run(
+        run_id,
+        "task",
+        owner="p",
+        ttl_seconds=60,
+        owner_subject="olivia",
+        project_id="sandbox",
+        workflow_kind=WorkflowKind.DEVELOPMENT,
+    )
+    # A row that already occupies the publish ordinal (what pre-fix data looked like).
+    await repo.append_events(
+        run_id,
+        [
+            RunEvent(
+                kind=RunEventKind.APPROVAL_RECORDED,
+                ordinal=DecisionStage.PUBLISH.event_ordinal,
+                payload={"stage": "legacy"},
+            )
+        ],
+    )
+    await repo.project(
+        run_id,
+        RunProjection(
+            status=RunLifecycleStatus.WAITING_APPROVAL, pending_stage=DecisionStage.SCOPE
+        ),
+        release=True,
+    )
+    claim = await repo.claim_decision(
+        run_id, DecisionStage.SCOPE, True, owner="api", ttl_seconds=30, decided_by="martin"
+    )
+    assert claim is not None and claim.claimed
+    assert await repo.mark_decision_applied(run_id, DecisionStage.SCOPE)
+    recorded = [
+        (e.ordinal, e.payload.get("stage"))
+        for e in repo.events[run_id]
+        if e.kind is RunEventKind.APPROVAL_RECORDED
+    ]
+    assert recorded == [(2, "legacy"), (1, "scope")]
+    await repo.project(
+        run_id,
+        RunProjection(
+            status=RunLifecycleStatus.WAITING_APPROVAL, pending_stage=DecisionStage.PUBLISH
+        ),
+        release=True,
+    )
+    # The natural key is enforced like uq_run_events_run_id_kind_ordinal would be.
+    with pytest.raises(ValueError, match="duplicate run_events key"):
+        await repo.claim_decision(
+            run_id, DecisionStage.PUBLISH, True, owner="api", ttl_seconds=30, decided_by="martin"
+        )

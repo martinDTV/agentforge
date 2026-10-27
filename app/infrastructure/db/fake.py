@@ -474,6 +474,11 @@ class InMemoryRunRepository:
             payload["approved_by" if approved else "rejected_by"] = decided_by
         if scope_digest is not None:
             payload["scope_digest"] = scope_digest
+        key = (RunEventKind.APPROVAL_RECORDED, stage.event_ordinal)
+        if any((e.kind, e.ordinal) == key for e in self.events.get(run_id, [])):
+            # Mirror PostgreSQL: claim_decision inserts the event directly, so a
+            # repeated (run_id, kind, ordinal) is a UniqueViolation, not a no-op.
+            raise ValueError(f"duplicate run_events key {key} for run {run_id}")
         self._append(
             run_id,
             [
