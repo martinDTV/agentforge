@@ -25,8 +25,12 @@ def test_terminal_states_never_change(terminal: RunLifecycleStatus):
 
 def test_recorded_decision_is_never_regressed_to_waiting():
     assert can_transition(S.WAITING_APPROVAL, S.RESUME_PENDING)
-    assert not can_transition(S.RESUME_PENDING, S.WAITING_APPROVAL)
-    assert not can_transition(S.RESUME_PENDING, S.INTERRUPTED)
+    # The next stage's wait is a forward move (scope -> publish); regressing to the
+    # same stage is prevented by the projection, which pins resume_pending.
+    assert can_transition(S.RESUME_PENDING, S.WAITING_APPROVAL)
+    # A publication that stops on a transient failure after the decision was
+    # applied leaves positive evidence in the checkpoint and waits for a retry.
+    assert can_transition(S.RESUME_PENDING, S.INTERRUPTED)
     assert not can_transition(S.RESUME_PENDING, S.RUNNING)
 
 
@@ -36,7 +40,12 @@ def test_running_cannot_be_regressed_to_from_a_wait():
 
 
 def test_sources_for_are_the_statuses_a_conditional_update_accepts():
-    assert sources_for(S.WAITING_APPROVAL) == {S.RUNNING, S.INTERRUPTED, S.WAITING_APPROVAL}
+    assert sources_for(S.WAITING_APPROVAL) == {
+        S.RUNNING,
+        S.INTERRUPTED,
+        S.WAITING_APPROVAL,
+        S.RESUME_PENDING,
+    }
     assert sources_for(S.RESUME_PENDING) == {S.WAITING_APPROVAL, S.RESUME_PENDING}
     assert S.RESUME_PENDING in sources_for(S.APPROVED)
     assert sources_for(S.RUNNING) == {S.RUNNING, S.INTERRUPTED}

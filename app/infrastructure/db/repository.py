@@ -265,6 +265,16 @@ class SqlAlchemyRunRepository:
             RunRecord.id == run_id,
             RunRecord.status.in_(list(sources_for(projection.status))),
         ]
+        if projection.status is RunLifecycleStatus.WAITING_APPROVAL:
+            # A recorded decision never goes back to the same wait; it may only
+            # advance to the next stage's wait (scope -> publish, ADR 0011).
+            next_stage = projection.pending_stage.value if projection.pending_stage else None
+            conditions.append(
+                or_(
+                    RunRecord.status != RunLifecycleStatus.RESUME_PENDING,
+                    RunRecord.pending_stage.is_distinct_from(next_stage),
+                )
+            )
         if projection.checkpoint_id is not None:
             # Checkpoint ids are time-ordered (uuid6): never write an older one.
             conditions.append(
@@ -402,6 +412,47 @@ class SqlAlchemyRunRepository:
             .limit(limit)
             .with_for_update(skip_locked=True)
             .cte("candidates")
+        )
+        async with self._tx() as session:
+            rows = (
+                await session.execute(
+                    update(RunRecord)
+                    .where(RunRecord.id == candidates.c.id)
+                    .values(
+                        lease_owner=owner,
+                        lease_expires_at=_expiry(ttl_seconds),
+                        lease_generation=RunRecord.lease_generation + 1,
+                        updated_at=func.now(),
+                    )
+                    .returning(RunRecord.id, RunRecord.lease_generation)
+                )
+            ).all()
+            claimed: list[tuple[PersistedRun, LeaseToken]] = []
+            for run_id, generation in rows:
+                run = await self._load(session, run_id)
+                if run is not None:
+                    claimed.append((run, LeaseToken(owner=owner, generation=int(generation))))
+            return claimed
+
+    async def claim_interrupted_publications(
+        self, *, owner: str, ttl_seconds: float, limit: int
+    ) -> list[tuple[PersistedRun, LeaseToken]]:
+        state = RunRecord.publication["state"].astext
+        retryable = RunRecord.publication["retryable"].astext
+        candidates = (
+            select(RunRecord.id)
+            .where(
+                RunRecord.status == RunLifecycleStatus.INTERRUPTED,
+                _LEASE_FREE,
+                or_(
+                    state.in_(["prepared", "approved", "pushed", "opened"]),
+                    and_(state == "failed", retryable == "true"),
+                ),
+            )
+            .order_by(RunRecord.updated_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+            .cte("publication_candidates")
         )
         async with self._tx() as session:
             rows = (
@@ -712,6 +763,32 @@ class SqlAlchemyRunRepository:
                 select(RunApprovalRecord).where(RunApprovalRecord.run_id == run_id)
             )
             return _to_decision(record)
+
+    async def set_publication(
+        self,
+        run_id: UUID,
+        publication: dict[str, Any],
+        *,
+        expected_state: str | None = None,
+        expect_absent: bool = False,
+    ) -> PersistedRun | None:
+        conditions: list[Any] = [RunRecord.id == run_id]
+        if expect_absent:
+            conditions.append(RunRecord.publication.is_(None))
+        elif expected_state is not None:
+            conditions.append(RunRecord.publication["state"].astext == expected_state)
+        async with self._tx() as session:
+            updated = (
+                await session.execute(
+                    update(RunRecord)
+                    .where(*conditions)
+                    .values(publication=publication, updated_at=func.now())
+                    .returning(RunRecord.id)
+                )
+            ).scalar_one_or_none()
+            if updated is None:
+                return None
+            return await self._load(session, run_id)
 
     async def mark_approval_applied(self, run_id: UUID) -> bool:
         async with self._tx() as session:

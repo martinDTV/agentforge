@@ -260,3 +260,34 @@ def test_github_app_settings_come_in_pairs_and_the_key_lives_outside_the_roots()
     with pytest.raises(ValidationError):
         make(**GIT, github_app_id=0, github_app_private_key_file="/etc/agentforge/app.pem")
     assert 0 < make().mirror_fetch_timeout_seconds <= 3600
+
+
+def test_github_writes_are_off_by_default_and_gated_when_enabled():
+    settings = make()
+    assert settings.github_write_enabled is False and settings.publish_allowed_repositories == []
+    assert settings.publish_distinct_approver is False  # local: derived like separation of duties
+    with pytest.raises(ValidationError, match="GITHUB_WRITE_ENABLED requiere"):
+        make(github_write_enabled=True)
+    enabled = make(
+        **GIT,
+        github_app_id=4242,
+        github_app_private_key_file="/etc/agentforge/app.pem",
+        github_write_enabled=True,
+    )
+    assert enabled.github_write_enabled and enabled.publish_push_timeout_seconds == 120.0
+    production = {
+        **GIT,
+        "environment": "production",
+        "auth_mode": "oidc",
+        "oidc_issuer": "https://issuer.example",
+        "oidc_audience": "agentforge",
+        "oidc_jwks_url": "https://issuer.example/.well-known/jwks.json",
+        "github_app_id": 4242,
+        "github_app_private_key_file": "/etc/agentforge/app.pem",
+        "github_write_enabled": True,
+    }
+    with pytest.raises(ValidationError, match="PUBLISH_ALLOWED_REPOSITORIES"):
+        make(**production)
+    strict = make(**production, publish_allowed_repositories=["sandbox-github"])
+    assert strict.publish_distinct_approver is True and strict.separation_of_duties is True
+    assert make(authz_publish_distinct_approver=True).publish_distinct_approver is True

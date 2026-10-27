@@ -25,6 +25,8 @@ class RunLifecycleStatus(StrEnum):
     CANCELLED = "cancelled"
     # Nobody decided within the window the pending stage allowed (Fase 7).
     EXPIRED = "expired"
+    # A human approved publication and the draft pull request exists (Fase 7, Paso 3).
+    PUBLISHED = "published"
     FAILED = "failed"
 
 
@@ -35,6 +37,7 @@ TERMINAL_STATUSES: frozenset[RunLifecycleStatus] = frozenset(
         RunLifecycleStatus.COMPLETED,
         RunLifecycleStatus.CANCELLED,
         RunLifecycleStatus.EXPIRED,
+        RunLifecycleStatus.PUBLISHED,
         RunLifecycleStatus.FAILED,
     }
 )
@@ -45,7 +48,7 @@ class DecisionStage(StrEnum):
 
     ``plan`` is the Fase 1 approval of the planning workflow; ``scope`` authorises
     the exact files Developer may write; ``publish`` authorises leaving the host
-    (not reachable in Paso 1).
+    (a branch and a draft pull request, ADR 0011).
     """
 
     PLAN = "plan"
@@ -65,11 +68,31 @@ _S = RunLifecycleStatus
 # from -> allowed targets (re-projecting the same status is always allowed).
 ALLOWED_TRANSITIONS: dict[RunLifecycleStatus, frozenset[RunLifecycleStatus]] = {
     _S.RUNNING: frozenset(
-        {_S.WAITING_APPROVAL, _S.INTERRUPTED, _S.APPROVED, _S.REJECTED, _S.COMPLETED, _S.FAILED}
+        {
+            _S.WAITING_APPROVAL,
+            _S.INTERRUPTED,
+            _S.APPROVED,
+            _S.REJECTED,
+            _S.COMPLETED,
+            _S.PUBLISHED,
+            _S.FAILED,
+        }
     ),
     _S.WAITING_APPROVAL: frozenset({_S.RESUME_PENDING, _S.FAILED, _S.CANCELLED, _S.EXPIRED}),
-    # resume_pending never goes back to waiting_approval: the decision is already recorded.
-    _S.RESUME_PENDING: frozenset({_S.APPROVED, _S.REJECTED, _S.COMPLETED, _S.FAILED}),
+    # resume_pending never goes back to the *same* wait (the projection pins it);
+    # it may advance to the next stage's wait (scope -> publish, ADR 0011) or
+    # to interrupted when the checkpoint positively says the work stopped.
+    _S.RESUME_PENDING: frozenset(
+        {
+            _S.WAITING_APPROVAL,
+            _S.APPROVED,
+            _S.REJECTED,
+            _S.COMPLETED,
+            _S.PUBLISHED,
+            _S.FAILED,
+            _S.INTERRUPTED,
+        }
+    ),
     _S.INTERRUPTED: frozenset(
         {
             _S.RUNNING,
@@ -77,6 +100,7 @@ ALLOWED_TRANSITIONS: dict[RunLifecycleStatus, frozenset[RunLifecycleStatus]] = {
             _S.APPROVED,
             _S.REJECTED,
             _S.COMPLETED,
+            _S.PUBLISHED,
             _S.CANCELLED,
             _S.FAILED,
         }
@@ -86,6 +110,7 @@ ALLOWED_TRANSITIONS: dict[RunLifecycleStatus, frozenset[RunLifecycleStatus]] = {
     _S.COMPLETED: frozenset(),
     _S.CANCELLED: frozenset(),
     _S.EXPIRED: frozenset(),
+    _S.PUBLISHED: frozenset(),
     _S.FAILED: frozenset(),
 }
 
@@ -117,6 +142,12 @@ class RunEventKind(StrEnum):
     RUN_EXPIRED = "run_expired"
     SCOPE_PROPOSED = "scope_proposed"
     MIRROR_REFRESHED = "mirror_refreshed"
+    # Publication (Fase 7, Paso 3; ADR 0011)
+    PUBLICATION_PREPARED = "publication_prepared"
+    BRANCH_PUSHED = "branch_pushed"
+    PULL_REQUEST_OPENED = "pull_request_opened"
+    PUBLICATION_FAILED = "publication_failed"
+    RUN_PUBLISHED = "run_published"
     RUN_FAILED = "run_failed"
     RUN_INTERRUPTED = "run_interrupted"
     RUN_RESUMED = "run_resumed"

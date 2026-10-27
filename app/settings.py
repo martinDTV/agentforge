@@ -192,6 +192,16 @@ class Settings(DatabaseSettings):
     github_api_url: str = "https://api.github.com"
     github_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
     mirror_fetch_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    # Publication (Fase 7, Paso 3; ADR 0011). Off by default: without it no
+    # write-scoped installation token is ever requested and runs on remote
+    # repositories end ``completed`` without leaving the host.
+    github_write_enabled: bool = False
+    # Repositories (repository_id) that may be published. Required and
+    # non-empty in staging/production when writes are enabled.
+    publish_allowed_repositories: list[str] = Field(default_factory=list)
+    publish_push_timeout_seconds: float = Field(default=120.0, gt=0, le=1800)
+    # None = derive from the environment, like AUTHZ_SEPARATION_OF_DUTIES.
+    authz_publish_distinct_approver: bool | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -199,6 +209,12 @@ class Settings(DatabaseSettings):
     def separation_of_duties(self) -> bool:
         if self.authz_separation_of_duties is not None:
             return self.authz_separation_of_duties
+        return self.is_production_like
+
+    @property
+    def publish_distinct_approver(self) -> bool:
+        if self.authz_publish_distinct_approver is not None:
+            return self.authz_publish_distinct_approver
         return self.is_production_like
 
     @field_validator("oidc_algorithms")
@@ -296,6 +312,19 @@ class Settings(DatabaseSettings):
                 )
         if self.git_repositories_file is None:
             raise ValueError("La GitHub App requiere GIT_REPOSITORIES_FILE y PROJECTS_FILE")
+        return self
+
+    @model_validator(mode="after")
+    def _publication_is_coherent(self) -> "Settings":
+        if not self.github_write_enabled:
+            return self
+        if self.github_app_id is None:
+            raise ValueError("GITHUB_WRITE_ENABLED requiere la GitHub App configurada")
+        if self.is_production_like and not self.publish_allowed_repositories:
+            raise ValueError(
+                "GITHUB_WRITE_ENABLED en staging/production requiere "
+                "PUBLISH_ALLOWED_REPOSITORIES con al menos un repositorio"
+            )
         return self
 
     @model_validator(mode="after")

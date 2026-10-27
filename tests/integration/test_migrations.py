@@ -19,6 +19,7 @@ BUSINESS_TABLES = {
     "run_events",
     "tool_invocations",
     "mirror_syncs",
+    "publications",
 }
 
 
@@ -30,7 +31,7 @@ def test_upgrade_head_on_a_clean_database_creates_the_business_schema(empty_data
         assert set(inspector.get_table_names()) == BUSINESS_TABLES | {"alembic_version"}
         with engine.connect() as conn:
             version = conn.scalar(text("SELECT version_num FROM alembic_version"))
-        assert version == expected_head_revision() == "0007"
+        assert version == expected_head_revision() == "0008"
     finally:
         engine.dispose()
 
@@ -105,7 +106,7 @@ async def test_verify_schema_accepts_head_and_rejects_anything_else(
 ):
     good = create_async_engine(migrated_database_url)
     try:
-        assert await verify_schema(good) == "0007"
+        assert await verify_schema(good) == "0008"
     finally:
         await good.dispose()
 
@@ -122,7 +123,7 @@ async def test_verify_schema_accepts_head_and_rejects_anything_else(
     try:
         with pytest.raises(SchemaMismatchError) as wrong:
             await verify_schema(stale)
-        assert (wrong.value.current, wrong.value.expected) == ("9999", "0007")
+        assert (wrong.value.current, wrong.value.expected) == ("9999", "0008")
     finally:
         await stale.dispose()
 

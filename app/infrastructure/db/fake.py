@@ -35,6 +35,7 @@ from app.orchestration.ports import (
     RunEvent,
     RunProjection,
 )
+from app.publishing import PublicationRecord
 from app.security import AccessScope
 from app.tools.ports import InvocationCompletion, ToolInvocation
 
@@ -175,6 +176,12 @@ class InMemoryRunRepository:
         if current is None or not can_transition(current.status, projection.status):
             return None
         if (
+            projection.status is RunLifecycleStatus.WAITING_APPROVAL
+            and current.status is RunLifecycleStatus.RESUME_PENDING
+            and current.pending_stage == projection.pending_stage
+        ):
+            return None  # never back to the same wait; only forward to the next stage
+        if (
             projection.checkpoint_id is not None
             and current.last_checkpoint_id is not None
             and current.last_checkpoint_id > projection.checkpoint_id
@@ -283,6 +290,34 @@ class InMemoryRunRepository:
             if projects is not None and run.project_id not in projects:
                 continue
             if run.status in statuses and self._lease_free(run):
+                generation = run.lease_generation + 1
+                updated = self._store(
+                    run.model_copy(
+                        update={
+                            "lease_owner": owner,
+                            "lease_expires_at": self.clock() + timedelta(seconds=ttl_seconds),
+                            "lease_generation": generation,
+                            "updated_at": self.clock(),
+                        }
+                    )
+                )
+                claimed.append((updated, LeaseToken(owner=owner, generation=generation)))
+        return claimed
+
+    async def claim_interrupted_publications(
+        self, *, owner: str, ttl_seconds: float, limit: int
+    ) -> list[tuple[PersistedRun, LeaseToken]]:
+        self._enter("claim_interrupted_publications")
+        claimed: list[tuple[PersistedRun, LeaseToken]] = []
+        for run in sorted(self.runs.values(), key=lambda r: r.updated_at):
+            if len(claimed) >= limit:
+                break
+            publication = run.publication or {}
+            state = publication.get("state")
+            resumable = state in ("prepared", "approved", "pushed", "opened") or (
+                state == "failed" and bool(publication.get("retryable"))
+            )
+            if run.status is RunLifecycleStatus.INTERRUPTED and resumable and self._lease_free(run):
                 generation = run.lease_generation + 1
                 updated = self._store(
                     run.model_copy(
@@ -450,6 +485,29 @@ class InMemoryRunRepository:
             self.approvals[run_id] = self.approvals[run_id].model_copy(update={"applied_at": now})
         return True
 
+    async def set_publication(
+        self,
+        run_id: UUID,
+        publication: dict[str, Any],
+        *,
+        expected_state: str | None = None,
+        expect_absent: bool = False,
+    ) -> PersistedRun | None:
+        self._enter("set_publication")
+        current = self.runs.get(run_id)
+        if current is None:
+            return None
+        state = (current.publication or {}).get("state")
+        if expect_absent and current.publication is not None:
+            return None
+        if not expect_absent and expected_state is not None and state != expected_state:
+            return None
+        return self._store(
+            current.model_copy(
+                update={"publication": dict(publication), "updated_at": self.clock()}
+            )
+        )
+
     async def mark_approval_applied(self, run_id: UUID) -> bool:
         self._enter("mark_approval_applied")
         decision = self.approvals.get(run_id)
@@ -606,3 +664,17 @@ class InMemoryMirrorSyncRepository:
     async def list_for_repository(self, repository_id: str, *, limit: int = 50) -> list[MirrorSync]:
         rows = [r for r in self.rows if r.repository_id == repository_id]
         return list(reversed(rows))[:limit]
+
+
+class InMemoryPublicationRepository:
+    """Mirror of ``SqlAlchemyPublicationRepository`` for the unit suite."""
+
+    def __init__(self) -> None:
+        self.rows: list[PublicationRecord] = []
+
+    async def record(self, record: PublicationRecord) -> int:
+        self.rows.append(record)
+        return len(self.rows)
+
+    async def list_for_run(self, run_id: UUID) -> list[PublicationRecord]:
+        return [r for r in self.rows if r.run_id == run_id]

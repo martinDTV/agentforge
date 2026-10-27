@@ -145,7 +145,7 @@ def test_only_the_agent_role_grants_tools_and_only_humans_grant_repo_writes():
         granted = policy.permissions_of(who("u", {role}))
         assert (P.TOOLS_EXECUTE in granted) == (role is Role.AGENT)
         assert (P.REPOS_WRITE in granted) == (role in writers)  # ADR 0009: humans only
-        assert P.REPOS_PUBLISH not in granted  # Paso 3 of Fase 7; nobody yet
+        assert (P.REPOS_PUBLISH in granted) == (role in writers)  # ADR 0011: humans only
         assert (P.RUNS_CANCEL in granted) == (role in writers | {Role.OPERATOR})
     assert policy.permissions_of(who("u", {Role.AGENT})) == {P.TOOLS_EXECUTE}
 
@@ -173,3 +173,37 @@ def test_sweep_scope_requires_the_permission_and_follows_project_membership():
         "alpha"
     }
     assert policy.sweep_scope(who("root", {"platform_admin"}, set())).projects is None
+
+
+def test_publication_approval_needs_repos_publish_and_distinct_humans():
+    policy = AuthorizationPolicy(separation_of_duties=True)
+    row = run(owner="olivia")
+    omar = who("omar", {"project_operator"})
+    assert policy.decide_publish(omar, row, scope_approver="olivia").allowed
+    # The creator never publishes their own run, whatever their roles.
+    creator = policy.decide_publish(who("olivia", {"project_operator"}), row, scope_approver=None)
+    assert creator.outcome == "forbidden" and creator.reason == "self_approval"
+    with pytest.raises(SelfApprovalForbiddenError):
+        policy.raise_for(creator, run_id="r")
+    # runs:approve without repos:publish is not enough; viewers are forbidden; outsiders hidden.
+    approver = policy.decide_publish(who("alice", {"approver"}), row, scope_approver=None)
+    assert approver.outcome == "forbidden" and "repos:publish" in approver.reason
+    assert policy.decide_publish(who("victor", {"viewer"}), row, scope_approver=None).outcome == (
+        "forbidden"
+    )
+    outsider = who("eve", {"project_operator"}, {"other"})
+    assert policy.decide_publish(outsider, row, scope_approver=None).outcome == "hidden"
+    # Four real eyes: the scope approver may not also approve publication.
+    same = policy.decide_publish(omar, row, scope_approver="omar")
+    assert same.outcome == "forbidden" and same.reason == "publish_same_approver"
+    with pytest.raises(PermissionDeniedError, match="distinto"):
+        policy.raise_for(same, run_id="r")
+    relaxed = AuthorizationPolicy(separation_of_duties=False, publish_distinct_approver=False)
+    assert relaxed.decide_publish(omar, row, scope_approver="omar").allowed
+    # Even relaxed, the creator never publishes their own run.
+    assert relaxed.decide_publish(who("olivia", {"admin"}), row, scope_approver=None).reason == (
+        "self_approval"
+    )
+    # Agents hold no run permission at all.
+    agent = who("agentforge:developer", {"agent"})
+    assert policy.decide_publish(agent, row, scope_approver=None).outcome == "hidden"

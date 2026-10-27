@@ -40,7 +40,8 @@ class Permission(StrEnum):
     # Create development runs that write inside a worktree and approve their
     # scope (Fase 7, ADR 0009). Humans only; agents never hold it.
     REPOS_WRITE = "repos:write"
-    # Approve publication to a remote (Paso 3 of Fase 7). No role grants it yet.
+    # Approve publication to a remote: a branch and a draft pull request (ADR 0011).
+    # Humans only; agents never hold it.
     REPOS_PUBLISH = "repos:publish"
 
 
@@ -67,6 +68,7 @@ _PROJECT_ADMIN = frozenset(
         _P.RUNS_AUDIT_READ,
         _P.RECOVERY_SWEEP,
         _P.REPOS_WRITE,
+        _P.REPOS_PUBLISH,
     }
 )
 _PROJECT_OPERATOR = frozenset(
@@ -78,6 +80,7 @@ _PROJECT_OPERATOR = frozenset(
         _P.RUNS_CANCEL,
         _P.RUNS_AUDIT_READ,
         _P.REPOS_WRITE,
+        _P.REPOS_PUBLISH,
     }
 )
 
@@ -159,10 +162,16 @@ class AuthorizationPolicy:
         role_permissions: Mapping[str, frozenset[Permission]] | None = None,
         *,
         separation_of_duties: bool = True,
+        publish_distinct_approver: bool | None = None,
         reserved_projects: frozenset[str] = RESERVED_PROJECTS,
     ) -> None:
         self._roles = dict(role_permissions or DEFAULT_ROLE_PERMISSIONS)
         self.separation_of_duties = separation_of_duties
+        # Publication (ADR 0011): besides never approving one's own run, the
+        # publisher must differ from the scope approver (four real eyes).
+        self.publish_distinct_approver = (
+            separation_of_duties if publish_distinct_approver is None else publish_distinct_approver
+        )
         self._reserved = reserved_projects
 
     # -- permissions --------------------------------------------------------------
@@ -205,6 +214,30 @@ class AuthorizationPolicy:
                 return Decision(outcome="forbidden", reason="self_approval")
         return ALLOWED
 
+    def decide_publish(
+        self, principal: Principal, run: OwnedRun, *, scope_approver: str | None
+    ) -> Decision:
+        """May ``principal`` approve the publication of ``run``? (ADR 0011 §2)
+
+        Requires ``runs:approve`` and ``repos:publish`` inside the project, never
+        the run's creator, and, when ``publish_distinct_approver`` is on, never
+        the subject that approved the scope. Agents are never visible principals.
+        """
+        base = self.decide(principal, Permission.RUNS_APPROVE, run)
+        if not base.allowed:
+            return base
+        if not self.has(principal, Permission.REPOS_PUBLISH):
+            return Decision(outcome="forbidden", reason="falta el permiso repos:publish")
+        if run.owner_subject == principal.subject:
+            return Decision(outcome="forbidden", reason="self_approval")
+        if (
+            self.publish_distinct_approver
+            and scope_approver is not None
+            and scope_approver == principal.subject
+        ):
+            return Decision(outcome="forbidden", reason="publish_same_approver")
+        return ALLOWED
+
     def listing_scope(self, principal: Principal) -> AccessScope:
         """Rows visible in a listing: same rule as ``can_see``, expressed as a filter."""
         if self.has(principal, Permission.PROJECTS_ALL):
@@ -240,6 +273,10 @@ class AuthorizationPolicy:
         """Turn a non-allowed decision into the matching domain error."""
         if decision.outcome == "forbidden" and decision.reason == "self_approval":
             raise SelfApprovalForbiddenError()
+        if decision.outcome == "forbidden" and decision.reason == "publish_same_approver":
+            raise PermissionDeniedError(
+                "Quien aprueba la publicación debe ser distinto de quien aprobó el alcance."
+            )
         if decision.outcome == "forbidden":
             raise PermissionDeniedError(decision.reason.capitalize() + ".")
         # "hidden" is raised by the caller as RunNotFoundError: the policy does

@@ -330,3 +330,47 @@ class MirrorSyncRecord(Base):
         CheckConstraint("result IN ('ok', 'failed')", name="ck_mirror_syncs_result"),
         Index("ix_mirror_syncs_repository_id_started_at", "repository_id", "started_at"),
     )
+
+
+class PublicationAuditRecord(Base):
+    """One row per publication step of a run (ADR 0011): prepared, approved,
+    pushed, opened, published, failed... with the identities, commits and pull
+    request involved. Written by the platform (``agentforge:publisher``); never
+    holds a token, a URL with credentials or the pull request body."""
+
+    __tablename__ = "publications"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("runs.id", ondelete="CASCADE"))
+    repository_id: Mapped[str] = mapped_column(String(64))
+    project_id: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(32))
+    code: Mapped[str | None] = mapped_column(String(64))
+    retryable: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    remote_branch: Mapped[str | None] = mapped_column(String(200))
+    base_branch: Mapped[str | None] = mapped_column(String(200))
+    base_sha: Mapped[str | None] = mapped_column(String(40))
+    base_branch_head: Mapped[str | None] = mapped_column(String(40))
+    head_sha: Mapped[str | None] = mapped_column(String(40))
+    patch_digest: Mapped[str | None] = mapped_column(String(64))
+    publish_digest: Mapped[str | None] = mapped_column(String(64))
+    pr_number: Mapped[int | None] = mapped_column(Integer)
+    pr_url: Mapped[str | None] = mapped_column(String(512))
+    approved_by: Mapped[str | None] = mapped_column(String(255))
+    actor_subject: Mapped[str] = mapped_column(
+        String(255), server_default=text("'agentforge:publisher'")
+    )
+    attempt: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('unavailable', 'prepared', 'approved', 'pushed', 'opened', 'published', "
+            "'rejected', 'failed', 'cancelled_after_push')",
+            name="ck_publications_state",
+        ),
+        Index("ix_publications_run_id_id", "run_id", "id"),
+    )

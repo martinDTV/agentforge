@@ -268,6 +268,14 @@ class RunRepository(Protocol):
         (``FOR UPDATE SKIP LOCKED``), so concurrent sweepers never share one."""
         ...
 
+    async def claim_interrupted_publications(
+        self, *, owner: str, ttl_seconds: float, limit: int
+    ) -> list[tuple[PersistedRun, LeaseToken]]:
+        """Recovery (ADR 0011): ``interrupted`` runs whose publication is midway
+        (prepared/approved/pushed/opened) or failed transiently, lease free or
+        expired; claimed like ``claim_expired_leases``."""
+        ...
+
     # -- audit ----------------------------------------------------------------
 
     async def append_events(self, run_id: UUID, events: Sequence[RunEvent]) -> int:
@@ -337,4 +345,20 @@ class RunRepository(Protocol):
 
     async def mark_approval_applied(self, run_id: UUID) -> bool:
         """Set ``applied_at`` once; returns whether this call did it."""
+        ...
+
+    # -- publication (Fase 7, Paso 3) ----------------------------------------------
+
+    async def set_publication(
+        self,
+        run_id: UUID,
+        publication: dict[str, Any],
+        *,
+        expected_state: str | None = None,
+        expect_absent: bool = False,
+    ) -> PersistedRun | None:
+        """Compare-and-set of ``runs.publication`` on its current ``state`` (or on
+        its absence with ``expect_absent``); ``None`` when the state moved first.
+        Independent of the run status and the lease: progress of a remote
+        operation must survive a lost lease to stay idempotent."""
         ...
