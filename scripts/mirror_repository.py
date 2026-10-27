@@ -5,7 +5,7 @@ the GitHub App private key, the repositories file and the projects file.
 It never prints a token; the JSON summary carries identities, the base commit
 and the audit outcome. Exit codes: 0 ok, 1 refused or failed, 2 misuse.
 
-    uv run python scripts/mirror_repository.py --repository sandbox-demo \\
+    uv run python -m scripts.mirror_repository --repository sandbox-demo \\
         --project sandbox --create
 """
 

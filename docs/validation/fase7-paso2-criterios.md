@@ -56,3 +56,56 @@ El endpoint Git lo simula un repositorio local alcanzado por `file://` con
 5. Añadir el bloque `remote` a la política del repositorio en `PROJECTS_FILE`; crear el espejo con `scripts/mirror_repository.py --create`; añadir la entrada del espejo a `GIT_REPOSITORIES_FILE`; `--check`.
 6. Ejecutar las pruebas de rechazo de la tabla del runbook y comprobar `mirror_syncs`, el marcador y la ausencia de `ghs_` en disco.
 7. Lanzar una ejecución `development` por la API sobre el espejo y revisar `base`, `hidden_paths`, `signals` y el evento `mirror_refreshed` antes de aprobar el alcance.
+
+## Integración real con GitHub (lectura), 2026-10-26
+
+Ejecutada por el operador sobre el repositorio privado y desechable
+`martinDTV/agentforge-sandbox-demo` con la GitHub App `agentforge-sandbox-martindtv`.
+Ningún token ni clave se imprimió; los valores siguientes son públicos.
+
+| Dato | Valor |
+| --- | --- |
+| Repositorio / id numérico | `martinDTV/agentforge-sandbox-demo` / `1435009323` (privado, `main`, no archivado) |
+| App / App ID | `agentforge-sandbox-martindtv` / `5487341`, propietario `martinDTV`, sin webhook ni eventos |
+| Instalación | `175627193`, cuenta `martinDTV`, `repository_selection: selected`, un solo repositorio |
+| Commit base (`main`) | `f7e73dcf46e695f77938dfb38c0e4f3eef9b90ac` ("seed: mailcheck demo", subido por el operador) |
+| Espejo | `GIT_REPOSITORIES_ROOT/sandbox-github/agentforge-sandbox-demo.git`; `origin` = URL derivada sin credenciales; solo `refs/heads/main`; `remote.origin.fetch = +refs/heads/*:refs/heads/*`; `tagOpt = --no-tags`; marcador `0600` con el mismo `base_sha` |
+| Identificadores locales | `repository_id = project_id = sandbox-github` (`sandbox-demo` ya existía en el registro de la Fase 5) |
+
+Secuencia y resultados:
+
+1. **Descubrimiento como App** (`GET /app`, `/app/installations`): la App se había creado sin permisos de repositorio (`permissions: {}`) y la instalación no alcanzaba ningún repositorio; el canje de un token de lectura devolvía 422 "The permissions requested are not granted to this installation". El preflight lo reportó como `installation_restricted` fallido con `missing_permissions: ["contents", "metadata"]` y `github: token_request_rejected`. El operador añadió `Contents` y seleccionó el repositorio.
+2. **Preflight** tras la corrección: `private_key`, `policy`, `registry`, `app_auth`, `installation_token` (acotado a `contents:read` + `metadata:read`, caducidad de una hora), `repository_identity` (id, nombre, rama, privado, alcanzable), `remote_head`, `mirror` y `no_token_leaks` en `ok`. En un primer intento la instalación concedía `contents: write` y `installation_restricted` falló (`unexpected_permissions: {"contents": "write"}`); el operador lo bajó a Read-only y el preflight quedó en **`ok: true`** con `permissions: {"contents": "read", "metadata": "read"}` y `repository_selection: selected`.
+3. **Primera sincronización**: `--create` → `base_sha f7e73dcf…`, `changed: true`, 2,9 s; `--check` y `--refresh` idempotentes (`changed: false`). `mirror_syncs` registró `create`, `check` y `refresh` con `actor_subject = agentforge:platform` y la caducidad del token, nunca el token.
+4. **Pruebas negativas sobre el espejo real** (política o espejo alterados temporalmente, instalación intacta, restaurado y comprobado al final):
+
+   | Prueba | Código |
+   | --- | --- |
+   | App ID distinto con la misma clave | `installation_not_found` |
+   | Clave privada ajena (RSA desechable) con el App ID correcto | `app_auth_failed` |
+   | `installation_id`, `github_repository_id` o rama distintos en la política con espejo existente | `mirror_identity_mismatch` (el marcador local gana antes de llamar a GitHub) |
+   | `name` fuera de la instalación con espejo existente | `mirror_path_mismatch` |
+   | `origin` del espejo cambiado con `git remote set-url` | `mirror_remote_mismatch` |
+   | Marcador editado (otro id) | `mirror_identity_mismatch` |
+   | `contents:write`, `pull_requests:write`, `workflows:write`, `administration:read` pedidos a la plataforma | `permission_not_allowed` en local, sin petición a GitHub |
+   | `workflows:write` y `administration:read` pedidos directamente a GitHub | `token_request_rejected` (422) |
+
+   Las mismas variantes sobre una raíz vacía (sin marcador), para que sea GitHub quien rechace: `installation_not_found`, `repository_substituted` ("ya no es el repositorio 1435009324"), `token_request_rejected` (nombre fuera de la instalación) y `default_branch_changed`; la política correcta creó el espejo de control (`ok`).
+5. **Ejecuciones gobernadas por la API** (Claude `claude-sonnet-4-6` vía Vertex, Runner de Proxmox `agentforge-runner-01`, `podman-rootless`, `verified/ready/rootless = true`):
+   - `ed70edb8-258f-46d5-92c0-654971c9f2c9` (Tailscale detenido en el Mac): `mirror_refreshed` por la plataforma, propuesta con `base`, `hidden_paths: 1` (`AGENTS.md`), aprobación por digest, Developer escribió los dos archivos aprobados y la ejecución terminó `failed` con `runner_unreachable` en `apply_changes`. Útil como evidencia de fallo cerrado sin Runner.
+   - `89484248-d461-4b4a-8def-62a62db649bb` (Tailscale conectado): mismo `base_sha f7e73dcf…` (`changed: false`), mismo digest `23567a52…`, `omar` aprobó; Developer escribió `src/mailcheck/validator.py` y `tests/test_validator.py`; QA ejecutó `ruff check`, `ruff format --check` y `pytest` en el Runner (primera ronda: 3 comprobaciones, 2 fallidas, 4 observaciones; Developer corrigió; segunda ronda: 3 comprobaciones, 0 fallidas, aprobado) y la ejecución terminó **`completed`** en 69 s con `revision 1` y 5 llamadas al modelo. Auditoría: 11 `exec.run` (Developer y QA) en `ok` entre 289 y 624 ms, 4 `workspace.write_file` todos dentro del alcance, `git.diff` de QA, ninguna invocación de red. El worktree quedó en la rama `run/89484248…` sobre `f7e73dcf…` con `AGENTS.md` idéntico al original; el espejo conserva `refs/heads/main` en `f7e73dcf…` más la rama local `run/<run_id>` que crea el worktree; `main` en GitHub no cambió. **Ningún `push`.**
+6. **Barrido de credenciales** tras ambas ejecuciones: `no_token_leaks` en `ok` con `--scan-db` y los logs de la API: 0 archivos bajo las raíces de Git y worktrees, 0 filas en `run_events`, `mirror_syncs`, `tool_invocations`, `runs`, `checkpoints`, `checkpoint_blobs` y `checkpoint_writes`; los logs de la API no contienen `ghs_`, `x-access-token`, cabeceras `Authorization` ni URLs con credenciales; `origin` del espejo sin usuario ni token. El Runner no recibe variables `GITHUB_*` ni `GIT_*` (contrato del `SandboxRequest`) y siguió `ready` tras la ejecución.
+
+Correcciones hechas durante la integración (sin confirmar en la rama):
+
+- `installation_restricted` fallaba en silencio con permisos vacíos: ahora exige exactamente `contents:read` + `metadata:read` (`missing_permissions`).
+- El 422 del canje tiene código propio `token_request_rejected` (antes `github_failed`).
+- Los scripts se ejecutan como `uv run python -m scripts.<nombre>` (convención del proyecto); el runbook y las docstrings decían `python scripts/<archivo>.py`, que no encuentra `app`.
+- `PROJECTS_FILE` no estaba en el `.env` del host (la demostración del Paso 1 lo pasaba por entorno); añadido junto a `GITHUB_APP_ID` y `GITHUB_APP_PRIVATE_KEY_FILE`.
+
+Limitaciones abiertas tras la integración real:
+
+1. `repository_transferred` y `repository_archived` solo están cubiertos por la API simulada: no se renombró ni archivó el repositorio real.
+2. El preflight no enumera qué otros repositorios tiene seleccionados la instalación (el token se acota a uno); la exclusividad se confirmó con un token sin acotar en el descubrimiento inicial (`total_count` de la instalación) y en la interfaz de GitHub por el operador.
+3. La conexión del Mac a la red privada depende de que Tailscale esté activo; sin ella la ejecución falla cerrada con `runner_unreachable` después de escribir dentro del alcance aprobado (no antes): el worktree local queda con los cambios y el espejo intacto.
+4. En `/tmp` de la VM del Runner hay tres directorios `agentforge-cleanup-*` anteriores a este paso (trabajo de la Fase 6); no se tocaron ni se crearon nuevos; la cuenta SSH del operador no tiene `sudo` sin contraseña, por lo que la ausencia de contenedores residuales no se comprobó desde aquí en esta sesión.

@@ -6,7 +6,8 @@ class GitHubError(DomainError):
 
     Codes: ``github_unconfigured``, ``app_auth_failed``, ``token_invalid``,
     ``installation_forbidden``, ``installation_not_found``, ``repository_not_found``,
-    ``permission_not_allowed``, ``github_failed``, ``github_unreachable``,
+    ``permission_not_allowed``, ``token_request_rejected``, ``github_failed``,
+    ``github_unreachable``,
     ``github_protocol_error``, ``repository_substituted``, ``repository_transferred``,
     ``repository_identity_mismatch``, ``default_branch_changed``,
     ``repository_archived``, ``repository_not_in_installation``.

@@ -110,6 +110,11 @@ def test_preflight_names_every_misconfiguration(tmp_path: Path):
     lab.github.app_permissions = {"contents": "write", "metadata": "read"}
     checks = by_name(run_preflight(deps_for(lab), repository_id=REPO, project_id=PROJECT))
     assert checks["installation_restricted"]["unexpected_permissions"] == {"contents": "write"}
+    assert checks["installation_restricted"]["missing_permissions"] == ["contents"]
+    lab.github.app_permissions = {}  # created without repository permissions (real case 2026-10-26)
+    checks = by_name(run_preflight(deps_for(lab), repository_id=REPO, project_id=PROJECT))
+    assert not checks["installation_restricted"]["ok"]
+    assert checks["installation_restricted"]["missing_permissions"] == ["contents", "metadata"]
     lab.github.app_permissions = {"contents": "read", "metadata": "read"}
     lab.github.suspended = True
     assert not by_name(run_preflight(deps_for(lab), repository_id=REPO, project_id=PROJECT))[

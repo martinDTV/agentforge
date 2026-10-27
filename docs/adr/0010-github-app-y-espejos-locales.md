@@ -1,6 +1,6 @@
 # 0010. GitHub App dedicada y espejos Git locales (Fase 7, Paso 2)
 
-- Status: accepted (implementado y validado localmente con una API de GitHub simulada; **ninguna App creada ni repositorio real conectado** hasta ejecutar `docs/runbooks/github-app.md`)
+- Status: accepted (implementado y validado contra GitHub real el 2026-10-26 sobre `martinDTV/agentforge-sandbox-demo` con la App `agentforge-sandbox-martindtv` instalada solo ahí con `contents:read` + `metadata:read`: preflight `ok`, espejo, pruebas negativas, barrido de credenciales y una ejecución gobernada completa Scoper → aprobación → Developer → QA con Claude vía Vertex y el Runner de Proxmox, sin `push`; evidencia en `docs/validation/fase7-paso2-criterios.md`)
 - Date: 2026-10-26
 - Deciders: martin, Claude (Fase 7)
 

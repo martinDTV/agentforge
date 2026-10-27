@@ -19,7 +19,7 @@ with the operator policy:
 
 Prints one JSON report; exit 0 when every check passed, 1 otherwise, 2 on misuse.
 
-    uv run python scripts/github_preflight.py --repository sandbox-demo --project sandbox-github
+    uv run python -m scripts.github_preflight --repository sandbox-demo --project sandbox-github
 """
 
 import argparse
@@ -190,6 +190,9 @@ def run_preflight(deps: PreflightDeps, *, repository_id: str, project_id: str) -
         unexpected = {
             k: v for k, v in info.permissions.items() if READ_ONLY_PERMISSIONS.get(k) != v
         }
+        missing = sorted(
+            k for k, v in READ_ONLY_PERMISSIONS.items() if info.permissions.get(k) != v
+        )
         forbidden = sorted(set(info.permissions) & FORBIDDEN_PERMISSIONS)
         checks.append(
             Check(
@@ -203,6 +206,7 @@ def run_preflight(deps: PreflightDeps, *, repository_id: str, project_id: str) -
                 "installation_restricted",
                 info.repository_selection == "selected"
                 and not unexpected
+                and not missing
                 and not forbidden
                 and not info.suspended,
                 {
@@ -210,6 +214,7 @@ def run_preflight(deps: PreflightDeps, *, repository_id: str, project_id: str) -
                     "account": info.account,
                     "repository_selection": info.repository_selection,
                     "permissions": info.permissions,
+                    "missing_permissions": missing,
                     "unexpected_permissions": unexpected,
                     "forbidden_permissions": forbidden,
                     "suspended": info.suspended,

@@ -147,7 +147,27 @@ def test_github_failures_map_to_stable_codes_without_payloads():
     assert exc.value.code == "installation_not_found"
     with pytest.raises(GitHubError) as exc:  # repository outside the installation: 422
         provider.token_for(INSTALLATION_ID, "not-installed")
-    assert exc.value.code == "github_failed" and not exc.value.retryable
+    assert exc.value.code == "token_request_rejected" and not exc.value.retryable
+    original = fake.handler
+
+    def no_permissions(request: httpx.Request) -> httpx.Response:
+        # The App was created without repository permissions (real case, 2026-10-26).
+        if request.method == "POST" and "/access_tokens" in request.url.path:
+            return httpx.Response(
+                422,
+                json={"message": "The permissions requested are not granted to this installation."},
+            )
+        return original(request)
+
+    strict = GitHubClient("https://api.github.test", transport=httpx.MockTransport(no_permissions))
+    with pytest.raises(GitHubError) as exc:
+        strict.create_installation_token(
+            credentials.app_jwt(),
+            INSTALLATION_ID,
+            repositories=[NAME],
+            permissions=dict(READ_ONLY_PERMISSIONS),
+        )
+    assert exc.value.code == "token_request_rejected" and "granted" not in str(exc.value)
     token = provider.token_for(INSTALLATION_ID, NAME)
     fake.revoked.add(token.reveal())
     with pytest.raises(GitHubError) as exc:

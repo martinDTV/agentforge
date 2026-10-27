@@ -33,9 +33,10 @@ comprueba su modo, propietario y ubicación, y la App la usa en memoria para fir
   (local del operador en esta fase), migraciones aplicadas hasta `0007`:
   `uv run alembic upgrade head`.
 - Variables ya operativas del Paso 1: `GIT_REPOSITORIES_ROOT`, `GIT_REPOSITORIES_FILE`,
-  `WORKTREES_ROOT`, `PROJECTS_FILE`. Todas rutas absolutas.
+  `WORKTREES_ROOT`, `PROJECTS_FILE`. Todas rutas absolutas y **en el `.env`** (la demostración
+  del Paso 1 pasaba `PROJECTS_FILE` por entorno; los scripts de este paso leen el `.env`).
 - Decide los identificadores locales. En este runbook: `project_id = sandbox-github`,
-  `repository_id = sandbox-demo`. Los proyectos del MVP deben empezar por `sandbox-`
+  `repository_id = sandbox-github` (`sandbox-demo` ya existe en el registro local de la Fase 5). Los proyectos del MVP deben empezar por `sandbox-`
   (`DevelopmentScope` lo exige).
 
 ## 1. Crear el repositorio desechable
@@ -75,6 +76,13 @@ No concedas `Workflows`, `Administration`, `Secrets`, `Actions`, `Members`, `Pul
 ni `Issues`. `Pull requests: write` y `Contents: write` se pedirán en el Paso 3 con su
 propio runbook; sin `Workflows` GitHub rechaza cualquier cambio bajo `.github/workflows`
 aunque todo lo demás fallara.
+
+Si la App ya existía sin permisos (o con otros), cámbialos en *Permissions & events*, guarda,
+y después **acepta la solicitud de permisos en la instalación** (Settings → Applications →
+Installed GitHub Apps → Configure): hasta entonces la instalación sigue con los permisos
+anteriores y el canje devuelve 422. El preflight exige exactamente `contents: read` y
+`metadata: read`: con `contents: write` falla `installation_restricted` aunque la plataforma
+solo pida lectura.
 
 Tras crear la App:
 
@@ -140,7 +148,7 @@ GITHUB_APP_PRIVATE_KEY_FILE=/Users/<usuario>/.config/agentforge/agentforge-sandb
 {
   "repositories": [
     {
-      "repository_id": "sandbox-demo",
+      "repository_id": "sandbox-github",
       "project_id": "sandbox-github",
       "writable_globs": ["src/**", "tests/**"],
       "test_paths": ["tests"],
@@ -166,7 +174,7 @@ que `MirrorService` deriva: `GIT_REPOSITORIES_ROOT/<project_id>/<name>.git`:
 {
   "repositories": [
     {
-      "id": "sandbox-demo",
+      "id": "sandbox-github",
       "project_id": "sandbox-github",
       "path": "/ruta/absoluta/GIT_REPOSITORIES_ROOT/sandbox-github/agentforge-sandbox-demo.git",
       "default_branch": "main"
@@ -184,7 +192,7 @@ existe y apunta a otra ruta, rechaza con `mirror_path_mismatch`.
 
 ```bash
 uv run alembic upgrade head   # 0007: tabla mirror_syncs
-uv run python scripts/github_preflight.py --repository sandbox-demo --project sandbox-github
+uv run python -m scripts.github_preflight --repository sandbox-github --project sandbox-github
 ```
 
 Es de solo lectura y debe terminar con `"ok": true` y estas comprobaciones:
@@ -211,8 +219,8 @@ paso 3.
 ## 7. Crear el espejo y verificarlo
 
 ```bash
-uv run python scripts/mirror_repository.py --repository sandbox-demo --project sandbox-github --create
-uv run python scripts/mirror_repository.py --repository sandbox-demo --project sandbox-github --check
+uv run python -m scripts.mirror_repository --repository sandbox-github --project sandbox-github --create
+uv run python -m scripts.mirror_repository --repository sandbox-github --project sandbox-github --check
 ```
 
 Salida esperada (resumen JSON, nunca un token):
@@ -252,7 +260,7 @@ Restaura la política y vuelve a `--check` antes de seguir. Después de la prime
 sincronización real y de la primera ejecución gobernada, ejecuta el barrido completo:
 
 ```bash
-uv run python scripts/github_preflight.py --repository sandbox-demo --project sandbox-github \
+uv run python -m scripts.github_preflight --repository sandbox-github --project sandbox-github \
   --scan-db --scan /ruta/al/log/de/uvicorn
 ```
 

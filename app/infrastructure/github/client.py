@@ -241,6 +241,14 @@ def _error_for(status: int, purpose: str) -> GitHubError:
     if status == 404:
         code = "installation_not_found" if purpose == "token" else "repository_not_found"
         return GitHubError(code, f"recurso no encontrado en GitHub ({purpose})")
+    if status == 422 and purpose == "token":
+        # GitHub refuses the narrowing: a permission the installation does not
+        # grant, or a repository the installation does not reach.
+        return GitHubError(
+            "token_request_rejected",
+            "GitHub rechazó el canje: permiso no concedido a la instalación o repositorio "
+            "fuera de ella (422)",
+        )
     if status >= 500:
         return GitHubError(
             "github_failed", f"GitHub respondió {status} ({purpose})", retryable=True
