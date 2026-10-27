@@ -48,7 +48,8 @@ def _pid() -> int | None:
 def _health(port: int) -> dict[str, Any]:
     try:
         with urllib.request.urlopen(f"http://{DEFAULT_HOST}:{port}/health/ready", timeout=3) as r:  # noqa: S310
-            return {"http": r.status}
+            body = json.loads(r.read().decode() or "{}")
+            return {"http": r.status, **{k: v for k, v in body.items() if isinstance(v, str)}}
     except Exception as exc:  # noqa: BLE001
         return {"http": 0, "error": type(exc).__name__}
 
@@ -139,11 +140,25 @@ def down() -> int:
     return 0
 
 
+def _worker_state() -> str:
+    """What the current log says about the in-process notification worker."""
+    try:
+        text = LOG_FILE.read_text(errors="replace")
+    except OSError:
+        return "unknown"
+    started = text.rfind("notification worker started")
+    stopped = text.rfind("Application shutdown complete")
+    if started < 0:
+        return "not started (AGENTFORGE_EMAIL_ENABLED=false?)"
+    return "running" if started > stopped else "stopped"
+
+
 def status(port: int) -> int:
     pid = _pid()
     report = {
         "api": {"pid": pid, "running": pid is not None, "health": _health(port) if pid else None},
         "alembic": _alembic_current(),
+        "worker": (_health(port).get("notifications") if pid else None) or _worker_state(),
         "log": str(LOG_FILE),
     }
     try:

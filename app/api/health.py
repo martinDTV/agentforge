@@ -25,6 +25,14 @@ async def live() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _notifications(state: object) -> str:
+    """``worker`` while the in-process mail worker runs; ``disabled`` without e-mail."""
+    if getattr(state, "notification_worker", None) is None:
+        return "disabled"
+    task = getattr(state, "notification_task", None)
+    return "stopped" if task is None or task.done() else "worker"
+
+
 @router.get("/ready")
 async def ready(request: Request, response: Response) -> dict[str, str]:
     state = request.app.state
@@ -50,7 +58,13 @@ async def ready(request: Request, response: Response) -> dict[str, str]:
 
     checkpoints: PostgresCheckpointer | None = state.checkpoints
     if checkpoints is None:
-        return {"status": "ok", "database": "ok", "schema": "ok", "checkpoints": "memory"}
+        return {
+            "status": "ok",
+            "database": "ok",
+            "schema": "ok",
+            "checkpoints": "memory",
+            "notifications": _notifications(state),
+        }
     if not state.checkpoints_verified:
         try:
             await checkpoints.verify_schema()
@@ -66,4 +80,10 @@ async def ready(request: Request, response: Response) -> dict[str, str]:
             response.status_code = _UNAVAILABLE
             return {"status": "unavailable", "database": "unreachable"}
         state.checkpoints_verified = True
-    return {"status": "ok", "database": "ok", "schema": "ok", "checkpoints": "ok"}
+    return {
+        "status": "ok",
+        "database": "ok",
+        "schema": "ok",
+        "checkpoints": "ok",
+        "notifications": _notifications(state),
+    }

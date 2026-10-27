@@ -18,6 +18,11 @@ uv run python -m scripts.agentforge_dev down
 servicios permanentes: tras reiniciar el Mac, vuelve a ejecutar `up`. Requisitos: PostgreSQL
 local, `.env` (0600) y, para que Developer y QA ejecuten pruebas, el Runner alcanzable.
 
+`status` resume todo lo que importa: `api.running`, `health` (`database`, `schema`,
+`checkpoints` y `notifications`: `worker` cuando el worker de correo está activo, `disabled`
+sin correo), `alembic` (`0009 (head)` esperado), `worker` y los recuentos de la bandeja de
+salida por estado. `GET /health/ready` devuelve la misma información.
+
 Valores predeterminados seguros: `GITHUB_WRITE_ENABLED=false` (nada sale del equipo),
 `NOTIFICATIONS_LEVEL=priority`, `ROUTER_DEFAULT_MODE=auto`.
 
@@ -29,8 +34,8 @@ uv run python -m scripts.agentforge task \
   --project sandbox-github --repository sandbox-github --mode auto
 ```
 
-Guarda `AGENTFORGE_PROJECT=…` y `AGENTFORGE_REPOSITORY=…` en el `.env` para omitir las
-opciones. La identidad es `AGENTFORGE_SUBJECT` (por defecto tu usuario del sistema) con el rol
+Con `AGENTFORGE_PROJECT` y `AGENTFORGE_REPOSITORY` en el `.env` (hoy `sandbox-github`) basta
+`uv run python -m scripts.agentforge task "…"`; `--mode` es opcional (`auto` por defecto). La identidad es `AGENTFORGE_SUBJECT` (por defecto tu usuario del sistema) con el rol
 `project_operator`; el token lo emite el emisor local de desarrollo y nunca se imprime.
 
 Modos de ruta:
@@ -104,7 +109,19 @@ Reversión: `uv run alembic downgrade 0008` elimina solo lo añadido por 0009; l
 decisiones, eventos y publicaciones no se tocan. El respaldo del 2026-10-27 está en
 `~/.local/share/agentforge-backups/` con su manifiesto de recuentos.
 
-## 7. Si algo falla
+## 7. Registros y auditoría
+
+- `uv run python -m scripts.agentforge_dev logs -n 200`: log de la API (uvicorn); nunca
+  contiene tokens ni la contraseña de correo.
+- `uv run python -m scripts.agentforge events <run_id>`: eventos durables de la ejecución
+  (ruta elegida, propuesta, aprobaciones, Developer, QA, publicación), con su ordinal.
+- `uv run python -m scripts.notifications list --status sent`: correos entregados, con
+  `Message-ID`; `--status failed --status dead` para los que requieren atención.
+- En PostgreSQL: `runs` (estado, `route`, `route_mode`, `publication`), `run_decisions`,
+  `route_decisions` (motivo, versión de política, confianza), `publications`,
+  `notification_outbox`.
+
+## 8. Si algo falla
 
 - `agentforge_dev status` muestra `alembic` distinto de `(head)`: aplica §6.
 - Un correo no llega: `scripts.notifications list --status failed --status dead` y

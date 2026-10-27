@@ -409,6 +409,7 @@ def create_app(
             else None
         )
         app.state.notification_worker = notification_worker
+        app.state.notification_task = None
         del publish_distinct  # consumed through ``authz``; kept explicit for readers
         app.state.tool_gateway = tool_gateway
         app.state.worktrees = manager
@@ -427,6 +428,12 @@ def create_app(
             if notification_worker is not None:
                 mailer = asyncio.create_task(
                     notification_worker.run_forever(worker_interval), name="notification-worker"
+                )
+                app.state.notification_task = mailer
+                logger.info(
+                    "notification worker started (every %ss, level=%s)",
+                    worker_interval,
+                    getattr(enqueuer, "level", "n/a"),
                 )
             if db is not None:
                 await _check_database_on_startup(app, db)

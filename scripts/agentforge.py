@@ -172,7 +172,8 @@ def run(argv: Sequence[str] | None = None, *, client: httpx.Client | None = None
             if r.status_code != 200:
                 return _fail(r)
             for item in r.json().get("items", []):
-                print(json.dumps(_summary(item), ensure_ascii=False))
+                row = {k: v for k, v in _summary(item).items() if v is not None}
+                print(json.dumps(row, ensure_ascii=False))
             return 0
         if args.command == "show":
             r = client.get(f"/runs/{args.run_id}", headers=h)
