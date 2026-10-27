@@ -54,6 +54,14 @@ class RunState(TypedDict, total=False):
     scope_proposal: dict[str, Any]
     approved_scope: dict[str, Any]
     development_deadline: str
+    # Publication (Fase 7, Paso 3; ADR 0011): the frozen plan, the progress snapshot
+    # and the positive markers the status derivation relies on.
+    publication_plan: dict[str, Any]
+    publication: dict[str, Any]
+    publish_approved: bool
+    publish_decided_by: str
+    published: bool
+    publication_interrupted: bool
 
 
 RunGraph = CompiledStateGraph[RunState, None, RunState, RunState]

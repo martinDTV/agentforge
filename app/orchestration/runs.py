@@ -73,6 +73,18 @@ _S = RunLifecycleStatus
 _WAITING = frozenset({_S.WAITING_APPROVAL, _S.RESUME_PENDING})
 
 
+_RESUMABLE_PUBLICATION_STATES = frozenset({"prepared", "approved", "pushed", "opened"})
+
+
+def _publication_resumable(row: PersistedRun) -> bool:
+    """A development run whose publication stopped midway or failed transiently (ADR 0011)."""
+    publication = row.publication or {}
+    state = publication.get("state")
+    if state in _RESUMABLE_PUBLICATION_STATES:
+        return True
+    return state == "failed" and bool(publication.get("retryable"))
+
+
 def _config(run_id: UUID) -> RunnableConfig:
     # thread_id == run_id, always: one run is exactly one LangGraph thread.
     return {"configurable": {"thread_id": str(run_id)}}
@@ -323,6 +335,7 @@ class RunService:
         *,
         stage: DecisionStage | None = None,
         scope_digest: str | None = None,
+        publish_digest: str | None = None,
     ) -> RunResponse:
         """Record and apply a human decision for the stage the run waits for.
 
@@ -364,6 +377,25 @@ class RunService:
                 ):
                     raise DecisionStaleError(run_id)
                 digest = pending.scope_digest if pending is not None else scope_digest
+            elif effective is DecisionStage.PUBLISH:
+                # ADR 0011: repos:publish, never the creator, never (in production)
+                # the scope approver, and the exact plan digest shown.
+                taken = await self._repository.list_decisions(rid)
+                scope_by = next(
+                    (d.decided_by for d in taken if d.stage is DecisionStage.SCOPE), None
+                )
+                verdict = self._authz.decide_publish(principal, row, scope_approver=scope_by)
+                if not verdict.allowed:
+                    self._authz.raise_for(verdict, run_id=run_id)
+                if pending is not None and pending.deadline is not None:
+                    if self._clock() > pending.deadline:
+                        await self._expire(row)
+                        raise DecisionExpiredError(run_id)
+                if pending is not None and (
+                    publish_digest is None or publish_digest != pending.publish_digest
+                ):
+                    raise DecisionStaleError(run_id)
+                digest = pending.publish_digest if pending is not None else publish_digest
             claim = await self._repository.claim_decision(
                 rid,
                 effective,
@@ -512,6 +544,13 @@ class RunService:
                 self._authz.raise_for(decision, run_id=run_id)
             if row.status is not _S.INTERRUPTED:
                 raise RunNotResumableError(run_id, f"estado actual '{row.status}'")
+            if row.workflow_kind is WorkflowKind.DEVELOPMENT:
+                if not _publication_resumable(row):
+                    raise RunNotResumableError(
+                        run_id, "una ejecución de desarrollo interrumpida no se reconduce"
+                    )
+                if not self._authz.has(principal, Permission.REPOS_PUBLISH):
+                    raise PermissionDeniedError("Falta el permiso repos:publish.")
             if row.attempt >= self._policy.max_attempts:
                 raise RunNotResumableError(
                     run_id, f"agotó sus {self._policy.max_attempts} intentos"
@@ -602,6 +641,17 @@ class RunService:
                 return RecoveryOutcome.REPROJECTED
 
             if row.workflow_kind is WorkflowKind.DEVELOPMENT:
+                if _publication_resumable(row):
+                    # Publication is idempotent and costs no model call (ADR 0011):
+                    # re-drive it, bounded by the same attempt limit.
+                    if row.attempt >= self._policy.max_attempts:
+                        await self._fail_abandoned(rid, snapshot, lease, row.attempt)
+                        return RecoveryOutcome.ABANDONED
+                    attempt = await self._repository.bump_attempt(rid, lease)
+                    if attempt is None:
+                        raise LeaseLostError(str(rid))
+                    await self._redrive(rid, row, snapshot, lease, actor=actor, attempt=attempt)
+                    return RecoveryOutcome.RESUMED
                 # Writes, billable calls and sandbox programs with unknown
                 # outcome are never repeated implicitly (ADR 0008).
                 await self._fail_development_interrupted(row, lease)
@@ -632,7 +682,25 @@ class RunService:
     ) -> None:
         """Continue a run from its last checkpoint under ``lease`` (shared by sweep and resume)."""
         if row.workflow_kind is WorkflowKind.DEVELOPMENT:
-            await self._fail_development_interrupted(row, lease)
+            if not _publication_resumable(row):
+                await self._fail_development_interrupted(row, lease)
+                return
+            graph = self._graph_for(WorkflowKind.DEVELOPMENT)
+            if snapshot.values.get("publication_interrupted") is True:
+                # Re-enter the ``publish`` node: the plan and the decision stay as they
+                # are; only the transient marker is cleared, as if ``approve_publish``
+                # had just produced its verdict again.
+                await graph.aupdate_state(
+                    _config(rid), {"publication_interrupted": False}, as_node="approve_publish"
+                )
+                snapshot = await graph.aget_state(_config(rid))
+            await self._project_status(rid, snapshot, _S.RUNNING, lease)
+            await self._record(
+                rid,
+                [RunEvent(kind=RunEventKind.RUN_RESUMED, ordinal=attempt or row.attempt)],
+                actor=actor,
+            )
+            await self._drive(rid, None, lease, actor=actor, graph=graph)
             return
         has_checkpoint = "task" in snapshot.values
         await self._project_status(rid, snapshot, _S.RUNNING, lease)
@@ -805,9 +873,16 @@ class RunService:
             raise RunNotFoundError(str(rid))
         snapshot = await self._reader_for(row.workflow_kind).aget_state(_config(rid))
         if has_pending_interrupt(snapshot):
-            resume: dict[str, Any] = {"approved": decision.approved, "stage": decision.stage.value}
+            resume: dict[str, Any] = {
+                "approved": decision.approved,
+                "stage": decision.stage.value,
+                "approved_by": decision.decided_by,
+            }
             if decision.scope_digest is not None:
-                resume["scope_digest"] = decision.scope_digest
+                key = (
+                    "publish_digest" if decision.stage is DecisionStage.PUBLISH else "scope_digest"
+                )
+                resume[key] = decision.scope_digest
             await self._drive(
                 rid,
                 Command(resume=resume),
@@ -819,7 +894,10 @@ class RunService:
             # The resume already happened (crash after it): only the projection is missing.
             await self._project(rid, lease=lease, release=True)
         updated = await self._repository.get_run(rid)
-        if updated is not None and updated.status not in _WAITING:
+        moved_on = updated is not None and (
+            updated.status not in _WAITING or updated.pending_stage is not decision.stage
+        )
+        if updated is not None and moved_on:
             if await self._repository.mark_decision_applied(rid, decision.stage):
                 await self._record(
                     rid,
@@ -862,7 +940,12 @@ class RunService:
                 await self._repository.release_lease(rid, lease)
             return current  # no checkpoint written yet
         in_flight = current.lease_active and not release
-        projection = build_projection(snapshot, current=current.status, in_flight=in_flight)
+        projection = build_projection(
+            snapshot,
+            current=current.status,
+            in_flight=in_flight,
+            current_stage=current.pending_stage,
+        )
         if not projection_differs(current, projection) and not release:
             return current
         updated = await self._repository.project(rid, projection, lease=lease, release=release)

@@ -50,6 +50,7 @@ def has_pending_interrupt(snapshot: StateSnapshot) -> bool:
 _STAGE_BY_KIND: dict[str, DecisionStage] = {
     "approve_plan": DecisionStage.PLAN,
     "approve_scope": DecisionStage.SCOPE,
+    "approve_publish": DecisionStage.PUBLISH,
     "approve_publication": DecisionStage.PUBLISH,
 }
 
@@ -62,6 +63,12 @@ class PendingDecision:
     scope_digest: str | None
     deadline: datetime | None
     payload: dict[str, Any]
+    publish_digest: str | None = None
+
+    @property
+    def digest(self) -> str | None:
+        """The digest the decision must name: scope or publish, depending on the stage."""
+        return self.publish_digest if self.stage is DecisionStage.PUBLISH else self.scope_digest
 
 
 def _interrupts(snapshot: StateSnapshot) -> list[Interrupt]:
@@ -89,21 +96,44 @@ def pending_decision(snapshot: StateSnapshot) -> PendingDecision | None:
             except ValueError:
                 parsed = None
         digest = value.get("scope_digest")
+        publish = value.get("publish_digest")
         return PendingDecision(
             stage=stage,
             scope_digest=str(digest) if isinstance(digest, str) else None,
             deadline=parsed,
             payload=dict(value),
+            publish_digest=str(publish) if isinstance(publish, str) else None,
         )
     return None
 
 
+def publication_pending(values: dict[str, Any]) -> bool:
+    """Positive evidence that a publication is under way (ADR 0011): a plan exists
+    and no decision was taken yet, or the decision was taken and nothing final
+    (published, rejected, failed) was written. Such a run is never ``completed``."""
+    if "publication_plan" not in values or not values.get("publication_plan"):
+        return False
+    decided = values.get("publish_approved")
+    if decided is None:
+        return True
+    return decided is True and values.get("published") is not True
+
+
 def derive_status(snapshot: StateSnapshot, *, in_flight: bool = False) -> RunLifecycleStatus:
+    values = snapshot.values
     if derive_error(snapshot) is not None:
         return RunLifecycleStatus.FAILED
-    if snapshot.values.get("completed") is True:
+    if values.get("published") is True:
+        return RunLifecycleStatus.PUBLISHED
+    if values.get("publish_approved") is False:
+        return RunLifecycleStatus.REJECTED
+    if has_pending_interrupt(snapshot):
+        return RunLifecycleStatus.WAITING_APPROVAL
+    if values.get("publication_interrupted") is True or publication_pending(values):
+        return RunLifecycleStatus.RUNNING if in_flight else RunLifecycleStatus.INTERRUPTED
+    if values.get("completed") is True:
         return RunLifecycleStatus.COMPLETED
-    approved = snapshot.values.get("approved")
+    approved = values.get("approved")
     if approved is True:
         return RunLifecycleStatus.APPROVED
     if approved is False:

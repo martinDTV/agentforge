@@ -24,7 +24,7 @@ from app.contracts import (
     RunSummary,
 )
 from app.contracts.execution import PROJECT_ID_PATTERN
-from app.contracts.lifecycle import RunLifecycleStatus
+from app.contracts.lifecycle import DecisionStage, RunLifecycleStatus
 from app.orchestration.ports import PersistedEvent, PersistedRun
 
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -157,11 +157,19 @@ async def approve_run(
     """Decide the stage the run waits for (``runs:approve``).
 
     A ``scope`` decision also needs ``repos:write`` and the ``scope_digest`` of
-    the proposal shown by ``GET /runs/{run_id}/decisions``: a different or
-    missing digest is ``409 decision_stale``; a wrong stage is
-    ``409 decision_stage_mismatch``; a closed window is ``409 decision_expired``."""
+    the proposal shown by ``GET /runs/{run_id}/decisions``; a ``publish`` decision
+    needs ``repos:publish``, a human distinct from the creator (and from the
+    scope approver where configured) and the ``publish_digest`` of the plan
+    shown. A different or missing digest is ``409 decision_stale``; a wrong
+    stage is ``409 decision_stage_mismatch``; a closed window is
+    ``409 decision_expired``."""
     return await service.approve(
-        run_id, body.approved, principal, stage=body.stage, scope_digest=body.scope_digest
+        run_id,
+        body.approved,
+        principal,
+        stage=body.stage,
+        scope_digest=body.scope_digest,
+        publish_digest=body.publish_digest,
     )
 
 
@@ -175,11 +183,12 @@ async def list_run_decisions(
         PendingDecisionRead(
             stage=view.pending.stage,
             scope_digest=view.pending.scope_digest,
+            publish_digest=view.pending.publish_digest,
             deadline=view.pending.deadline,
             proposal={
                 k: v
                 for k, v in view.pending.payload.items()
-                if k not in ("kind", "stage", "scope_digest", "deadline")
+                if k not in ("kind", "stage", "scope_digest", "publish_digest", "deadline")
             },
         )
         if view.pending is not None
@@ -196,7 +205,8 @@ async def list_run_decisions(
                 decided_by=d.decided_by,
                 decided_at=d.decided_at,
                 applied_at=d.applied_at,
-                scope_digest=d.scope_digest,
+                scope_digest=d.scope_digest if d.stage is not DecisionStage.PUBLISH else None,
+                publish_digest=d.scope_digest if d.stage is DecisionStage.PUBLISH else None,
             )
             for d in view.decisions
         ],

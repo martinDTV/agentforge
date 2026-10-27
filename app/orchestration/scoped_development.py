@@ -51,6 +51,7 @@ from app.projects import (
     injection_signals,
     matches_any,
 )
+from app.publishing import PublicationProgress
 from app.sandbox import SandboxPort
 from app.security import (
     AgentGrant,
@@ -79,6 +80,7 @@ from .development import (
     DevelopmentState,
     revise,
 )
+from .publication import PublicationNodes, PublicationRuntime
 
 SCOPE_STAGE = "scope"
 CONTEXT_FILES: tuple[str, ...] = ("README.md", "pyproject.toml", "package.json")
@@ -111,6 +113,16 @@ class DevelopmentRuntime:
     # before a run starts. Only the platform holds it; agents never see it.
     mirrors: MirrorService | None = None
     mirror_syncs: MirrorSyncRepository | None = None
+    # Fase 7, Paso 3 (ADR 0011): the Publisher. ``None`` = publication disabled:
+    # runs on remote repositories end ``completed`` and nothing leaves the host.
+    publisher: PublicationRuntime | None = None
+
+    async def runs_set_publication(self, run_id: UUID, progress: PublicationProgress) -> None:
+        """Record a non-progressing publication state (unavailable, failed at prepare)."""
+        if self.publisher is None:
+            return
+        stamped = progress.model_copy(update={"updated_at": self.publisher.clock()})
+        await self.publisher.runs.set_publication(run_id, stamped.as_json())
 
     def policy_for(self, state: DevelopmentState) -> RepositoryPolicy:
         return self.policies.require(state["repository_id"], state["project_id"])
@@ -456,6 +468,25 @@ def build_scoped_development_graph(
             return END
         return "developer"
 
+    publication = PublicationNodes(runtime)
+
+    def after_qa(state: DevelopmentState) -> str:
+        if state.get("error"):
+            return END
+        if state.get("completed"):
+            return "prepare_publication"
+        return "revise_development"
+
+    def after_prepare(state: DevelopmentState) -> str:
+        if state.get("error") or not state.get("publication_plan"):
+            return END
+        return "approve_publish"
+
+    def after_publish_decision(state: DevelopmentState) -> str:
+        if state.get("error") or state.get("publish_approved") is not True:
+            return END
+        return "publish"
+
     builder = StateGraph(DevelopmentState)
     builder.add_node("scoper", scoper_node)
     builder.add_node("approve_scope", approve_scope_node)
@@ -463,6 +494,9 @@ def build_scoped_development_graph(
     builder.add_node("apply_changes", apply_node)
     builder.add_node("qa", qa_node)
     builder.add_node("revise_development", revise)
+    builder.add_node("prepare_publication", publication.prepare_publication)
+    builder.add_node("approve_publish", publication.approve_publish)
+    builder.add_node("publish", publication.publish)
     builder.add_edge(START, "scoper")
     builder.add_conditional_edges(
         "scoper", after_scoper, {"approve_scope": "approve_scope", END: END}
@@ -480,8 +514,19 @@ def build_scoped_development_graph(
     )
     builder.add_conditional_edges(
         "qa",
-        lambda s: END if s.get("error") or s.get("completed") else "revise_development",
-        {"revise_development": "revise_development", END: END},
+        after_qa,
+        {
+            "revise_development": "revise_development",
+            "prepare_publication": "prepare_publication",
+            END: END,
+        },
     )
     builder.add_edge("revise_development", "developer")
+    builder.add_conditional_edges(
+        "prepare_publication", after_prepare, {"approve_publish": "approve_publish", END: END}
+    )
+    builder.add_conditional_edges(
+        "approve_publish", after_publish_decision, {"publish": "publish", END: END}
+    )
+    builder.add_edge("publish", END)
     return builder.compile(checkpointer=checkpointer or InMemorySaver())

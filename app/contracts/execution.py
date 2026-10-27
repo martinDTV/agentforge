@@ -34,6 +34,11 @@ class Approval(BaseModel):
         pattern=r"^[0-9a-f]{64}$",
         description="Required for ``scope``: digest of the exact proposal shown",
     )
+    publish_digest: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Required for ``publish``: digest of the exact publication plan shown",
+    )
 
 
 class DecisionRead(BaseModel):
@@ -43,11 +48,13 @@ class DecisionRead(BaseModel):
     decided_at: datetime
     applied_at: datetime | None
     scope_digest: str | None
+    publish_digest: str | None = None
 
 
 class PendingDecisionRead(BaseModel):
     stage: DecisionStage
     scope_digest: str | None
+    publish_digest: str | None = None
     deadline: datetime | None
     proposal: dict[str, Any] = Field(
         default_factory=dict, description="What the human must decide on (files, tests, limits)"

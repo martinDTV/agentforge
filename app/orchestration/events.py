@@ -26,6 +26,9 @@ EXECUTED_BY: dict[str, str] = {
     "developer": "agentforge:developer",
     "apply_changes": "agentforge:developer",
     "qa": "agentforge:qa",
+    # Publication steps are platform work, never an agent's (ADR 0011).
+    "prepare_publication": "agentforge:publisher",
+    "publish": "agentforge:publisher",
 }
 # Events that a human decision causes directly: attributed to that human.
 HUMAN_CAUSED: frozenset[RunEventKind] = frozenset(
@@ -197,6 +200,13 @@ def events_from_update(
             if approved_by is not None:
                 verdict["approved_by" if delta["approved"] else "rejected_by"] = approved_by
             events.append(RunEvent(kind=kind, payload=verdict))
+        elif node == "approve_publish" and "publish_approved" in delta:
+            decided = bool(delta["publish_approved"])
+            kind = RunEventKind.RUN_APPROVED if decided else RunEventKind.RUN_REJECTED
+            verdict = {"stage": "publish"}
+            if approved_by is not None:
+                verdict["approved_by" if decided else "rejected_by"] = approved_by
+            events.append(RunEvent(kind=kind, ordinal=1, payload=verdict))
     for event in events:
         object.__setattr__(event, "checkpoint_id", checkpoint_id)
         if event.kind is not RunEventKind.RUN_FAILED:
@@ -247,6 +257,19 @@ def transition_events(previous: RunLifecycleStatus, updated: PersistedRun) -> li
         return [RunEvent(kind=RunEventKind.RUN_REJECTED)]
     if status is RunLifecycleStatus.COMPLETED:
         return [RunEvent(kind=RunEventKind.RUN_COMPLETED)]
+    if status is RunLifecycleStatus.PUBLISHED:
+        publication = updated.publication or {}
+        return [
+            RunEvent(
+                kind=RunEventKind.RUN_PUBLISHED,
+                payload={
+                    "remote_branch": publication.get("remote_branch"),
+                    "pr_number": publication.get("pr_number"),
+                    "approved_by": publication.get("approved_by"),
+                    "executed_by": "agentforge:publisher",
+                },
+            )
+        ]
     if status is RunLifecycleStatus.CANCELLED:
         return [RunEvent(kind=RunEventKind.RUN_CANCELLED)]
     if status is RunLifecycleStatus.EXPIRED:
@@ -259,7 +282,7 @@ def _interrupt_payload(delta: Any) -> dict[str, Any]:
     for item in delta if isinstance(delta, tuple | list) else (delta,):
         if isinstance(item, Interrupt) and isinstance(item.value, dict):
             payload: dict[str, Any] = {}
-            for key in ("stage", "scope_digest", "deadline"):
+            for key in ("stage", "scope_digest", "publish_digest", "deadline"):
                 if item.value.get(key) is not None:
                     payload[key] = item.value[key]
             return payload

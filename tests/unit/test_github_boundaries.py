@@ -66,13 +66,20 @@ def test_agents_tools_sandbox_and_contracts_never_import_github_or_jwt():
     assert offenders == [], offenders
 
 
-def test_the_orchestration_reaches_github_only_through_the_mirror_service():
+def test_the_orchestration_reaches_github_only_through_platform_components():
+    """Only the Publisher's own module may hold GitHub tokens; every other
+    orchestration module reaches GitHub through MirrorService or not at all."""
     for path in (APP / "orchestration").rglob("*.py"):
+        if path.name == "publication.py":
+            continue
         text = path.read_text()
         assert "app.infrastructure.github" not in text, path
         assert "InstallationToken" not in text and ".reveal(" not in text, path
     text = (APP / "orchestration" / "scoped_development.py").read_text()
-    assert "MirrorService" in text  # the single platform-side entry point
+    assert "MirrorService" in text  # the single platform-side entry point for reads
+    publication = (APP / "orchestration" / "publication.py").read_text()
+    assert "askpass_credential(" in publication  # the token reaches one git subprocess only
+    assert "PUSH_PERMISSIONS" in publication and "revoke" in publication
 
 
 def test_no_tool_exposes_github_mirrors_or_push_to_a_model():
@@ -96,3 +103,29 @@ def test_the_askpass_helper_is_only_wired_by_the_mirror_fetch():
     for name in ("worktrees", "tools", "agents"):
         for path in (APP / name).rglob("*.py"):
             assert "askpass" not in path.read_text().lower(), path
+
+
+def test_publication_capabilities_stay_in_the_platform_layer():
+    """ADR 0011: agents, tools, sandbox and workspaces never import the publishing
+    packages; the only push lives in ``publish.py``; the agents' port keeps ``push`` disabled."""
+    sources = _sources()
+    offenders = []
+    for name, text in sources.items():
+        if name.startswith(("app/agents", "app/tools", "app/sandbox", "app/workspaces")):
+            if re.search(r"^\s*(from|import)\s+app\.publishing\b", text, re.M):
+                offenders.append((name, "app.publishing"))
+            if "GitPublisher" in text or "GitHubPublisher" in text or "PUSH_PERMISSIONS" in text:
+                offenders.append((name, "publisher"))
+        if "--force-with-lease" in text and name != "app/infrastructure/git/publish.py":
+            offenders.append((name, "force-with-lease"))
+        if re.search(r'"push",', text) and name != "app/infrastructure/git/publish.py":
+            offenders.append((name, "git push argv"))
+    assert offenders == [], offenders
+    local = sources["app/infrastructure/git/local.py"]
+    assert '"push_disabled"' in local  # the port agents use still refuses to push
+    names = set(default_registry(ToolLimits(), None, None).names())
+    assert not any(n.startswith(("publish", "github", "pull_request")) for n in names), names
+    # Write-scoped tokens exist only behind the explicit flag.
+    credentials = sources["app/infrastructure/github/credentials.py"]
+    assert "write_enabled" in credentials and "PUBLISH_PERMISSIONS" in credentials
+    assert "GITHUB_WRITE_ENABLED" in sources["app/settings.py"]

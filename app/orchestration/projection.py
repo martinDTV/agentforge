@@ -10,7 +10,7 @@ not the latest one. Terminal rows are never touched; a recorded decision
 
 from langgraph.types import StateSnapshot
 
-from app.contracts.lifecycle import TERMINAL_STATUSES, RunLifecycleStatus
+from app.contracts.lifecycle import TERMINAL_STATUSES, DecisionStage, RunLifecycleStatus
 from app.orchestration.ports import PersistedRun, RunProjection
 from app.orchestration.status import (
     checkpoint_id_of,
@@ -23,9 +23,24 @@ _S = RunLifecycleStatus
 _WAITING = frozenset({_S.WAITING_APPROVAL, _S.RESUME_PENDING})
 
 
-def resolve_status(current: RunLifecycleStatus, derived: RunLifecycleStatus) -> RunLifecycleStatus:
+def resolve_status(
+    current: RunLifecycleStatus,
+    derived: RunLifecycleStatus,
+    *,
+    positive_interrupt: bool = False,
+    next_stage: bool = False,
+) -> RunLifecycleStatus:
+    """``positive_interrupt``: the checkpoint itself says the work stopped (a
+    publication that failed transiently, ADR 0011), so even a recorded decision
+    may move to ``interrupted`` and wait for a retry. ``next_stage``: the graph
+    paused again at a *different* stage than the one just decided (scope ->
+    publish), which is forward progress, not a regression."""
     if current in TERMINAL_STATUSES:
         return current
+    if current is _S.RESUME_PENDING and derived is _S.INTERRUPTED and positive_interrupt:
+        return derived
+    if current is _S.RESUME_PENDING and derived is _S.WAITING_APPROVAL and next_stage:
+        return derived
     if current is _S.RESUME_PENDING and derived in (
         _S.WAITING_APPROVAL,
         _S.INTERRUPTED,
@@ -36,11 +51,25 @@ def resolve_status(current: RunLifecycleStatus, derived: RunLifecycleStatus) -> 
 
 
 def build_projection(
-    snapshot: StateSnapshot, *, current: RunLifecycleStatus, in_flight: bool
+    snapshot: StateSnapshot,
+    *,
+    current: RunLifecycleStatus,
+    in_flight: bool,
+    current_stage: DecisionStage | None = None,
 ) -> RunProjection:
     values = snapshot.values
-    status = resolve_status(current, derive_status(snapshot, in_flight=in_flight))
-    pending = pending_decision(snapshot) if status in _WAITING else None
+    derived = derive_status(snapshot, in_flight=in_flight)
+    pending = pending_decision(snapshot) if derived in _WAITING else None
+    status = resolve_status(
+        current,
+        derived,
+        positive_interrupt=values.get("publication_interrupted") is True,
+        next_stage=(
+            pending is not None and current_stage is not None and pending.stage is not current_stage
+        ),
+    )
+    if status not in _WAITING:
+        pending = None
     return RunProjection(
         status=status,
         revision=values.get("revision", 0),

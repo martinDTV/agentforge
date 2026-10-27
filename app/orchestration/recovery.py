@@ -102,6 +102,18 @@ class RecoveryService:
             logger.warning("Barrido de recuperación sin base de datos: %s", exc.message)
             report.errors += 1
             return report
+        try:
+            # Publications stopped midway or failed transiently (ADR 0011): idempotent
+            # re-drive, no model cost, bounded by max_attempts in ``recover``.
+            if projects is None:
+                claimed = list(claimed) + await service.repository.claim_interrupted_publications(
+                    owner=service.owner,
+                    ttl_seconds=service.policy.lease_ttl_seconds,
+                    limit=service.policy.batch_size,
+                )
+        except DatabaseUnavailableError as exc:
+            logger.warning("Barrido de publicaciones sin base de datos: %s", exc.message)
+            report.errors += 1
         report.claimed = len(claimed)
         for row, lease in claimed:
             try:

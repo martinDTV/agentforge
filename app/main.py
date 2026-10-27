@@ -15,18 +15,22 @@ from app.infrastructure.db import (
     Database,
     DatabaseUnavailableError,
     InMemoryMirrorSyncRepository,
+    InMemoryPublicationRepository,
     InMemoryRunRepository,
     InMemoryToolInvocationRepository,
     SqlAlchemyMirrorSyncRepository,
+    SqlAlchemyPublicationRepository,
     SqlAlchemyRunRepository,
     SqlAlchemyToolInvocationRepository,
     verify_schema,
 )
 from app.infrastructure.git import LocalGitAdapter
 from app.infrastructure.git.mirror import MirrorService
+from app.infrastructure.git.publish import GitPublisher
 from app.infrastructure.github import (
     GitHubAppCredentials,
     GitHubClient,
+    GitHubPublisher,
     InstallationTokenProvider,
 )
 from app.infrastructure.llm import build_llm
@@ -36,6 +40,7 @@ from app.orchestration.graph import RunGraph, build_graph
 from app.orchestration.limits import RunLimits
 from app.orchestration.policy import RecoveryPolicy
 from app.orchestration.ports import PersistedRun, RunRepository
+from app.orchestration.publication import PublicationRuntime
 from app.orchestration.recovery import RecoveryService
 from app.orchestration.runs import RunService
 from app.orchestration.scoped_development import (
@@ -115,6 +120,7 @@ def create_app(
     sandbox: SandboxPort | None = None,
     projects: ProjectPolicyRegistry | None = None,
     mirrors: MirrorService | None = None,
+    publisher: PublicationRuntime | None = None,
     docs_enabled: bool | None = None,
     shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
     startup_sweep: bool | None = None,
@@ -161,6 +167,11 @@ def create_app(
         sandbox_port = sandbox
         policies = projects
         mirror_service = mirrors
+        publication_runtime = publisher
+        publication_parts: tuple[LocalGitAdapter, GitHubClient, InstallationTokenProvider] | None
+        publication_parts = None
+        publish_allowed: frozenset[str] = frozenset()
+        publish_distinct = False
         execution_policy = ExecutionPolicy()
         if port is None:
             settings = get_settings()
@@ -193,15 +204,25 @@ def create_app(
                     github = GitHubClient(
                         settings.github_api_url, timeout_seconds=settings.github_timeout_seconds
                     )
+                    # Write scopes exist only behind GITHUB_WRITE_ENABLED (ADR 0011):
+                    # the same provider serves read tokens for mirrors and, when the
+                    # flag is on, the Publisher's narrowed write tokens.
+                    tokens = InstallationTokenProvider(
+                        github, credentials, write_enabled=settings.github_write_enabled
+                    )
                     mirror_service = MirrorService(
                         git=git_adapter,
                         repositories_root=settings.git_repositories_root,
                         policies=policies,
                         github=github,
-                        tokens=InstallationTokenProvider(github, credentials),
+                        tokens=tokens,
                         registry=registry,
                         fetch_timeout_seconds=settings.mirror_fetch_timeout_seconds,
                     )
+                    if settings.github_write_enabled:
+                        publication_parts = (git_adapter, github, tokens)
+                        publish_allowed = frozenset(settings.publish_allowed_repositories)
+                publish_distinct = settings.publish_distinct_approver
             if verifier is None:
                 verifier = (
                     JwtVerifier.from_settings(settings)
@@ -209,7 +230,10 @@ def create_app(
                     else DisabledAuthentication()
                 )
             if authz is None:
-                authz = AuthorizationPolicy(separation_of_duties=settings.separation_of_duties)
+                authz = AuthorizationPolicy(
+                    separation_of_duties=settings.separation_of_duties,
+                    publish_distinct_approver=settings.publish_distinct_approver,
+                )
             run_limits = run_limits or RunLimits(
                 max_revisions=settings.max_plan_revisions,
                 max_llm_calls=settings.max_llm_calls_per_run,
@@ -232,6 +256,23 @@ def create_app(
         planning_graph = build_graph(port, run_limits or RunLimits(), checkpointer=saver)
         graphs: dict[WorkflowKind, RunGraph] = {WorkflowKind.PLANNING: planning_graph}
         runtime: DevelopmentRuntime | None = None
+        if publication_runtime is None and publication_parts is not None:
+            git_for_publish, github_for_publish, tokens_for_publish = publication_parts
+            publication_runtime = PublicationRuntime(
+                git=GitPublisher(
+                    git_for_publish,
+                    push_timeout_seconds=get_settings().publish_push_timeout_seconds,
+                ),
+                github=GitHubPublisher(github_for_publish, tokens_for_publish),
+                tokens=tokens_for_publish,
+                audit=(
+                    SqlAlchemyPublicationRepository(db.session_factory)
+                    if db is not None
+                    else InMemoryPublicationRepository()
+                ),
+                runs=repo,
+                allowed_repositories=publish_allowed,
+            )
         if policies is not None and manager is not None:
             # The governed development workflow (ADR 0009) exists only when the
             # operator configured both repositories and their policies. Agent
@@ -257,6 +298,7 @@ def create_app(
                     if db is not None
                     else InMemoryMirrorSyncRepository()
                 ),
+                publisher=publication_runtime,
             )
             graphs[WorkflowKind.DEVELOPMENT] = build_scoped_development_graph(
                 runtime, checkpointer=saver
@@ -300,6 +342,8 @@ def create_app(
         app.state.run_service = service
         app.state.projects = policies
         app.state.mirrors = mirror_service
+        app.state.publisher = publication_runtime
+        del publish_distinct  # consumed through ``authz``; kept explicit for readers
         app.state.tool_gateway = tool_gateway
         app.state.worktrees = manager
         app.state.sandbox = sandbox_port
