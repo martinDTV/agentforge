@@ -1,6 +1,6 @@
 # 0011. Publisher: rama de ejecución y Pull Request en borrador tras una aprobación humana de publicación (Fase 7, Paso 3)
 
-- Status: accepted (aprobado el 2026-10-27 con las cinco decisiones de la sección final; etapas **3.1–3.3 implementadas y validadas con una API de GitHub simulada**; la etapa 3.4, la primera publicación real, espera autorización; la GitHub App sigue con `contents:read` + `metadata:read` y `GITHUB_WRITE_ENABLED` permanece desactivado)
+- Status: accepted (aprobado el 2026-10-27 con las cinco decisiones de la sección final; etapas **3.1–3.3 implementadas y validadas con una API de GitHub simulada**; la etapa 3.4 fue autorizada el 2026-10-27 solo para `agentforge-sandbox-demo` y está detenida en sus comprobaciones previas: la instalación sigue en solo lectura y GitHub no expone protección de ramas en un repositorio privado de plan gratuito (`branch_rules_unavailable`), ver `docs/validation/fase7-paso3-criterios.md`; la GitHub App sigue con `contents:read` + `metadata:read` y `GITHUB_WRITE_ENABLED` permanece desactivado)
 - Date: 2026-10-27
 - Deciders: martin, Claude (Fase 7)
 
