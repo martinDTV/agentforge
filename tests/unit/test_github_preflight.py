@@ -214,3 +214,62 @@ def test_main_refuses_without_git_configuration(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr("app.settings.get_settings", lambda: Unconfigured())
     assert preflight.main(["--repository", REPO, "--project", PROJECT]) == 2
     assert "git_unconfigured" in capsys.readouterr().err
+
+
+def test_expect_publish_requires_write_grants_the_flag_and_a_protected_base(tmp_path: Path):
+    from app.infrastructure.github import InstallationTokenProvider
+
+    lab = Lab(tmp_path)
+    lab.service.create(REPO, PROJECT)
+    # Read-only installation, flag off: publish expectations fail on both counts.
+    report = run_preflight(deps_for(lab), repository_id=REPO, project_id=PROJECT, expect="publish")
+    checks = by_name(report)
+    assert not report["ok"]
+    assert checks["write_flag"]["ok"] is False and checks["write_flag"]["expect"] == "publish"
+    assert checks["installation_restricted"]["missing_permissions"] == ["contents", "pull_requests"]
+    assert checks["installation_restricted"]["expected_permissions"] == {
+        "contents": "write",
+        "pull_requests": "write",
+        "metadata": "read",
+    }
+    # A read token still reads the rules: none configured yet on the simulated repository.
+    assert checks["base_branch_protected"]["ok"] is False
+    assert checks["base_branch_protected"]["missing_rules"] == [
+        "pull_request",
+        "non_fast_forward",
+        "deletion",
+    ]
+    # Grants and flag in place, but GitHub cannot expose rules (free plan): stop.
+    lab.github.app_permissions = {"contents": "write", "pull_requests": "write", "metadata": "read"}
+    lab.github.branch_rules = None
+    lab.tokens = InstallationTokenProvider(
+        lab.client, lab.credentials, write_enabled=True, clock=lab.clock
+    )
+    deps = deps_for(lab, write_enabled=True, allowed_repositories=frozenset({REPO}))
+    checks = by_name(run_preflight(deps, repository_id=REPO, project_id=PROJECT, expect="publish"))
+    assert checks["write_flag"]["ok"] and checks["installation_restricted"]["ok"]
+    assert checks["base_branch_protected"]["ok"] is False
+    assert checks["base_branch_protected"]["error"] == "branch_rules_unavailable"
+    # Rules present but incomplete; then complete: ok.
+    lab.github.branch_rules = {"main": ["pull_request"]}
+    checks = by_name(run_preflight(deps, repository_id=REPO, project_id=PROJECT, expect="publish"))
+    assert checks["base_branch_protected"]["missing_rules"] == ["non_fast_forward", "deletion"]
+    lab.github.branch_rules = {"main": ["pull_request", "non_fast_forward", "deletion"]}
+    report = run_preflight(deps, repository_id=REPO, project_id=PROJECT, expect="publish")
+    assert report["ok"], json.dumps(report, indent=1)
+    assert by_name(report)["base_branch_protected"]["rules"] == [
+        "deletion",
+        "non_fast_forward",
+        "pull_request",
+    ]
+    # The repository must be in the allowlist when one is configured; in read mode the
+    # write flag must be off.
+    narrowed = deps_for(lab, write_enabled=True, allowed_repositories=frozenset({"other"}))
+    assert not by_name(
+        run_preflight(narrowed, repository_id=REPO, project_id=PROJECT, expect="publish")
+    )["write_flag"]["ok"]
+    assert not by_name(run_preflight(deps, repository_id=REPO, project_id=PROJECT))["write_flag"][
+        "ok"
+    ]
+    with pytest.raises(Exception, match="modo desconocido"):
+        run_preflight(deps, repository_id=REPO, project_id=PROJECT, expect="merge")

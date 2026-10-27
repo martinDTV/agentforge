@@ -96,6 +96,9 @@ class FakeGitHub:
         # fake see those branches when a pull request is created.
         self.branch_resolver: Callable[[str], str | None] | None = None
         self.revoked_by_api: list[str] = []
+        # ``GET /repos/{o}/{n}/rules/branches/{b}``: rule types per branch; ``None`` = the
+        # plan does not expose rulesets (GitHub answers 403 "Upgrade to GitHub Pro").
+        self.branch_rules: dict[str, list[str]] | None = {}
         self.tokens: dict[str, dict[str, Any]] = {}
         self.revoked: set[str] = set()
         self.reject_app_jwt = False
@@ -144,6 +147,15 @@ class FakeGitHub:
             return httpx.Response(204)
         if path.startswith("/repos/") and path.endswith("/pulls"):
             return self._pulls(request, token, path)
+        if request.method == "GET" and path.startswith("/repos/") and "/rules/branches/" in path:
+            if self.branch_rules is None:
+                return httpx.Response(
+                    403, json={"message": "Upgrade to GitHub Pro or make this repository public"}
+                )
+            branch = path.rsplit("/", 1)[1]
+            return httpx.Response(
+                200, json=[{"type": t, "ruleset_id": 1} for t in self.branch_rules.get(branch, [])]
+            )
         if request.method == "GET" and path.startswith("/repos/") and "/branches/" in path:
             _, _, owner, name, _, branch = path.split("/", 5)
             if name not in token["repositories"]:

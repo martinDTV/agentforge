@@ -15,7 +15,12 @@ with the operator policy:
 - the local mirror (when it exists): marker identity, ``origin`` URL, local head
   versus marker ``base_sha`` versus remote head;
 - a leak scan: no ``ghs_`` token under the Git roots, in the marker, in the
-  mirror's config or (with ``--scan-db``) in events, audit and checkpoints.
+  mirror's config or (with ``--scan-db``) in events, audit and checkpoints;
+- with ``--expect publish`` (Fase 7, etapa 3.4): the installation must grant
+  exactly ``contents: write`` + ``pull_requests: write`` + ``metadata: read``,
+  ``GITHUB_WRITE_ENABLED`` must be on with the repository in
+  ``PUBLISH_ALLOWED_REPOSITORIES``, and the base branch must be protected by
+  rulesets that require a pull request and block force pushes and deletions.
 
 Prints one JSON report; exit 0 when every check passed, 1 otherwise, 2 on misuse.
 
@@ -39,6 +44,7 @@ from app.git.remote import RemoteSpec
 from app.infrastructure.git import LocalGitAdapter
 from app.infrastructure.git.mirror import MirrorService
 from app.infrastructure.github import (
+    PUBLISH_PERMISSIONS,
     READ_ONLY_PERMISSIONS,
     GitHubAppCredentials,
     GitHubClient,
@@ -52,6 +58,11 @@ TOKEN_PATTERN = re.compile(rb"ghs_[A-Za-z0-9]{30,}")
 FORBIDDEN_PERMISSIONS = frozenset(
     {"workflows", "administration", "secrets", "actions", "members", "organization_administration"}
 )
+EXPECTATIONS: dict[str, dict[str, str]] = {
+    "read": dict(READ_ONLY_PERMISSIONS),
+    "publish": dict(PUBLISH_PERMISSIONS),
+}
+REQUIRED_BASE_RULES = ("pull_request", "non_fast_forward", "deletion")
 MAX_SCAN_FILE_BYTES = 8 * 1024 * 1024
 
 
@@ -77,6 +88,8 @@ class PreflightDeps:
     scan_roots: list[Path] = field(default_factory=list)
     scan_database: Callable[[], list[dict[str, Any]]] | None = None
     credentials_error: str | None = None
+    write_enabled: bool = False
+    allowed_repositories: frozenset[str] = frozenset()
 
 
 class PreflightRefused(Exception):
@@ -130,9 +143,30 @@ def _scan_files(roots: Iterable[Path]) -> list[str]:
     return list(hits)
 
 
-def run_preflight(deps: PreflightDeps, *, repository_id: str, project_id: str) -> dict[str, Any]:
+def run_preflight(
+    deps: PreflightDeps, *, repository_id: str, project_id: str, expect: str = "read"
+) -> dict[str, Any]:
+    if expect not in EXPECTATIONS:
+        raise PreflightRefused("expect", f"modo desconocido: {expect}")
+    expected = EXPECTATIONS[expect]
     checks: list[Check] = []
     checks.append(_key_file_check(deps.key_file, deps.credentials_error))
+    checks.append(
+        Check(
+            "write_flag",
+            (deps.write_enabled is (expect == "publish"))
+            and (
+                expect == "read"
+                or not deps.allowed_repositories
+                or repository_id in deps.allowed_repositories
+            ),
+            {
+                "expect": expect,
+                "github_write_enabled": deps.write_enabled,
+                "allowed_repositories": sorted(deps.allowed_repositories),
+            },
+        )
+    )
 
     try:
         policy = deps.policies.require(repository_id, project_id)
@@ -187,12 +221,8 @@ def run_preflight(deps: PreflightDeps, *, repository_id: str, project_id: str) -
     remote_head: str | None = None
     try:
         info = deps.client.installation(deps.credentials.app_jwt(), spec.installation_id)
-        unexpected = {
-            k: v for k, v in info.permissions.items() if READ_ONLY_PERMISSIONS.get(k) != v
-        }
-        missing = sorted(
-            k for k, v in READ_ONLY_PERMISSIONS.items() if info.permissions.get(k) != v
-        )
+        unexpected = {k: v for k, v in info.permissions.items() if expected.get(k) != v}
+        missing = sorted(k for k, v in expected.items() if info.permissions.get(k) != v)
         forbidden = sorted(set(info.permissions) & FORBIDDEN_PERMISSIONS)
         checks.append(
             Check(
@@ -213,6 +243,7 @@ def run_preflight(deps: PreflightDeps, *, repository_id: str, project_id: str) -
                     "installation_id": info.id,
                     "account": info.account,
                     "repository_selection": info.repository_selection,
+                    "expected_permissions": expected,
                     "permissions": info.permissions,
                     "missing_permissions": missing,
                     "unexpected_permissions": unexpected,
@@ -249,13 +280,18 @@ def run_preflight(deps: PreflightDeps, *, repository_id: str, project_id: str) -
             identity_detail["error"] = exc.code
             checks.append(Check("repository_identity", False, identity_detail))
         else:
-            checks.append(Check("repository_identity", observed.private, identity_detail))
+            # Visibility is the operator's decision (the sandbox was made public to get
+            # rulesets on a free plan); it is reported, never a failure by itself.
+            identity_detail["visibility"] = "private" if observed.private else "public"
+            checks.append(Check("repository_identity", True, identity_detail))
         remote_head = deps.client.branch_head(
             token.reveal(), spec.owner, spec.name, spec.default_branch
         )
         checks.append(
             Check("remote_head", True, {"branch": spec.default_branch, "sha": remote_head})
         )
+        if expect == "publish":
+            checks.append(_base_protection_check(deps.client, token.reveal(), spec))
     except GitHubError as exc:
         checks.append(Check("github", False, {"error": exc.code, "detail": exc.detail}))
 
@@ -270,6 +306,34 @@ def run_preflight(deps: PreflightDeps, *, repository_id: str, project_id: str) -
         hits = hits + [str(r) for r in rows]
     checks.append(Check("no_token_leaks", not hits, leak))
     return _report(repository_id, project_id, checks)
+
+
+def _base_protection_check(client: GitHubClient, token: str, spec: RemoteSpec) -> Check:
+    """``main`` must be protected by rulesets the App cannot bypass (ADR 0011 §5).
+
+    The REST API lists the rules that apply to the branch but not the bypass
+    actors; those are confirmed by the operator in the ruleset settings. When
+    GitHub does not expose rules at all (private repository on a free plan) the
+    check fails with ``branch_rules_unavailable``: protection cannot be verified."""
+    try:
+        rules = client.branch_rules(token, spec.owner, spec.name, spec.default_branch)
+    except GitHubError as exc:
+        return Check(
+            "base_branch_protected",
+            False,
+            {"branch": spec.default_branch, "error": exc.code, "detail": exc.detail},
+        )
+    missing = [rule for rule in REQUIRED_BASE_RULES if rule not in rules]
+    return Check(
+        "base_branch_protected",
+        not missing,
+        {
+            "branch": spec.default_branch,
+            "rules": rules,
+            "missing_rules": missing,
+            "note": "los actores con bypass no son visibles por la API; confirmarlos en Settings",
+        },
+    )
 
 
 def _mirror_check(
@@ -366,6 +430,8 @@ def deps_from_settings(*, scan_db: bool, extra_scan: Sequence[str]) -> Preflight
         roots.append(settings.worktrees_root)
     roots.extend(Path(p) for p in extra_scan)
     scanner = (lambda: scan_database(settings.database_dsn.get_secret_value())) if scan_db else None
+    if credentials is not None and client is not None and settings.github_write_enabled:
+        tokens = InstallationTokenProvider(client, credentials, write_enabled=True)
     return PreflightDeps(
         policies=policies,
         registry=registry,
@@ -377,6 +443,8 @@ def deps_from_settings(*, scan_db: bool, extra_scan: Sequence[str]) -> Preflight
         scan_roots=roots,
         scan_database=scanner,
         credentials_error=error,
+        write_enabled=settings.github_write_enabled,
+        allowed_repositories=frozenset(settings.publish_allowed_repositories),
     )
 
 
@@ -432,6 +500,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--scan", action="append", default=[], help="extra file or directory to scan"
     )
+    parser.add_argument(
+        "--expect",
+        choices=sorted(EXPECTATIONS),
+        default="read",
+        help="read: mirrors only (default); publish: etapa 3.4 write permissions and protection",
+    )
     args = parser.parse_args(argv)
     try:
         deps = deps_from_settings(scan_db=args.scan_db, extra_scan=args.scan)
@@ -441,7 +515,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:  # Settings validation
         print(json.dumps({"refused": "settings_invalid", "detail": str(exc)}), file=sys.stderr)
         return 2
-    report = run_preflight(deps, repository_id=args.repository, project_id=args.project)
+    try:
+        report = run_preflight(
+            deps, repository_id=args.repository, project_id=args.project, expect=args.expect
+        )
+    except PreflightRefused as exc:
+        print(json.dumps({"refused": exc.code, "detail": exc.detail}), file=sys.stderr)
+        return 2
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 1
 

@@ -180,6 +180,31 @@ class GitHubClient:
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise GitHubError("github_protocol_error", "respuesta de instalación ilegible") from exc
 
+    def branch_rules(self, token: str, owner: str, name: str, branch: str) -> list[str]:
+        """Rule types active on ``branch`` through repository rulesets (read-only).
+
+        GitHub only offers rulesets and branch protection on private repositories
+        of paid plans; the 403 it returns then becomes ``branch_rules_unavailable``
+        so the preflight can say exactly why ``main`` cannot be verified."""
+        try:
+            response = self._request(
+                "GET",
+                f"/repos/{owner}/{name}/rules/branches/{branch}",
+                bearer=token,
+                purpose="rules",
+            )
+        except GitHubError as exc:
+            if exc.code == "installation_forbidden":
+                raise GitHubError(
+                    "branch_rules_unavailable",
+                    "GitHub no expone reglas de rama para este repositorio (plan o permisos)",
+                ) from exc
+            raise
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise GitHubError("github_protocol_error", "reglas de rama ilegibles")
+        return sorted({str(item.get("type")) for item in payload if isinstance(item, dict)})
+
     def branch_head(self, token: str, owner: str, name: str, branch: str) -> str:
         """Current commit of ``branch`` as GitHub sees it (``contents: read``)."""
         response = self._request(
