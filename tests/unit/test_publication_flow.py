@@ -61,8 +61,10 @@ class PublishWorld(MirrorWorld):
         write_enabled: bool = True,
         installation_writes: bool = True,
         allowed: frozenset[str] = frozenset(),
+        notifications: object | None = None,
+        outbox: object | None = None,
     ) -> None:
-        super().__init__(tmp_path)
+        super().__init__(tmp_path, notifications=notifications, outbox=outbox)
         fake = self.lab.github
         if installation_writes:
             fake.app_permissions = {
@@ -460,3 +462,59 @@ async def test_without_the_write_flag_an_allowlist_or_the_grant_nothing_is_publi
     assert failed.error.code == "token_request_rejected"
     assert world3.agentforge_branches() == {} and world3.lab.github.pulls == {}
     assert failed.publication is not None and failed.publication["retryable"] is False
+
+
+async def test_a_full_run_mails_both_approvals_and_the_pull_request_without_event_collisions(
+    tmp_path: Path,
+):
+    """The daily flow end to end with the default ``priority`` level: scope pending,
+    publish pending, run completed, pull request opened and run published reach the
+    outbox; every (kind, ordinal) pair of run_events is unique, so the second human
+    decision never collides with the first (the 2026-10-27 incident)."""
+    from datetime import UTC, datetime
+
+    from app.infrastructure.db import InMemoryNotificationOutbox
+    from app.infrastructure.notifications import FakeEmailSender
+    from app.notifications import (
+        NotificationEnqueuer,
+        NotificationKind,
+        NotificationPolicy,
+        NotificationWorker,
+    )
+
+    clock = lambda: datetime(2026, 10, 27, 9, 0, tzinfo=UTC)  # noqa: E731
+    outbox = InMemoryNotificationOutbox(clock)
+    enqueuer = NotificationEnqueuer(
+        NotificationPolicy(base_url="http://127.0.0.1:8011"),
+        recipients=["martin@example.com"],
+    )
+    assert enqueuer.level == "priority"
+    world = PublishWorld(tmp_path, notifications=enqueuer, outbox=outbox)
+    service = world.service()
+    run_id, digest = await world.up_to_publish(service)
+    done = await service.approve(run_id, True, PAULA, publish_digest=digest)
+    assert done.status is S.PUBLISHED and done.publication is not None
+    events = await world.repository.list_events(uuid.UUID(run_id), after_id=None, limit=300)
+    pairs = [(e.kind, e.ordinal) for e in events]
+    assert len(pairs) == len(set(pairs)), "run_events natural key must stay unique"
+    by_kind = {k: sorted(o for kk, o in pairs if kk == k) for k, _ in pairs}
+    assert by_kind[RunEventKind.WAITING_APPROVAL] == [1, 2]
+    assert by_kind[RunEventKind.APPROVAL_RECORDED] == [1, 2]
+    assert by_kind[RunEventKind.APPROVAL_APPLIED] == [1, 2]
+    # The scope decision is audited by approval_recorded/applied; the graph itself
+    # emits run_approved only for the publish node.
+    assert by_kind[RunEventKind.RUN_APPROVED] == [2]
+    mails = [i.kind for i in sorted(await outbox.list_items(limit=100), key=lambda i: i.id)]
+    assert mails == [
+        NotificationKind.SCOPE_PENDING,
+        NotificationKind.RUN_COMPLETED,
+        NotificationKind.PUBLISH_PENDING,
+        NotificationKind.PULL_REQUEST_OPENED,
+        NotificationKind.RUN_PUBLISHED,
+    ]
+    sender = FakeEmailSender()
+    report = await NotificationWorker(outbox, sender, clock=clock).run_once()
+    assert report.sent == 5
+    opened = next(m for m in sender.sent if "Pull Request" in m.subject)
+    assert done.publication["pr_url"] in opened.text and "ghs_" not in opened.text
+    assert all(m.references == sender.sent[0].references for m in sender.sent)  # one thread

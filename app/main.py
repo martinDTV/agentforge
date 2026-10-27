@@ -274,6 +274,7 @@ def create_app(
                     NotificationPolicy(base_url=settings.agentforge_public_url),
                     recipients=settings.agentforge_email_to,
                     domain=settings.agentforge_email_from.split("@", 1)[-1],
+                    level=settings.notifications_level,
                 )
                 sender = sender or SmtpEmailSender(
                     host=settings.agentforge_smtp_host,
