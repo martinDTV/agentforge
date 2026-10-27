@@ -86,6 +86,16 @@ class FakeGitHub:
         # ``GET /repos/{o}/{n}/branches/{b}``: branch -> sha; a callable answers dynamically.
         self.branch_heads: dict[str, str] | Callable[[str], str | None] = {}
         self.installation_lists_nothing = False
+        # Pull requests by number; ``pulls_fail_next`` injects statuses for POST /pulls only;
+        # ``lose_create_response`` makes the POST succeed but the response never arrive.
+        self.pulls: dict[int, dict[str, Any]] = {}
+        self.pulls_fail_next: list[int] = []
+        self.lose_create_response = 0
+        self.branches: dict[str, str] = {}  # remote branches known to the fake (name -> sha)
+        # Flow tests push over file:// to a local repository; this callable lets the REST
+        # fake see those branches when a pull request is created.
+        self.branch_resolver: Callable[[str], str | None] | None = None
+        self.revoked_by_api: list[str] = []
         self.tokens: dict[str, dict[str, Any]] = {}
         self.revoked: set[str] = set()
         self.reject_app_jwt = False
@@ -128,6 +138,12 @@ class FakeGitHub:
             names = [] if self.installation_lists_nothing else token["repositories"]
             repos = [self.installation_repositories[n] for n in names]
             return httpx.Response(200, json={"total_count": len(repos), "repositories": repos})
+        if request.method == "DELETE" and path == "/installation/token":
+            self.revoked.add(bearer)
+            self.revoked_by_api.append(bearer)
+            return httpx.Response(204)
+        if path.startswith("/repos/") and path.endswith("/pulls"):
+            return self._pulls(request, token, path)
         if request.method == "GET" and path.startswith("/repos/") and "/branches/" in path:
             _, _, owner, name, _, branch = path.split("/", 5)
             if name not in token["repositories"]:
@@ -220,15 +236,24 @@ class FakeGitHub:
         unknown = [r for r in repositories if r not in self.installation_repositories]
         if unknown:
             return httpx.Response(422, json={"message": "repository not in installation"})
-        too_much = {k: v for k, v in permissions.items() if ALLOWED_PERMISSIONS.get(k) != v}
+        levels = {"read": 0, "write": 1}
+        too_much = {
+            k: v
+            for k, v in permissions.items()
+            if k not in self.app_permissions
+            or levels.get(v, 9) > levels.get(self.app_permissions[k], -1)
+        }
         if too_much:
-            return httpx.Response(422, json={"message": "permission not granted to the App"})
+            return httpx.Response(
+                422,
+                json={"message": "The permissions requested are not granted to this installation."},
+            )
         value = "ghs_" + secrets.token_hex(20)
         expires = self.clock() + self.token_ttl
         self.tokens[value] = {
             "expires_at": expires,
             "repositories": repositories or list(self.installation_repositories),
-            "permissions": permissions or dict(ALLOWED_PERMISSIONS),
+            "permissions": permissions or dict(self.app_permissions),
         }
         return httpx.Response(
             201,
@@ -239,6 +264,53 @@ class FakeGitHub:
                 "repository_selection": "selected",
             },
         )
+
+    def _pulls(self, request: httpx.Request, token: dict[str, Any], path: str) -> httpx.Response:
+        _, _, owner, name, _ = path.split("/", 4)
+        if name not in token["repositories"]:
+            return httpx.Response(404, json={"message": "Not Found"})
+        if request.method == "GET":
+            if token["permissions"].get("pull_requests") not in ("read", "write"):
+                return httpx.Response(403, json={"message": "Resource not accessible"})
+            head = request.url.params.get("head", "")
+            branch = head.split(":", 1)[1] if ":" in head else head
+            items = [p for p in self.pulls.values() if p["head"]["ref"] == branch]
+            items.sort(key=lambda p: p["number"], reverse=True)
+            return httpx.Response(200, json=items)
+        if request.method != "POST":
+            return httpx.Response(405, json={"message": "Method Not Allowed"})
+        if token["permissions"].get("pull_requests") != "write":
+            return httpx.Response(403, json={"message": "Resource not accessible by integration"})
+        if self.pulls_fail_next:
+            return httpx.Response(self.pulls_fail_next.pop(0), json={"message": "simulated"})
+        import json as _json
+
+        body = _json.loads(request.read())
+        head_ref = str(body.get("head", ""))
+        head_sha = self.branches.get(head_ref)
+        if head_sha is None and self.branch_resolver is not None:
+            head_sha = self.branch_resolver(head_ref)
+        if head_sha is None:
+            return httpx.Response(422, json={"message": "Validation Failed: head invalid"})
+        if any(p["head"]["ref"] == head_ref and p["state"] == "open" for p in self.pulls.values()):
+            return httpx.Response(422, json={"message": "A pull request already exists"})
+        number = max(self.pulls, default=0) + 1
+        pr = {
+            "number": number,
+            "html_url": f"https://github.com/{owner}/{name}/pull/{number}",
+            "state": "open",
+            "draft": bool(body.get("draft")),
+            "title": body.get("title"),
+            "body": body.get("body"),
+            "node_id": f"PR_{number}",
+            "head": {"ref": head_ref, "sha": head_sha},
+            "base": {"ref": body.get("base")},
+        }
+        self.pulls[number] = pr
+        if self.lose_create_response > 0:
+            self.lose_create_response -= 1
+            raise httpx.ReadTimeout("response lost after the pull request was created")
+        return httpx.Response(201, json=pr)
 
     def _token(self, bearer: str) -> dict[str, Any] | None:
         token = self.tokens.get(bearer)

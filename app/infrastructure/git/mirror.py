@@ -198,6 +198,7 @@ class MirrorService:
         self._same_remote(path, spec)
         token, _observed = self._verify_remote(spec)
         checked_at = self._clock()
+        self._git.configure_remote(path, self._url_for(spec))  # idempotent: url + refspec
         token = self._fetch(path, spec, token)
         base = self._base_sha(path, spec)
         record = existing.model_copy(
@@ -221,7 +222,7 @@ class MirrorService:
                 raise MirrorError("mirror_missing", f"no existe espejo para {spec.full_name}")
             self._same_identity(existing, policy, spec)
             self._same_remote(path, spec)
-            local = self._base_sha(path, spec)
+            local = self._local_head(path, spec)
             if existing.base_sha is not None and local != existing.base_sha:
                 raise MirrorError(
                     "mirror_base_mismatch",
@@ -337,8 +338,23 @@ class MirrorService:
         raise AssertionError("unreachable")
 
     def _base_sha(self, path: Path, spec: RemoteSpec) -> str:
-        heads = self._git.branch_heads(path)
-        sha = heads.get(spec.default_branch)
+        """After a fetch: copy the remote default branch to the local one and return it.
+
+        Remote branches live under ``refs/remotes/origin/*``; only the default
+        branch is materialised as a local head (worktrees start from it). Local
+        ``run/<run_id>`` branches are never touched by a fetch or a prune."""
+        tracked = self._git.remote_tracking_heads(path)
+        sha = tracked.get(spec.default_branch)
+        if sha is None:
+            raise MirrorError(
+                "mirror_base_missing",
+                f"el remoto de {spec.full_name} no tiene la rama '{spec.default_branch}'",
+            )
+        self._git.set_branch(path, spec.default_branch, sha)
+        return sha
+
+    def _local_head(self, path: Path, spec: RemoteSpec) -> str:
+        sha = self._git.branch_heads(path).get(spec.default_branch)
         if sha is None:
             raise MirrorError(
                 "mirror_base_missing",

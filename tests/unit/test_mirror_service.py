@@ -74,7 +74,7 @@ class Lab:
 
     def __init__(self, tmp_path: Path, *, policy: RepositoryPolicy | None = None) -> None:
         self.tmp = tmp_path
-        tmp_path.mkdir(exist_ok=True)
+        tmp_path.mkdir(parents=True, exist_ok=True)
         self.home = tmp_path / "home"
         self.home.mkdir()
         self.remote = seed_repository(tmp_path / "remote", home=self.home)
@@ -193,14 +193,25 @@ def test_refresh_is_idempotent_tracks_the_remote_head_and_prunes_branches(tmp_pa
     moved = lab.service.refresh(REPO, PROJECT)
     assert moved.changed and moved.record.base_sha == new_head
     assert moved.sync.previous_sha == first.base_sha
-    assert set(lab.adapter.branch_heads(lab.mirror_path)) == {"main", "feature"}
+    # Remote branches are tracked under refs/remotes/origin; only the default branch
+    # becomes a local head, so pruning can never delete a run's local branch.
+    assert set(lab.adapter.remote_tracking_heads(lab.mirror_path)) == {"main", "feature"}
+    assert set(lab.adapter.branch_heads(lab.mirror_path)) == {"main"}
     git("branch", "-D", "feature", cwd=lab.remote, home=lab.home)
     lab.service.refresh(REPO, PROJECT)
-    assert set(lab.adapter.branch_heads(lab.mirror_path)) == {"main"}  # pruned
+    assert set(lab.adapter.remote_tracking_heads(lab.mirror_path)) == {"main"}  # pruned
     # A later check agrees with the marker without fetching.
     checked = lab.service.check(REPO, PROJECT)
     assert checked.record.base_sha == new_head and checked.sync.operation == "check"
     assert lab.tokens.minted == 1  # one token served every operation within its lifetime
+    # A local run branch survives any number of refreshes (ADR 0011 depends on it).
+    run_branch = "run/00000000-0000-4000-8000-000000000000"
+    git("branch", run_branch, "main", cwd=lab.mirror_path, home=lab.home)
+    lab.commit_remote("src/again.py", "a = 1\n")
+    lab.service.refresh(REPO, PROJECT)
+    assert run_branch in lab.adapter.branch_heads(lab.mirror_path)
+    with pytest.raises(GitOperationError):
+        lab.adapter.set_branch(lab.mirror_path, run_branch, new_head)
 
 
 @pytest.mark.parametrize(

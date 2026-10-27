@@ -51,6 +51,37 @@ class InstallationInfo(BaseModel):
     suspended: bool = False
 
 
+class PullRequestInfo(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    number: int = Field(gt=0)
+    url: str
+    state: str  # "open" | "closed"
+    draft: bool
+    head_ref: str
+    head_sha: str
+    base_ref: str
+    node_id: str | None = None
+
+
+def _pull_request(payload: dict[str, Any]) -> PullRequestInfo:
+    try:
+        head = payload.get("head") or {}
+        base = payload.get("base") or {}
+        return PullRequestInfo(
+            number=int(payload["number"]),
+            url=str(payload["html_url"]),
+            state=str(payload.get("state", "open")),
+            draft=bool(payload.get("draft", False)),
+            head_ref=str(head.get("ref", "")),
+            head_sha=str(head.get("sha", "")),
+            base_ref=str(base.get("ref", "")),
+            node_id=payload.get("node_id"),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GitHubError("github_protocol_error", "respuesta de pull request ilegible") from exc
+
+
 def _identity(payload: dict[str, Any]) -> RepositoryIdentity:
     try:
         owner = payload.get("owner") or {}
@@ -192,6 +223,74 @@ class GitHubClient:
                 break
         return found
 
+    def find_pull_requests(
+        self, token: str, owner: str, name: str, *, head_branch: str
+    ) -> list[PullRequestInfo]:
+        """Pull requests whose head is ``owner:head_branch`` (any state, newest first).
+
+        The lookup every publication does *before* creating: a branch name is
+        unique per run, so an existing pull request here is ours."""
+        response = self._request(
+            "GET",
+            f"/repos/{owner}/{name}/pulls",
+            bearer=token,
+            params={
+                "head": f"{owner}:{head_branch}",
+                "state": "all",
+                "sort": "created",
+                "direction": "desc",
+                "per_page": 10,
+            },
+            purpose="pulls",
+        )
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise GitHubError("github_protocol_error", "listado de pull requests ilegible")
+        return [_pull_request(item) for item in payload if isinstance(item, dict)]
+
+    def create_draft_pull_request(
+        self,
+        token: str,
+        owner: str,
+        name: str,
+        *,
+        title: str,
+        body: str,
+        head_branch: str,
+        base_branch: str,
+    ) -> PullRequestInfo:
+        """``POST /repos/{o}/{n}/pulls`` with ``draft: true``; never merges, never updates."""
+        response = self._request(
+            "POST",
+            f"/repos/{owner}/{name}/pulls",
+            bearer=token,
+            json={
+                "title": title,
+                "body": body,
+                "head": head_branch,
+                "base": base_branch,
+                "draft": True,
+                "maintainer_can_modify": True,
+            },
+            purpose="pulls",
+        )
+        created = _pull_request(response.json())
+        if not created.draft:
+            raise GitHubError(
+                "pull_request_not_draft", f"GitHub creó el PR #{created.number} sin borrador"
+            )
+        return created
+
+    def revoke_installation_token(self, token: str) -> bool:
+        """``DELETE /installation/token``: the token stops working immediately."""
+        try:
+            response = self._client.request(
+                "DELETE", "/installation/token", headers={"Authorization": f"Bearer {token}"}
+            )
+        except httpx.TransportError:
+            return False
+        return response.status_code in (204, 401)  # 401: already invalid
+
     # -- plumbing -----------------------------------------------------------------------
 
     def _request(
@@ -241,6 +340,12 @@ def _error_for(status: int, purpose: str) -> GitHubError:
     if status == 404:
         code = "installation_not_found" if purpose == "token" else "repository_not_found"
         return GitHubError(code, f"recurso no encontrado en GitHub ({purpose})")
+    if status == 422 and purpose == "pulls":
+        return GitHubError(
+            "pull_request_rejected",
+            "GitHub rechazó la creación del pull request (422): rama inexistente, sin cambios "
+            "o ya existe uno para esa rama",
+        )
     if status == 422 and purpose == "token":
         # GitHub refuses the narrowing: a permission the installation does not
         # grant, or a repository the installation does not reach.

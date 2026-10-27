@@ -27,10 +27,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 READ_ONLY_PERMISSIONS: Mapping[str, str] = {"contents": "read", "metadata": "read"}
+# Publication (ADR 0011 §4): two separate tokens, each with the least it needs.
+PUSH_PERMISSIONS: Mapping[str, str] = {"contents": "write", "metadata": "read"}
+PULLS_PERMISSIONS: Mapping[str, str] = {"pull_requests": "write", "metadata": "read"}
+PUBLISH_PERMISSIONS: Mapping[str, str] = {
+    "contents": "write",
+    "pull_requests": "write",
+    "metadata": "read",
+}
 JWT_SKEW_SECONDS = 60
 JWT_TTL_SECONDS = 9 * 60  # GitHub allows 10 minutes; stay under it
 RENEW_FRACTION = 0.8
 MIN_REMAINING_SECONDS = 120
+_LEVELS = {"read": 0, "write": 1}
 
 
 def _utcnow() -> datetime:
@@ -130,12 +139,21 @@ class InstallationTokenProvider:
         client: GitHubClient,
         credentials: GitHubAppCredentials,
         *,
-        allowed: Mapping[str, str] = READ_ONLY_PERMISSIONS,
+        allowed: Mapping[str, str] | None = None,
+        write_enabled: bool = False,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._client = client
         self._credentials = credentials
+        # Read-only by default. Write scopes exist only when the operator turned
+        # GITHUB_WRITE_ENABLED on; even then a request may name one level per
+        # scope (read tokens for mirrors, write tokens for the Publisher).
+        if allowed is None:
+            allowed = dict(READ_ONLY_PERMISSIONS)
+            if write_enabled:
+                allowed.update(PUBLISH_PERMISSIONS)
         self._allowed = dict(allowed)
+        self.write_enabled = write_enabled
         self._clock = clock
         self._cache: dict[tuple[int, str, tuple[tuple[str, str], ...]], InstallationToken] = {}
         self._lock = threading.Lock()
@@ -150,7 +168,8 @@ class InstallationTokenProvider:
     ) -> InstallationToken:
         wanted = dict(permissions or READ_ONLY_PERMISSIONS)
         for scope, level in wanted.items():
-            if self._allowed.get(scope) != level:
+            granted = self._allowed.get(scope)
+            if granted is None or _LEVELS.get(level, 99) > _LEVELS.get(granted, -1):
                 raise GitHubError(
                     "permission_not_allowed",
                     f"permiso {scope}:{level} no permitido en esta fase",
@@ -183,6 +202,11 @@ class InstallationTokenProvider:
                 expires_at.isoformat(),
             )
             return token
+
+    def revoke(self, token: InstallationToken) -> bool:
+        """Ask GitHub to kill the token now and forget it locally (publication cleanup)."""
+        self.invalidate(token)
+        return self._client.revoke_installation_token(token.reveal())
 
     def invalidate(self, token: InstallationToken) -> None:
         with self._lock:

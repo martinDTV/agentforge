@@ -16,6 +16,7 @@ Commits are authored by the repository's configured service identity.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -45,6 +46,9 @@ from app.tools.redaction import redact
 _SEP = "\x1f"
 _LOG_FORMAT = f"%H{_SEP}%h{_SEP}%an{_SEP}%ae{_SEP}%aI{_SEP}%s"
 _MAX_STDERR = 500
+# Mirrors fetch into the remote-tracking namespace: pruning there never deletes
+# the local run/<run_id> branches that worktrees depend on (ADR 0010/0011).
+MIRROR_FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
 
 
 def _false_binary() -> str:
@@ -323,9 +327,14 @@ class LocalGitAdapter:
         repository_path: Path,
         url: str,
         *,
-        fetch_refspec: str = "+refs/heads/*:refs/heads/*",
+        fetch_refspec: str = MIRROR_FETCH_REFSPEC,
     ) -> None:
-        """Point ``origin`` at ``url`` and fetch branches only (no tags, no PR refs)."""
+        """Point ``origin`` at ``url`` and fetch branches only (no tags, no PR refs).
+
+        Remote branches land under ``refs/remotes/origin/*``, never under
+        ``refs/heads/*``: pruning there can never touch the local ``run/<run_id>``
+        branches that worktrees of other runs depend on. The platform copies the
+        default branch to ``refs/heads/<default>`` explicitly after each fetch."""
         if url.startswith("-"):
             raise GitOperationError("ref_invalid", "URL de remoto inválida")
         if self.remote_url(repository_path) is None:
@@ -358,7 +367,7 @@ class LocalGitAdapter:
         args = ["fetch", "--quiet", "--prune", "--no-tags"]
         if depth is not None:
             args += ["--depth", str(int(depth))]
-        args += ["--", "origin", "+refs/heads/*:refs/heads/*"]
+        args += ["--", "origin", MIRROR_FETCH_REFSPEC]
         self._run(
             args,
             cwd=repository_path,
@@ -368,16 +377,37 @@ class LocalGitAdapter:
         )
 
     def branch_heads(self, repository_path: Path) -> dict[str, str]:
+        return self._refs(repository_path, "refs/heads/")
+
+    def remote_tracking_heads(self, repository_path: Path) -> dict[str, str]:
+        """Branches as last fetched from ``origin`` (``refs/remotes/origin/*``)."""
+        return self._refs(repository_path, "refs/remotes/origin/")
+
+    def _refs(self, repository_path: Path, namespace: str) -> dict[str, str]:
         completed = self._run(
-            ["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads/"],
+            ["for-each-ref", "--format=%(refname) %(objectname)", namespace],
             cwd=repository_path,
         )
         heads: dict[str, str] = {}
         for line in completed.stdout.splitlines():
             name, _, sha = line.strip().partition(" ")
-            if name and sha:
-                heads[name] = sha
+            if name.startswith(namespace) and sha:
+                heads[name[len(namespace) :]] = sha
         return heads
+
+    def set_branch(self, repository_path: Path, branch: str, sha: str) -> None:
+        """Move a local branch of a bare mirror to ``sha`` (platform: default branch only).
+
+        Never a ``run/<run_id>`` branch: those belong to worktrees and are only
+        ever written through them."""
+        name = validate_branch_name(branch)
+        if is_run_branch(name):
+            raise GitOperationError("ref_protected", f"'{name}' pertenece a una ejecución")
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise GitOperationError("ref_invalid", "SHA inválido")
+        self._run(
+            ["update-ref", f"refs/heads/{name}", sha, "--end-of-options"], cwd=repository_path
+        )
 
     # -- worktrees ----------------------------------------------------------------------
 
