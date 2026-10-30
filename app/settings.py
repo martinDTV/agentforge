@@ -219,8 +219,14 @@ class Settings(DatabaseSettings):
     notifications_level: Literal["priority", "verbose"] = "priority"
     notifications_worker_interval_seconds: float = Field(default=15.0, gt=0, le=600)
     notifications_max_attempts: int = Field(default=6, ge=1, le=20)
-    # Public base URL used in notification links (None = no links).
+    # Historical base URL of notification links. Kept for compatibility: it is used
+    # only when it already satisfies the strict rules of PUBLIC_APP_URL below.
     agentforge_public_url: str | None = None
+    # Links in mails to the platform itself. The API is never published on the
+    # Internet by AgentForge: set this only when an https destination exists that
+    # is reachable from where the mails are read (reverse proxy, private TLS).
+    # Without it, mails explain how to inspect runs and goals from the CLI.
+    public_app_url: str | None = None
 
     # Smart Router: default mode when a request does not say one.
     router_default_mode: Literal["auto", "fast", "full"] = "auto"
@@ -249,6 +255,15 @@ class Settings(DatabaseSettings):
         if self.authz_publish_distinct_approver is not None:
             return self.authz_publish_distinct_approver
         return self.is_production_like
+
+    @field_validator("public_app_url")
+    @classmethod
+    def _public_app_url_is_strict(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        from app.notifications.links import validate_public_app_url
+
+        return validate_public_app_url(value)
 
     @field_validator("oidc_algorithms")
     @classmethod

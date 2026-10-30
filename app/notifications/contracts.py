@@ -28,6 +28,11 @@ class NotificationKind(StrEnum):
     RUN_FAILED = "run_failed"
     RUN_CANCELLED = "run_cancelled"
     RUN_EXPIRED = "run_expired"
+    # Human decisions on a stage (the rejection names its stage; approvals are verbose
+    # except the scope one, which starts development and keeps ``developer_started``).
+    RUN_REJECTED = "run_rejected"
+    PLAN_APPROVED = "plan_approved"
+    PUBLISH_APPROVED = "publish_approved"
     # Goals (Fase 8, ADR 0012): what the Supervisor tells the human about an objective.
     GOAL_CREATED = "goal_created"
     GOAL_PLAN_REQUESTED = "goal_plan_requested"

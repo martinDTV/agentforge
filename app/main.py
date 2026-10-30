@@ -50,6 +50,7 @@ from app.notifications import (
     NotificationOutbox,
     NotificationPolicy,
     NotificationWorker,
+    PublicLinks,
 )
 from app.orchestration.goals import GoalCoordinator, GoalService, SupervisorLimits
 from app.orchestration.graph import RunGraph, build_graph
@@ -288,7 +289,11 @@ def create_app(
                 assert settings.agentforge_smtp_app_password is not None
                 assert settings.agentforge_email_from is not None
                 enqueuer = enqueuer or NotificationEnqueuer(
-                    NotificationPolicy(base_url=settings.agentforge_public_url),
+                    NotificationPolicy(
+                        links=PublicLinks.resolve(
+                            settings.public_app_url, legacy=settings.agentforge_public_url
+                        )
+                    ),
                     recipients=settings.agentforge_email_to,
                     domain=settings.agentforge_email_from.split("@", 1)[-1],
                     level=settings.notifications_level,
