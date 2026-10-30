@@ -12,6 +12,7 @@ from langgraph.types import Command, StateSnapshot
 from pydantic import BaseModel, ConfigDict
 
 from app.contracts.execution import RunError, RunResponse
+from app.contracts.goals import PlannedUpstream
 from app.contracts.lifecycle import (
     TERMINAL_STATUSES,
     DecisionStage,
@@ -278,6 +279,7 @@ class RunService:
         workflow_kind: WorkflowKind | None = None,
         repository_id: str | None = None,
         route_mode: RouteMode | None = None,
+        planned_upstream: PlannedUpstream | None = None,
     ) -> CreateResult:
         self._ensure_accepting()
         # Authorization first: nothing is written until the principal may
@@ -304,6 +306,10 @@ class RunService:
                 repository_id=repository_id,
                 route_mode=(route_mode or self._default_route_mode).value,
             )
+            if planned_upstream is not None:
+                # ADR 0012 (D4): the router may skip Planner/Architect for a task of an
+                # approved goal plan; the Scoper and every human approval stay.
+                graph_input["planned_upstream"] = planned_upstream.model_dump(mode="json")
         rid = _parse(run_id) if run_id else uuid4()
         # The row (status=running, lease held by us) exists before any LLM work:
         # a crash from here on leaves something to recover, never an orphan.

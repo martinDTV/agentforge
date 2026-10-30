@@ -309,6 +309,20 @@ class LocalGitAdapter:
         )
         return completed.returncode == 0
 
+    def is_ancestor(self, repository_path: Path, ancestor: str, descendant: str) -> bool:
+        """``ancestor`` is reachable from ``descendant`` (``merge-base --is-ancestor``).
+
+        Platform-only, read-only, used on mirrors to verify integration evidence
+        (ADR 0012 §4.2). Both arguments are validated revisions; exit code 1 means
+        "not an ancestor", anything else is an error.
+        """
+        completed = self._run(
+            ["merge-base", "--is-ancestor", validate_ref(ancestor), validate_ref(descendant)],
+            cwd=repository_path,
+            ok_codes=(0, 1),
+        )
+        return completed.returncode == 0
+
     # -- bare mirrors (platform only; ADR 0010) --------------------------------------------
 
     def init_bare(self, path: Path) -> None:

@@ -69,6 +69,8 @@ class RunState(TypedDict, total=False):
     route_decision: dict[str, Any]
     route_escalation: dict[str, Any]
     plan_approved: bool
+    # Goal Supervisor (ADR 0012, D4): the child comes from an approved goal plan.
+    planned_upstream: dict[str, Any]
 
 
 RunGraph = CompiledStateGraph[RunState, None, RunState, RunState]

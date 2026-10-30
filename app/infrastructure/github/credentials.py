@@ -30,6 +30,9 @@ READ_ONLY_PERMISSIONS: Mapping[str, str] = {"contents": "read", "metadata": "rea
 # Publication (ADR 0011 §4): two separate tokens, each with the least it needs.
 PUSH_PERMISSIONS: Mapping[str, str] = {"contents": "write", "metadata": "read"}
 PULLS_PERMISSIONS: Mapping[str, str] = {"pull_requests": "write", "metadata": "read"}
+# Integration evidence for the goal Supervisor (ADR 0012 §4.3): reading whether a
+# pull request was merged. Read-only, so it is allowed whether or not writes are.
+PULLS_READ_PERMISSIONS: Mapping[str, str] = {"pull_requests": "read", "metadata": "read"}
 PUBLISH_PERMISSIONS: Mapping[str, str] = {
     "contents": "write",
     "pull_requests": "write",
@@ -150,6 +153,7 @@ class InstallationTokenProvider:
         # scope (read tokens for mirrors, write tokens for the Publisher).
         if allowed is None:
             allowed = dict(READ_ONLY_PERMISSIONS)
+            allowed.update(PULLS_READ_PERMISSIONS)
             if write_enabled:
                 allowed.update(PUBLISH_PERMISSIONS)
         self._allowed = dict(allowed)

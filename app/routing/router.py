@@ -42,18 +42,30 @@ class SmartRouter:
         allow_fast: bool = True,
         context: dict[str, Any] | None = None,
         usage: Callable[[], dict[str, Any]] | None = None,
+        planned_upstream: bool = False,
     ) -> RouteDecision:
-        """``mode`` is the request; rules and policy bound it; the model only advises."""
+        """``mode`` is the request; rules and policy bound it; the model only advises.
+
+        ``planned_upstream`` (ADR 0012, D4): the task comes from a goal plan a human
+        already approved after the Architect reviewed it as a whole, so Planner and
+        Architect are not repeated per task. The mandatory rules are still evaluated
+        and recorded; the repository policy (``allow_fast``) and an explicit ``full``
+        request still win. The Scoper's escalation and every human approval remain.
+        """
         rules = mandatory_full_rules(task)
         base: dict[str, Any] = {"mode": mode, "mandatory_rules": rules, "decided_at": self._clock()}
         if mode is RouteMode.FULL:
             return RouteDecision(route=Route.FULL, reason="requested_full", **base)
+        if not allow_fast:
+            return RouteDecision(route=Route.FULL, reason="policy_disallows_fast", **base)
+        if planned_upstream:
+            return RouteDecision(
+                route=Route.FAST, reason=f"planned_upstream:{summarize(rules)}"[:255], **base
+            )
         if rules:
             return RouteDecision(
                 route=Route.FULL, reason=f"mandatory:{summarize(rules)}"[:255], **base
             )
-        if not allow_fast:
-            return RouteDecision(route=Route.FULL, reason="policy_disallows_fast", **base)
         if mode is RouteMode.FAST:
             return RouteDecision(route=Route.FAST, reason="requested_fast", **base)
         if self._classifier is None:

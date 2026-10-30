@@ -35,7 +35,7 @@ def test_automation_identity_is_a_service_principal_with_tools_only():
         granted = DEFAULT_ROLE_PERMISSIONS[role]
         assert (Permission.TOOLS_EXECUTE in granted) is (role is Role.AGENT)
         assert (Permission.REPOS_WRITE in granted) is (
-            role in (Role.PROJECT_OPERATOR, Role.ADMIN, Role.PLATFORM_ADMIN)
+            role in (Role.PROJECT_OPERATOR, Role.ADMIN, Role.PLATFORM_ADMIN, Role.GOAL_DELEGATE)
         )
         assert (Permission.REPOS_PUBLISH in granted) is (
             role in (Role.PROJECT_OPERATOR, Role.ADMIN, Role.PLATFORM_ADMIN)

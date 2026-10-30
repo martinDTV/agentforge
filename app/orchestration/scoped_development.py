@@ -263,13 +263,17 @@ def build_scoped_development_graph(
             run_id = _run_id(config)
             policy = runtime.policy_for(state)
             mode = RouteMode(str(state.get("route_mode") or RouteMode.AUTO.value))
+            planned_upstream = bool(state.get("planned_upstream"))
             if runtime.router is None:
                 route = Route.FULL if mode is RouteMode.FULL else Route.FAST
+                if route is Route.FULL:
+                    reason = "requested_full"
+                elif planned_upstream:
+                    reason = "planned_upstream:router_unconfigured"
+                else:
+                    reason = "router_unconfigured"
                 decision = RouteDecision(
-                    route=route,
-                    mode=mode,
-                    reason="requested_full" if route is Route.FULL else "router_unconfigured",
-                    decided_at=runtime.clock(),
+                    route=route, mode=mode, reason=reason, decided_at=runtime.clock()
                 )
                 calls = 0
             else:
@@ -278,6 +282,7 @@ def build_scoped_development_graph(
                     mode=mode,
                     allow_fast=policy.allow_fast_route,
                     context={"repository_id": policy.repository_id},
+                    planned_upstream=planned_upstream,
                 )
                 calls = 1 if decision.classifier_used else 0
             await runtime.record_route(run_id, decision)

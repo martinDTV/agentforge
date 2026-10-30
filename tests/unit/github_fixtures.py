@@ -147,6 +147,8 @@ class FakeGitHub:
             return httpx.Response(204)
         if path.startswith("/repos/") and path.endswith("/pulls"):
             return self._pulls(request, token, path)
+        if request.method == "GET" and path.startswith("/repos/") and "/pulls/" in path:
+            return self._pull(token, path)
         if request.method == "GET" and path.startswith("/repos/") and "/rules/branches/" in path:
             if self.branch_rules is None:
                 return httpx.Response(
@@ -323,6 +325,37 @@ class FakeGitHub:
             self.lose_create_response -= 1
             raise httpx.ReadTimeout("response lost after the pull request was created")
         return httpx.Response(201, json=pr)
+
+    def _pull(self, token: dict[str, Any], path: str) -> httpx.Response:
+        """``GET /repos/{o}/{n}/pulls/{number}``: the integration evidence a goal reads."""
+        _, _, owner, name, _, number = path.split("/", 5)
+        if name not in token["repositories"]:
+            return httpx.Response(404, json={"message": "Not Found"})
+        if token["permissions"].get("pull_requests") not in ("read", "write"):
+            return httpx.Response(403, json={"message": "Resource not accessible"})
+        pr = self.pulls.get(int(number))
+        if pr is None:
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(200, json=pr)
+
+    # -- remote-side actions a human would take on github.com -----------------------------
+
+    def merge_pull_request(
+        self, number: int, *, merge_commit_sha: str, squash: bool = True
+    ) -> None:
+        """Mark a PR merged. With ``squash`` (GitHub's default on many repositories) the
+        merge commit is a brand-new commit: the head SHA never reaches the base history."""
+        pr = self.pulls[number]
+        pr["state"] = "closed"
+        pr["merged"] = True
+        pr["merged_at"] = self.clock().strftime("%Y-%m-%dT%H:%M:%SZ")
+        pr["merge_commit_sha"] = merge_commit_sha if squash else pr["head"]["sha"]
+
+    def close_pull_request(self, number: int) -> None:
+        pr = self.pulls[number]
+        pr["state"] = "closed"
+        pr["merged"] = False
+        pr["merged_at"] = None
 
     def _token(self, bearer: str) -> dict[str, Any] | None:
         token = self.tokens.get(bearer)

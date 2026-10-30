@@ -131,3 +131,19 @@ def test_escalation_from_the_scoper_is_deterministic_and_only_from_fast():
     assert escalation_from_scope(full, high, accepted_files=9, max_files_per_run=6) is None
     with pytest.raises(ValueError):
         ScopeProposal(summary="s", files=small.files, complexity="extreme")  # type: ignore[arg-type]
+
+
+def test_planned_upstream_skips_planning_only_when_the_policy_allows_fast(fake_llm: FakeLLMAdapter):
+    """ADR 0012, D4: a task of an approved goal plan is not planned again per task; the
+    mandatory rules are still recorded and an explicit ``full`` or a policy win."""
+    router = SmartRouter(None, clock=lambda: T0)
+    risky = "Crea una migración Alembic para la tabla usuarios y su backfill"
+    decision = router.decide(risky, mode=RouteMode.AUTO, allow_fast=True, planned_upstream=True)
+    assert decision.route is Route.FAST
+    assert decision.reason.startswith("planned_upstream:data_or_schema_migration")
+    assert decision.mandatory_rules == ["data_or_schema_migration"]
+    assert not decision.classifier_used
+    assert router.decide(risky, allow_fast=False, planned_upstream=True).route is Route.FULL
+    assert router.decide(risky, mode=RouteMode.FULL, planned_upstream=True).route is Route.FULL
+    # Without the flag the same task goes full, as before.
+    assert router.decide(risky, allow_fast=True).route is Route.FULL

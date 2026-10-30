@@ -144,10 +144,18 @@ def test_only_the_agent_role_grants_tools_and_only_humans_grant_repo_writes():
     for role in Role:
         granted = policy.permissions_of(who("u", {role}))
         assert (P.TOOLS_EXECUTE in granted) == (role is Role.AGENT)
-        assert (P.REPOS_WRITE in granted) == (role in writers)  # ADR 0009: humans only
+        # ADR 0009: humans only, plus the goal delegate that acts *for* a human (ADR 0012).
+        assert (P.REPOS_WRITE in granted) == (role in writers | {Role.GOAL_DELEGATE})
         assert (P.REPOS_PUBLISH in granted) == (role in writers)  # ADR 0011: humans only
-        assert (P.RUNS_CANCEL in granted) == (role in writers | {Role.OPERATOR})
+        assert (P.RUNS_CANCEL in granted) == (role in writers | {Role.OPERATOR, Role.GOAL_DELEGATE})
     assert policy.permissions_of(who("u", {Role.AGENT})) == {P.TOOLS_EXECUTE}
+    # The delegate can create and cancel children and nothing else (D3): never approve,
+    # resume, publish, read other people's runs or execute tools.
+    assert policy.permissions_of(who("u", {Role.GOAL_DELEGATE})) == {
+        P.RUNS_CREATE,
+        P.REPOS_WRITE,
+        P.RUNS_CANCEL,
+    }
 
 
 def test_listing_scope_mirrors_visibility():
