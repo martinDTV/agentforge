@@ -4,7 +4,10 @@ from app.contracts.planning import DevelopmentPlan
 from app.infrastructure.llm.port import LLMPort
 
 SYSTEM_PROMPT = (
-    "Genera entre 3 y 5 tareas como máximo. "
+    "Genera entre 1 y 5 tareas como máximo: una sola si la solicitud es pequeña y "
+    "autocontenida. "
+    "Declara dependencies solo cuando una tarea necesite el resultado de otra y nunca "
+    "formes ciclos. "
     "Cada descripción debe tener máximo 180 caracteres. "
     "Cada tarea debe incluir de 1 a 3 criterios de aceptación. "
     "Identifica máximo 3 riesgos. "
