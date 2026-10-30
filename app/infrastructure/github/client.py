@@ -62,12 +62,32 @@ class PullRequestInfo(BaseModel):
     head_sha: str
     base_ref: str
     node_id: str | None = None
+    # Integration evidence (ADR 0012 §4.3): set once GitHub reports the PR merged.
+    # With squash or rebase merges ``merge_commit_sha`` is *not* ``head_sha``.
+    merged_at: datetime | None = None
+    merge_commit_sha: str | None = None
+
+    @property
+    def merged(self) -> bool:
+        return self.merged_at is not None
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _pull_request(payload: dict[str, Any]) -> PullRequestInfo:
     try:
         head = payload.get("head") or {}
         base = payload.get("base") or {}
+        merged_at = _parse_time(payload.get("merged_at"))
+        merge_commit = payload.get("merge_commit_sha")
         return PullRequestInfo(
             number=int(payload["number"]),
             url=str(payload["html_url"]),
@@ -77,6 +97,8 @@ def _pull_request(payload: dict[str, Any]) -> PullRequestInfo:
             head_sha=str(head.get("sha", "")),
             base_ref=str(base.get("ref", "")),
             node_id=payload.get("node_id"),
+            merged_at=merged_at,
+            merge_commit_sha=str(merge_commit) if merged_at and merge_commit else None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise GitHubError("github_protocol_error", "respuesta de pull request ilegible") from exc
@@ -272,6 +294,19 @@ class GitHubClient:
         if not isinstance(payload, list):
             raise GitHubError("github_protocol_error", "listado de pull requests ilegible")
         return [_pull_request(item) for item in payload if isinstance(item, dict)]
+
+    def get_pull_request(self, token: str, owner: str, name: str, number: int) -> PullRequestInfo:
+        """``GET /repos/{o}/{n}/pulls/{number}``: state, ``merged_at`` and ``merge_commit_sha``.
+
+        Read-only; the token needs ``pull_requests: read``. This is how the goal
+        Supervisor learns that a dependency was integrated (ADR 0012 §4.3)."""
+        response = self._request(
+            "GET", f"/repos/{owner}/{name}/pulls/{int(number)}", bearer=token, purpose="pulls"
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise GitHubError("github_protocol_error", "pull request ilegible")
+        return _pull_request(payload)
 
     def create_draft_pull_request(
         self,

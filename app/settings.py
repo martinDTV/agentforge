@@ -219,12 +219,28 @@ class Settings(DatabaseSettings):
     notifications_level: Literal["priority", "verbose"] = "priority"
     notifications_worker_interval_seconds: float = Field(default=15.0, gt=0, le=600)
     notifications_max_attempts: int = Field(default=6, ge=1, le=20)
-    # Public base URL used in notification links (None = no links).
+    # Historical base URL of notification links. Kept for compatibility: it is used
+    # only when it already satisfies the strict rules of PUBLIC_APP_URL below.
     agentforge_public_url: str | None = None
+    # Links in mails to the platform itself. The API is never published on the
+    # Internet by AgentForge: set this only when an https destination exists that
+    # is reachable from where the mails are read (reverse proxy, private TLS).
+    # Without it, mails explain how to inspect runs and goals from the CLI.
+    public_app_url: str | None = None
 
     # Smart Router: default mode when a request does not say one.
     router_default_mode: Literal["auto", "fast", "full"] = "auto"
     router_confidence_threshold: float = Field(default=0.7, ge=0.5, le=1.0)
+
+    # Goal Supervisor (Fase 8, ADR 0012). Active only when the development workflow
+    # exists (repositories and policies configured). The limits below are platform
+    # wide; each goal carries its own ``GoalLimits`` snapshot.
+    supervisor_enabled: bool = True
+    supervisor_tick_seconds: float = Field(default=60.0, ge=0)
+    supervisor_max_active_children: int = Field(default=3, ge=1, le=16)
+    supervisor_max_active_per_repository: int = Field(default=1, ge=1, le=16)
+    supervisor_lease_seconds: float = Field(default=60.0, gt=0)
+    supervisor_creating_timeout_seconds: float = Field(default=1800.0, gt=0)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -239,6 +255,15 @@ class Settings(DatabaseSettings):
         if self.authz_publish_distinct_approver is not None:
             return self.authz_publish_distinct_approver
         return self.is_production_like
+
+    @field_validator("public_app_url")
+    @classmethod
+    def _public_app_url_is_strict(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        from app.notifications.links import validate_public_app_url
+
+        return validate_public_app_url(value)
 
     @field_validator("oidc_algorithms")
     @classmethod

@@ -18,14 +18,18 @@ from .contracts import (
     SendOutcome,
 )
 from .enqueue import PRIORITY_KINDS, NotificationEnqueuer, NotificationLevel, OutboxDraft
-from .policy import NotificationDraft, NotificationPolicy, RunContext
-from .templates import render_html, render_subject, render_text
+from .links import PublicLinks, validate_public_app_url
+from .policy import GoalContext, NotificationDraft, NotificationPolicy, RunContext
+from .templates import Link, Notification, Section, Status, render_html, render_subject, render_text
 from .worker import BACKOFF_SECONDS, NotificationWorker, WorkerReport
 
 __all__ = [
     "BACKOFF_SECONDS",
     "EmailMessage",
     "EmailSender",
+    "GoalContext",
+    "Link",
+    "Notification",
     "NotificationDraft",
     "NotificationEnqueuer",
     "NotificationLevel",
@@ -37,10 +41,14 @@ __all__ = [
     "OutboxDraft",
     "OutboxItem",
     "OutboxStatus",
+    "PublicLinks",
     "RunContext",
+    "Section",
     "SendOutcome",
+    "Status",
     "WorkerReport",
     "render_html",
     "render_subject",
     "render_text",
+    "validate_public_app_url",
 ]

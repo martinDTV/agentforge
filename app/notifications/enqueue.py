@@ -4,16 +4,18 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
+from app.goals.ports import GoalEvent
 from app.orchestration.ports import RunEvent
 
 from .contracts import NotificationKind
-from .policy import NotificationPolicy, RunContext, message_id_for
+from .policy import GoalContext, NotificationPolicy, RunContext, goal_message_id_for, message_id_for
 
 
 @dataclass(frozen=True)
 class OutboxDraft:
-    run_context: RunContext
+    run_context: RunContext | None
     event_id: int | None
     kind: NotificationKind
     recipient: str
@@ -22,6 +24,11 @@ class OutboxDraft:
     html_body: str
     dedup_key: str
     message_id: str
+    goal_id: UUID | None = None
+
+    @property
+    def run_id(self) -> UUID | None:
+        return self.run_context.run_id if self.run_context is not None else None
 
 
 NotificationLevel = Literal["priority", "verbose"]
@@ -39,6 +46,13 @@ PRIORITY_KINDS: frozenset[NotificationKind] = frozenset(
         NotificationKind.RUN_PUBLISHED,
         NotificationKind.RUN_CANCELLED,
         NotificationKind.RUN_EXPIRED,
+        NotificationKind.RUN_REJECTED,
+        NotificationKind.GOAL_NEEDS_HUMAN,
+        NotificationKind.GOAL_COMPLETED,
+        NotificationKind.GOAL_PARTIAL,
+        NotificationKind.GOAL_FAILED,
+        NotificationKind.GOAL_CANCELLED,
+        NotificationKind.GOAL_EXPIRED,
     }
 )
 
@@ -80,13 +94,23 @@ class NotificationEnqueuer:
         drafts: list[OutboxDraft] = []
         if not self._recipients:
             return drafts
+        seen: set[str] = set()
         for event_id, event in events:
             draft = self._policy.draft(
-                run, kind=event.kind, payload=event.payload, ordinal=event.ordinal, moment=moment
+                run,
+                kind=event.kind,
+                payload=event.payload,
+                ordinal=event.ordinal,
+                moment=moment,
+                context=event.context,
             )
             if draft is None or not self.wants(draft.kind):
                 continue
             for recipient in self._recipients:
+                key = draft.dedup_key(run.run_id, recipient)
+                if key in seen:
+                    continue  # two events describing one outcome (PR opened + published)
+                seen.add(key)
                 drafts.append(
                     OutboxDraft(
                         run_context=run,
@@ -96,9 +120,50 @@ class NotificationEnqueuer:
                         subject=draft.subject,
                         text_body=draft.text,
                         html_body=draft.html,
-                        dedup_key=draft.dedup_key(run.run_id, recipient),
+                        dedup_key=key,
                         message_id=message_id_for(
                             run.run_id, draft.kind, draft.ordinal, self._domain
+                        ),
+                    )
+                )
+        return drafts
+
+    def goal_drafts(
+        self,
+        goal: GoalContext,
+        events: Sequence[tuple[int | None, GoalEvent]],
+        *,
+        moment: datetime,
+    ) -> list[OutboxDraft]:
+        """Same contract as ``drafts`` for a goal's events (ADR 0012 §2.8)."""
+        drafts: list[OutboxDraft] = []
+        if not self._recipients:
+            return drafts
+        for event_id, event in events:
+            draft = self._policy.draft_goal(
+                goal,
+                kind=event.kind,
+                payload=event.payload,
+                ordinal=event.ordinal,
+                moment=moment,
+                context=event.context,
+            )
+            if draft is None or not self.wants(draft.kind):
+                continue
+            for recipient in self._recipients:
+                drafts.append(
+                    OutboxDraft(
+                        run_context=None,
+                        goal_id=goal.goal_id,
+                        event_id=event_id,
+                        kind=draft.kind,
+                        recipient=recipient,
+                        subject=draft.subject,
+                        text_body=draft.text,
+                        html_body=draft.html,
+                        dedup_key=draft.goal_dedup_key(goal.goal_id, recipient),
+                        message_id=goal_message_id_for(
+                            goal.goal_id, draft.kind, draft.ordinal, self._domain
                         ),
                     )
                 )

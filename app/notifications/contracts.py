@@ -28,6 +28,24 @@ class NotificationKind(StrEnum):
     RUN_FAILED = "run_failed"
     RUN_CANCELLED = "run_cancelled"
     RUN_EXPIRED = "run_expired"
+    # Human decisions on a stage (the rejection names its stage; approvals are verbose
+    # except the scope one, which starts development and keeps ``developer_started``).
+    RUN_REJECTED = "run_rejected"
+    PLAN_APPROVED = "plan_approved"
+    PUBLISH_APPROVED = "publish_approved"
+    # Goals (Fase 8, ADR 0012): what the Supervisor tells the human about an objective.
+    GOAL_CREATED = "goal_created"
+    GOAL_PLAN_REQUESTED = "goal_plan_requested"
+    GOAL_TASK_READY = "goal_task_ready"
+    GOAL_TASK_STARTED = "goal_task_started"
+    GOAL_TASK_PUBLISHED = "goal_task_published"
+    GOAL_DEPENDENCY_MERGED = "goal_dependency_merged"
+    GOAL_NEEDS_HUMAN = "goal_needs_human"
+    GOAL_COMPLETED = "goal_completed"
+    GOAL_PARTIAL = "goal_partial"
+    GOAL_FAILED = "goal_failed"
+    GOAL_CANCELLED = "goal_cancelled"
+    GOAL_EXPIRED = "goal_expired"
 
 
 class OutboxStatus(StrEnum):
@@ -72,9 +90,11 @@ class OutboxItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: int
-    run_id: UUID
+    # Exactly one of the two is set: a run's notification or a goal's (migration 0010).
+    run_id: UUID | None
     event_id: int | None
     kind: NotificationKind
+    goal_id: UUID | None = None
     recipient: str
     subject: str
     text_body: str

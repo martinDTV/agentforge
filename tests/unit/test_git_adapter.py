@@ -189,3 +189,26 @@ def test_registry_loads_trusted_configuration_from_a_file(tmp_path: Path):
     config = loaded.require("demo", "alpha")
     assert config.identity.name == "AgentForge Bot" and config.is_protected("release/2")
     assert config.is_protected("main") and not config.is_protected(f"run/{uuid.uuid4()}")
+
+
+def test_is_ancestor_answers_from_the_history_and_validates_revisions(tmp_path: Path):
+    """Platform-only primitive behind the goal Supervisor's merge verification (ADR 0012)."""
+    from tests.unit.git_fixtures import git, seed_repository
+
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = seed_repository(tmp_path / "repo", home=home)
+    first = git("rev-parse", "HEAD", cwd=repo, home=home).strip()
+    (repo / "x.txt").write_text("x\n")
+    git("add", "-A", cwd=repo, home=home)
+    git("commit", "-q", "-m", "second", cwd=repo, home=home)
+    second = git("rev-parse", "HEAD", cwd=repo, home=home).strip()
+    adapter = LocalGitAdapter(scratch_home=tmp_path / "git-home")
+    assert adapter.is_ancestor(repo, first, second) is True
+    assert adapter.is_ancestor(repo, second, first) is False
+    assert adapter.is_ancestor(repo, first, "HEAD") is True
+    with pytest.raises(GitOperationError) as exc:
+        adapter.is_ancestor(repo, "--output=/tmp/x", second)
+    assert exc.value.code == "ref_invalid"
+    with pytest.raises(GitOperationError):  # unknown object: git fails, not "False"
+        adapter.is_ancestor(repo, "0" * 40, second)

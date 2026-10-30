@@ -15,6 +15,88 @@ from app.orchestration.ports import PersistedRun, RunEvent
 from app.orchestration.status import checkpoint_id_of, has_pending_interrupt
 
 INTERRUPT_KEY = "__interrupt__"
+# Bounds of the ephemeral notification context (never persisted; see RunEvent.context).
+_MAX_LIST = 16
+_MAX_TEXT = 400
+
+
+def _text(value: Any, limit: int = _MAX_TEXT) -> str:
+    return " ".join(str(value).split())[:limit] if value is not None else ""
+
+
+def _interrupt_context(delta: Any) -> dict[str, Any]:
+    """What a mail may say about a pending decision: a bounded view of the proposal the
+    human will see anyway, cut by the platform (counts stay in the payload)."""
+    for item in delta if isinstance(delta, tuple | list) else (delta,):
+        if not (isinstance(item, Interrupt) and isinstance(item.value, dict)):
+            continue
+        value = item.value
+        stage = str(value.get("stage") or "plan")
+        context: dict[str, Any] = {"stage": stage}
+        if stage == "plan":
+            plan = value.get("plan") or {}
+            review = value.get("architecture") or {}
+            context.update(
+                plan_summary=_text(plan.get("summary")),
+                tasks=[
+                    {
+                        "id": _text(t.get("id"), 32),
+                        "title": _text(t.get("title"), 160),
+                        "dependencies": [_text(d, 32) for d in (t.get("dependencies") or [])][:8],
+                    }
+                    for t in (plan.get("tasks") or [])[:8]
+                    if isinstance(t, dict)
+                ],
+                risks=[_text(r, 200) for r in (plan.get("risks") or [])[:5]],
+                architect_approved=value.get("architect_approved"),
+                architecture_summary=_text(review.get("summary")),
+                architecture_issues=[_text(i, 200) for i in (review.get("issues") or [])[:5]],
+                revision=value.get("revision", 0),
+                route=value.get("route"),
+            )
+        elif stage == "scope":
+            base = value.get("base") or {}
+            context.update(
+                summary=_text(value.get("summary")),
+                files=[
+                    {"action": _text(f.get("action"), 8), "path": _text(f.get("path"), 200)}
+                    for f in (value.get("files") or [])[:_MAX_LIST]
+                    if isinstance(f, dict)
+                ],
+                tests=[_text(t, 200) for t in (value.get("tests") or [])[:8]],
+                risks=[_text(r, 200) for r in (value.get("risks") or [])[:8]],
+                rejected=len(value.get("rejected") or []),
+                hidden_paths=value.get("hidden_paths", 0),
+                signals=len(value.get("signals") or []),
+                repository=_text(base.get("repository"), 120) if isinstance(base, dict) else "",
+                base_sha=_text(base.get("sha"), 40) if isinstance(base, dict) else "",
+                limits=value.get("limits") if isinstance(value.get("limits"), dict) else {},
+            )
+        elif stage == "publish":
+            scan = value.get("scan") or {}
+            context.update(
+                repository=_text(value.get("repository"), 120),
+                remote_branch=_text(value.get("remote_branch"), 200),
+                base_branch=_text(value.get("base_branch"), 200),
+                base_sha=_text(value.get("base_sha"), 40),
+                head_sha=_text(value.get("head_sha"), 40),
+                title=_text(value.get("title"), 160),
+                summary=_text(value.get("summary")),
+                files=[
+                    {"change": _text(f.get("change"), 12), "path": _text(f.get("path"), 200)}
+                    for f in (value.get("files") or [])[:32]
+                    if isinstance(f, dict)
+                ],
+                qa_checks=[
+                    {"program": _text(c.get("program"), 32), "exit_code": c.get("exit_code")}
+                    for c in (value.get("qa_checks") or [])[:8]
+                    if isinstance(c, dict)
+                ],
+                scan_findings=len(scan.get("findings") or []) if isinstance(scan, dict) else 0,
+            )
+        return context
+    return {}
+
 
 # Which automation identity executes each node (ADR 0009, attribution). Node
 # events are never attributed to a human: ``actor_subject`` stays NULL and the
@@ -70,6 +152,7 @@ def events_from_update(
                     kind=RunEventKind.WAITING_APPROVAL,
                     ordinal=ordinal,
                     payload=_interrupt_payload(delta),
+                    context=_interrupt_context(delta),
                 )
             )
             continue
@@ -77,18 +160,35 @@ def events_from_update(
             continue
         if node == "qa" and "qa_review" in delta:
             # The review happened even when it ends the run (correction limit).
+            review = delta.get("qa_review") or {}
+            validation = delta.get("validation", [])
             events.append(
                 RunEvent(
                     kind=RunEventKind.QA_REVIEWED,
                     ordinal=revision,
                     payload={
-                        "approved": bool((delta.get("qa_review") or {}).get("approved")),
-                        "issues": len((delta.get("qa_review") or {}).get("issues", [])),
-                        "checks": len(delta.get("validation", [])),
-                        "failed_checks": sum(
-                            1 for r in delta.get("validation", []) if r.get("exit_code") != 0
-                        ),
+                        "approved": bool(review.get("approved")),
+                        "issues": len(review.get("issues", [])),
+                        "checks": len(validation),
+                        "failed_checks": sum(1 for r in validation if r.get("exit_code") != 0),
                         "usage": delta.get("usage", {}),
+                    },
+                    context={
+                        "summary": _text(review.get("summary")),
+                        "issues": [
+                            {"code": _text(i.get("code"), 80), "path": _text(i.get("path"), 200)}
+                            for i in (review.get("issues") or [])[:6]
+                            if isinstance(i, dict)
+                        ],
+                        "checks": [
+                            {
+                                "program": _text(r.get("program"), 32),
+                                "exit_code": r.get("exit_code"),
+                            }
+                            for r in validation[:8]
+                            if isinstance(r, dict)
+                        ],
+                        "round": revision,
                     },
                 )
             )
@@ -99,7 +199,13 @@ def events_from_update(
                 failed["executed_by"] = EXECUTED_BY[node]
             if approved_by is not None:
                 failed["approved_by"] = approved_by
-            events.append(RunEvent(kind=RunEventKind.RUN_FAILED, payload=failed))
+            events.append(
+                RunEvent(
+                    kind=RunEventKind.RUN_FAILED,
+                    payload=failed,
+                    context={"message": _text(error.get("message"))},
+                )
+            )
             continue
         if node == "router" and delta.get("route_decision"):
             decision = delta["route_decision"]
@@ -166,13 +272,23 @@ def events_from_update(
                 )
             )
         elif node == "developer":
+            changes = delta.get("changes") or {}
             events.append(
                 RunEvent(
                     kind=RunEventKind.DEVELOPER_COMPLETED,
                     ordinal=revision,
                     payload={
-                        "files": len((delta.get("changes") or {}).get("edits", [])),
+                        "files": len(changes.get("edits", [])),
                         "usage": delta.get("usage", {}),
+                    },
+                    context={
+                        "summary": _text(changes.get("summary")),
+                        "files": [
+                            _text(e.get("path"), 200)
+                            for e in (changes.get("edits") or [])[:_MAX_LIST]
+                            if isinstance(e, dict)
+                        ],
+                        "round": revision,
                     },
                 )
             )
@@ -189,7 +305,13 @@ def events_from_update(
                 done: dict[str, Any] = {}
                 if approved_by is not None:
                     done["approved_by"] = approved_by
-                events.append(RunEvent(kind=RunEventKind.RUN_COMPLETED, payload=done))
+                events.append(
+                    RunEvent(
+                        kind=RunEventKind.RUN_COMPLETED,
+                        payload=done,
+                        context={"publication_expected": delta.get("publication_expected")},
+                    )
+                )
         elif node == "planner":
             plan = delta.get("plan") or {}
             if revision > 0:
@@ -293,7 +415,14 @@ def transition_events(previous: RunLifecycleStatus, updated: PersistedRun) -> li
         return [RunEvent(kind=RunEventKind.RUN_INTERRUPTED, ordinal=updated.attempt)]
     if status is RunLifecycleStatus.FAILED:
         code = updated.error.code if updated.error else "unknown"
-        return [RunEvent(kind=RunEventKind.RUN_FAILED, payload={"code": code})]
+        message = updated.error.message if updated.error else ""
+        return [
+            RunEvent(
+                kind=RunEventKind.RUN_FAILED,
+                payload={"code": code},
+                context={"message": _text(message)},
+            )
+        ]
     if status is RunLifecycleStatus.APPROVED:
         return [RunEvent(kind=RunEventKind.RUN_APPROVED)]
     if status is RunLifecycleStatus.REJECTED:

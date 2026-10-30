@@ -55,6 +55,10 @@ class Role(StrEnum):
     ADMIN = "admin"  # every run permission, but only inside the token's projects
     PLATFORM_ADMIN = "platform_admin"  # admin + projects:all
     AGENT = "agent"  # the automation identity: tools only, never runs
+    # The goal Supervisor acting *for* the human who created a goal (ADR 0012, D3):
+    # may create child runs and cancel its own children; never approves, resumes
+    # or publishes anything, and never holds tools:execute.
+    GOAL_DELEGATE = "goal_delegate"
 
 
 _P = Permission
@@ -94,6 +98,7 @@ DEFAULT_ROLE_PERMISSIONS: Mapping[str, frozenset[Permission]] = {
     Role.ADMIN: _PROJECT_ADMIN,
     Role.PLATFORM_ADMIN: _PROJECT_ADMIN | {_P.PROJECTS_ALL},
     Role.AGENT: frozenset({_P.TOOLS_EXECUTE}),
+    Role.GOAL_DELEGATE: frozenset({_P.RUNS_CREATE, _P.REPOS_WRITE, _P.RUNS_CANCEL}),
 }
 
 # Rows that pre-date authentication live here (migration 0003). No token can

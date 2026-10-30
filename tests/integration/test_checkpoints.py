@@ -285,6 +285,7 @@ def test_ready_reports_persistent_checkpoints(client: TestClient):
         "database": "ok",
         "schema": "ok",
         "checkpoints": "ok",
+        "notifications": "disabled",
     }
 
 

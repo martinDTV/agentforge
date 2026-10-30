@@ -10,15 +10,18 @@ from app.api.errors import register_exception_handlers
 from app.api.headers import SecurityHeadersMiddleware
 from app.contracts.lifecycle import WorkflowKind
 from app.git import RepositoryRegistry
+from app.goals import GoalRepository, IntegrationProbe
 from app.infrastructure.checkpoints import PostgresCheckpointer
 from app.infrastructure.db import (
     Database,
     DatabaseUnavailableError,
+    InMemoryGoalRepository,
     InMemoryMirrorSyncRepository,
     InMemoryPublicationRepository,
     InMemoryRouteDecisionRepository,
     InMemoryRunRepository,
     InMemoryToolInvocationRepository,
+    SqlAlchemyGoalRepository,
     SqlAlchemyMirrorSyncRepository,
     SqlAlchemyNotificationOutbox,
     SqlAlchemyPublicationRepository,
@@ -36,6 +39,7 @@ from app.infrastructure.github import (
     GitHubPublisher,
     InstallationTokenProvider,
 )
+from app.infrastructure.github.integration import GitHubIntegrationProbe
 from app.infrastructure.llm import build_llm
 from app.infrastructure.llm.port import LLMPort
 from app.infrastructure.notifications import SmtpEmailSender
@@ -46,14 +50,16 @@ from app.notifications import (
     NotificationOutbox,
     NotificationPolicy,
     NotificationWorker,
+    PublicLinks,
 )
+from app.orchestration.goals import GoalCoordinator, GoalService, SupervisorLimits
 from app.orchestration.graph import RunGraph, build_graph
 from app.orchestration.limits import RunLimits
 from app.orchestration.policy import RecoveryPolicy
 from app.orchestration.ports import PersistedRun, RunRepository
 from app.orchestration.publication import PublicationRuntime
 from app.orchestration.recovery import RecoveryService
-from app.orchestration.runs import RunService
+from app.orchestration.runs import RunService, TerminalHook
 from app.orchestration.scoped_development import (
     DevelopmentRuntime,
     build_scoped_development_graph,
@@ -141,6 +147,10 @@ def create_app(
     shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
     startup_sweep: bool | None = None,
     recovery_sweep_seconds: float | None = None,
+    goal_repository: GoalRepository | None = None,
+    integration_probe: IntegrationProbe | None = None,
+    supervisor_limits: SupervisorLimits | None = None,
+    supervisor_tick_seconds: float | None = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -192,6 +202,13 @@ def create_app(
         worker_max_attempts = 6
         publication_parts: tuple[LocalGitAdapter, GitHubClient, InstallationTokenProvider] | None
         publication_parts = None
+        github_parts: tuple[LocalGitAdapter, GitHubClient, InstallationTokenProvider] | None
+        github_parts = None
+        goals_repo = goal_repository
+        probe = integration_probe
+        supervisor_on = True
+        supervisor_tick = supervisor_tick_seconds
+        supervisor_policy = supervisor_limits
         publish_allowed: frozenset[str] = frozenset()
         publish_distinct = False
         execution_policy = ExecutionPolicy()
@@ -241,6 +258,7 @@ def create_app(
                         registry=registry,
                         fetch_timeout_seconds=settings.mirror_fetch_timeout_seconds,
                     )
+                    github_parts = (git_adapter, github, tokens)
                     if settings.github_write_enabled:
                         publication_parts = (git_adapter, github, tokens)
                         publish_allowed = frozenset(settings.publish_allowed_repositories)
@@ -271,7 +289,11 @@ def create_app(
                 assert settings.agentforge_smtp_app_password is not None
                 assert settings.agentforge_email_from is not None
                 enqueuer = enqueuer or NotificationEnqueuer(
-                    NotificationPolicy(base_url=settings.agentforge_public_url),
+                    NotificationPolicy(
+                        links=PublicLinks.resolve(
+                            settings.public_app_url, legacy=settings.agentforge_public_url
+                        )
+                    ),
                     recipients=settings.agentforge_email_to,
                     domain=settings.agentforge_email_from.split("@", 1)[-1],
                     level=settings.notifications_level,
@@ -286,6 +308,10 @@ def create_app(
                 )
                 worker_interval = settings.notifications_worker_interval_seconds
                 worker_max_attempts = settings.notifications_max_attempts
+            supervisor_on = settings.supervisor_enabled
+            if supervisor_tick is None:
+                supervisor_tick = settings.supervisor_tick_seconds
+            supervisor_policy = supervisor_policy or SupervisorLimits.from_settings(settings)
             db = db or Database.from_settings(settings)
             cp = cp or PostgresCheckpointer.from_settings(settings)
             run_policy = run_policy or RecoveryPolicy.from_settings(settings)
@@ -367,6 +393,13 @@ def create_app(
             if runtime is not None and row.workflow_kind is WorkflowKind.DEVELOPMENT:
                 await runtime.release(row.id, row.project_id, row.status)
 
+        # Terminal hooks: worktree release first, then the goal Supervisor (ADR 0012).
+        terminal_hooks: list[TerminalHook] = [release_worktree]
+
+        async def on_terminal(row: PersistedRun) -> None:
+            for hook in terminal_hooks:
+                await hook(row)
+
         service = RunService(
             planning_graph,
             repo,
@@ -376,9 +409,54 @@ def create_app(
             authorization=authz or AuthorizationPolicy(separation_of_duties=False),
             graphs=graphs,
             policies=policies,
-            on_terminal=release_worktree,
+            on_terminal=on_terminal,
         )
         recovery = RecoveryService(service)
+        goal_service: GoalService | None = None
+        coordinator: GoalCoordinator | None = None
+        if runtime is not None and policies is not None and supervisor_on:
+            # Goal Supervisor (Fase 8, ADR 0012): deterministic coordination of goals over
+            # ordinary runs. Exists only where the development workflow exists.
+            if goals_repo is None:
+                goals_repo = (
+                    SqlAlchemyGoalRepository(db.session_factory, notifications=enqueuer)
+                    if db is not None
+                    else InMemoryGoalRepository(
+                        notifications=enqueuer,
+                        outbox=repo.outbox if isinstance(repo, InMemoryRunRepository) else None,
+                    )
+                )
+            if probe is None and mirror_service is not None and github_parts is not None:
+                git_for_probe, github_for_probe, tokens_for_probe = github_parts
+                probe = GitHubIntegrationProbe(
+                    github=github_for_probe,
+                    tokens=tokens_for_probe,
+                    mirrors=mirror_service,
+                    git=git_for_probe,
+                    policies=policies,
+                    mirror_syncs=runtime.mirror_syncs,
+                )
+            coordinator = GoalCoordinator(
+                goals=goals_repo,
+                runs=repo,
+                launcher=service,
+                policies=policies,
+                planning_limits=run_limits or RunLimits(),
+                probe=probe,
+                limits=supervisor_policy or SupervisorLimits(),
+                owner=service.owner,
+            )
+            goal_service = GoalService(
+                coordinator,
+                authorization=service.authorization,
+                policies=policies,
+                runs=repo,
+                router=smart_router,
+                planning_limits=run_limits or RunLimits(),
+            )
+            terminal_hooks.append(coordinator.on_run_terminal)
+        app.state.goal_service = goal_service
+        app.state.goal_coordinator = coordinator
         git_tools = (
             GitTools(manager.git, manager, limits_for_tools) if manager is not None else None
         )
@@ -424,6 +502,7 @@ def create_app(
         app.state.checkpoints_verified = False
         sweeper: asyncio.Task[None] | None = None
         mailer: asyncio.Task[None] | None = None
+        supervisor: asyncio.Task[None] | None = None
         try:
             if notification_worker is not None:
                 mailer = asyncio.create_task(
@@ -446,14 +525,20 @@ def create_app(
                 sweeper = asyncio.create_task(
                     recovery.run_periodically(sweep_every), name="recovery-sweeper"
                 )
+            if coordinator is not None and supervisor_tick and supervisor_tick > 0:
+                supervisor = asyncio.create_task(
+                    coordinator.run_periodically(supervisor_tick), name="goal-supervisor"
+                )
             yield
         finally:
             # Ordered shutdown: stop sweeping, stop accepting, drain within the
             # grace period, cancel the rest, release only our leases, then close.
-            for background in (sweeper, mailer):
+            for background in (sweeper, mailer, supervisor):
                 if background is not None:
                     background.cancel()
                     await asyncio.gather(background, return_exceptions=True)
+            if coordinator is not None:
+                await coordinator.shutdown(grace)
             report = await service.shutdown(grace)
             if not report.drained:
                 logger.warning(
@@ -469,7 +554,7 @@ def create_app(
 
     app = FastAPI(
         title="AgentForge",
-        version="0.5.0",
+        version="0.8.0",
         lifespan=lifespan,
         docs_url="/docs" if docs_enabled else None,
         redoc_url="/redoc" if docs_enabled else None,

@@ -106,6 +106,7 @@ def _to_decision_record(record: RunDecisionRecord | None) -> DecisionRecord | No
         applied_at=record.applied_at,
         decided_by=record.decided_by,
         scope_digest=record.scope_digest,
+        reason=record.reason,
     )
 
 
@@ -154,6 +155,10 @@ class SqlAlchemyRunRepository:
             project_id=record.project_id,
             task=record.task,
             workflow_kind=str(record.workflow_kind),
+            plan=record.plan,
+            publication=record.publication,
+            error_code=record.error_code,
+            pending_stage=record.pending_stage,
         )
         drafts = self._notifications.drafts(context, events, moment=datetime.now(UTC))
         await insert_outbox(session, drafts)
@@ -633,6 +638,7 @@ class SqlAlchemyRunRepository:
         ttl_seconds: float,
         decided_by: str | None,
         scope_digest: str | None = None,
+        reason: str | None = None,
     ) -> DecisionClaim | None:
         async with self._tx() as session:
             generation = (
@@ -671,6 +677,7 @@ class SqlAlchemyRunRepository:
                 approved=approved,
                 decided_by=decided_by,
                 scope_digest=scope_digest,
+                reason=reason,
             )
             session.add(decision)
             if stage is DecisionStage.PLAN:
@@ -683,6 +690,8 @@ class SqlAlchemyRunRepository:
                 payload["approved_by" if approved else "rejected_by"] = decided_by
             if scope_digest is not None:
                 payload["scope_digest"] = scope_digest
+            if reason:
+                payload["reason"] = reason
             session.add(
                 RunEventRecord(
                     run_id=run_id,

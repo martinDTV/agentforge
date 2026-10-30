@@ -151,3 +151,103 @@ def test_interactive_confirmation_requires_the_digest_prefix(api, capsys, monkey
         "stage": "publish",
         "publish_digest": "6b66f7af" + "0" * 56,
     }
+
+
+GOAL = "7b2f1c9e-1d3a-4c5b-9e8f-0a1b2c3d4e5f"
+
+
+@pytest.fixture
+def goals_api(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AUTH_MODE", "disabled")
+    calls: list[tuple[str, str, dict | None]] = []
+    goal = {
+        "goal_id": GOAL,
+        "status": "active",
+        "repository_id": "sandbox",
+        "decomposition": "plan",
+        "route": None,
+        "plan_run_id": RUN,
+        "blocked_reasons": ["merge_pending"],
+        "usage": {"tasks_created": 1, "llm_calls_used": 5, "reserved_model_calls": 10},
+        "deadline": "2026-11-06T09:00:00Z",
+        "tasks": [
+            {
+                "task_key": "a",
+                "status": "published",
+                "run_id": RUN,
+                "pr_number": 3,
+                "dependencies": [],
+            },
+            {
+                "task_key": "b",
+                "status": "pending",
+                "run_id": None,
+                "dependencies": ["a"],
+                "pending_stage": None,
+            },
+        ],
+        "error": None,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        if request.method == "POST" and request.url.path == "/api/v1/goals":
+            return httpx.Response(201, json=goal)
+        if request.method == "GET" and request.url.path == f"/api/v1/goals/{GOAL}":
+            return httpx.Response(200, json=goal)
+        if request.method == "GET" and request.url.path == "/api/v1/goals":
+            return httpx.Response(200, json={"items": [{"goal_id": GOAL, "status": "active"}]})
+        if request.method == "POST" and request.url.path == f"/api/v1/goals/{GOAL}/cancel":
+            return httpx.Response(200, json={**goal, "status": "cancelled"})
+        if request.url.path == f"/api/v1/goals/{GOAL}/events":
+            return httpx.Response(
+                200,
+                json={"items": [{"created_at": "t", "kind": "goal_created", "payload": {}}]},
+            )
+        return httpx.Response(404, json={"code": "not_found", "detail": request.url.path})
+
+    client = httpx.Client(base_url="http://api.test/api/v1", transport=httpx.MockTransport(handler))
+    yield client, calls
+    client.close()
+
+
+def test_goal_commands_build_the_requests_and_describe_the_goal(goals_api, capsys):
+    client, calls = goals_api
+    assert (
+        cli.run(
+            [
+                "--project",
+                "sandbox",
+                "goal",
+                "Añade validación de correo con pruebas",
+                "--repository",
+                "sandbox",
+                "--decomposition",
+                "plan",
+                "--max-tasks",
+                "3",
+                "--deadline-days",
+                "2",
+            ],
+            client=client,
+        )
+        == 0
+    )
+    assert calls[-1][2] == {
+        "objective": "Añade validación de correo con pruebas",
+        "project_id": "sandbox",
+        "repository_id": "sandbox",
+        "decomposition": "plan",
+        "limits": {"max_tasks": 3, "deadline_seconds": 172800.0},
+    }
+    out = capsys.readouterr().out
+    assert f"Objetivo {GOAL}: active" in out and "Bloqueado por: merge_pending" in out
+    assert "a          published" in out and "PR #3" in out and "← a" in out
+    assert cli.run(["--project", "sandbox", "goals", "--status", "active"], client=client) == 0
+    assert calls[-1][1] == "/api/v1/goals"
+    assert cli.run(["--project", "sandbox", "goal-show", GOAL], client=client) == 0
+    assert cli.run(["--project", "sandbox", "goal-events", GOAL], client=client) == 0
+    assert cli.run(["--project", "sandbox", "goal-cancel", GOAL], client=client) == 0
+    assert calls[-1] == ("POST", f"/api/v1/goals/{GOAL}/cancel", None)
+    assert '"status": "cancelled"' in capsys.readouterr().out

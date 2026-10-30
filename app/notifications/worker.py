@@ -60,8 +60,13 @@ class NotificationWorker:
             text=item.text_body,
             html=item.html_body,
             message_id=item.message_id,
-            references=[f"<agentforge.{item.run_id}.thread@{self._domain}>"],
+            references=[self._thread_for(item)],
         )
+
+    def _thread_for(self, item: OutboxItem) -> str:
+        if item.run_id is not None:
+            return f"<agentforge.{item.run_id}.thread@{self._domain}>"
+        return f"<agentforge.goal.{item.goal_id}.thread@{self._domain}>"
 
     async def run_once(self) -> WorkerReport:
         report = WorkerReport()

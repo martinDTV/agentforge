@@ -69,6 +69,11 @@ class RunState(TypedDict, total=False):
     route_decision: dict[str, Any]
     route_escalation: dict[str, Any]
     plan_approved: bool
+    # Goal Supervisor (ADR 0012, D4): the child comes from an approved goal plan.
+    planned_upstream: dict[str, Any]
+    # Written by the governed qa node when QA approves: True when the repository has a
+    # remote, so the run continues into publication instead of ending ``completed``.
+    publication_expected: bool
 
 
 RunGraph = CompiledStateGraph[RunState, None, RunState, RunState]

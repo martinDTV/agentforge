@@ -45,7 +45,9 @@ def event(kind: RunEventKind, payload: dict | None = None, ordinal: int = 0) -> 
 
 
 def test_policy_maps_each_important_transition_and_ignores_noise():
+    # A loopback "public" URL is not a usable link: mails fall back to CLI instructions.
     policy = NotificationPolicy(base_url="http://127.0.0.1:8011")
+    github = "https://github.com/example-org/demo/pull/7"
     cases = [
         ((RunEventKind.RUN_CREATED, {}), NotificationKind.RUN_CREATED),
         (
@@ -60,21 +62,29 @@ def test_policy_maps_each_important_transition_and_ignores_noise():
         ((RunEventKind.WAITING_APPROVAL, {"stage": "plan"}), NotificationKind.PLAN_PENDING),
         ((RunEventKind.WAITING_APPROVAL, {"stage": "scope"}), NotificationKind.SCOPE_PENDING),
         ((RunEventKind.WAITING_APPROVAL, {"stage": "publish"}), NotificationKind.PUBLISH_PENDING),
-        ((RunEventKind.RUN_APPROVED, {"stage": "scope"}), NotificationKind.DEVELOPER_STARTED),
         (
             (RunEventKind.APPROVAL_RECORDED, {"approved": True, "stage": "scope"}),
             NotificationKind.DEVELOPER_STARTED,
+        ),
+        (
+            (RunEventKind.APPROVAL_RECORDED, {"approved": True, "stage": "plan"}),
+            NotificationKind.PLAN_APPROVED,
+        ),
+        (
+            (RunEventKind.APPROVAL_RECORDED, {"approved": False, "stage": "publish"}),
+            NotificationKind.RUN_REJECTED,
         ),
         ((RunEventKind.DEVELOPER_COMPLETED, {"files": 2}), NotificationKind.DEVELOPER_COMPLETED),
         ((RunEventKind.DEVELOPER_APPLIED, {"files": 2}), NotificationKind.QA_STARTED),
         ((RunEventKind.QA_REVIEWED, {"approved": False}), NotificationKind.QA_CHANGES_REQUESTED),
         ((RunEventKind.QA_REVIEWED, {"approved": True}), NotificationKind.QA_APPROVED),
         (
-            (RunEventKind.PULL_REQUEST_OPENED, {"pr_number": 7, "pr_url": "https://x/pull/7"}),
+            (RunEventKind.PULL_REQUEST_OPENED, {"pr_number": 7, "pr_url": github}),
             NotificationKind.PULL_REQUEST_OPENED,
         ),
         ((RunEventKind.RUN_COMPLETED, {}), NotificationKind.RUN_COMPLETED),
-        ((RunEventKind.RUN_PUBLISHED, {}), NotificationKind.RUN_PUBLISHED),
+        # ``run_published`` describes the same outcome as the PR mail: same kind, same key.
+        ((RunEventKind.RUN_PUBLISHED, {"pr_number": 7}), NotificationKind.PULL_REQUEST_OPENED),
         ((RunEventKind.RUN_FAILED, {"code": "x"}), NotificationKind.RUN_FAILED),
         ((RunEventKind.RUN_CANCELLED, {}), NotificationKind.RUN_CANCELLED),
         ((RunEventKind.RUN_EXPIRED, {}), NotificationKind.RUN_EXPIRED),
@@ -82,38 +92,59 @@ def test_policy_maps_each_important_transition_and_ignores_noise():
     for (kind, payload), expected in cases:
         draft = policy.draft(CTX, kind=kind, payload=payload, ordinal=0, moment=T0)
         assert draft is not None and draft.kind is expected, kind
-        assert "[AgentForge] sandbox-github · de8845f3 ·" in draft.subject
-        for required in ("Proyecto:", "Ejecución:", "Etapa:", "Estado:", "Fecha:", "Tarea:"):
-            assert required in draft.text
-        assert (
-            "http://127.0.0.1:8011/api/v1/runs/de8845f3-bd98-48cc-bdd4-1fe67d55ea75" in draft.text
-        )
+        assert draft.subject.startswith("[AgentForge] ") and draft.subject.endswith(
+            "— sandbox-github"
+        ), draft.subject
+        assert "de8845f3" not in draft.subject  # no identifiers in subjects
+        for required in ("Proyecto: sandbox-github", "Ejecución: de8845f3", "Solicitud:"):
+            assert required in draft.text, (kind, required)
+        assert "127.0.0.1" not in draft.text and "127.0.0.1" not in draft.html
         assert "<html" in draft.html and "&lt;b&gt;x&lt;/b&gt;" in draft.html  # escaped task
-    # Noise: per-node bookkeeping events produce no mail.
+        assert "<b>x</b>" not in draft.html
+    # Noise: per-node bookkeeping events produce no mail; so do decisions already covered.
     for kind in (
-        RunEventKind.APPROVAL_RECORDED,
+        RunEventKind.APPROVAL_RECORDED,  # without ``approved`` nothing can be said
         RunEventKind.APPROVAL_APPLIED,
         RunEventKind.RUN_RESUMED,
         RunEventKind.MIRROR_REFRESHED,
         RunEventKind.PLANNER_COMPLETED,
         RunEventKind.SCOPE_PROPOSED,
+        RunEventKind.RUN_APPROVED,
+        RunEventKind.RUN_REJECTED,
     ):
         assert policy.draft(CTX, kind=kind, payload={}, ordinal=0, moment=T0) is None
-    # The publish approval itself is silent: the outcome (PR / published) notifies.
+    # QA approval on a repository with a remote: the run continues into publication, so
+    # the qa node's ``run_completed`` says nothing (the publication mails follow).
     assert (
         policy.draft(
-            CTX, kind=RunEventKind.RUN_APPROVED, payload={"stage": "publish"}, ordinal=0, moment=T0
+            CTX,
+            kind=RunEventKind.RUN_COMPLETED,
+            payload={},
+            ordinal=0,
+            moment=T0,
+            context={"publication_expected": True},
         )
         is None
     )
     pr = policy.draft(
         CTX,
         kind=RunEventKind.PULL_REQUEST_OPENED,
-        payload={"pr_number": 7, "pr_url": "https://x/pull/7"},
+        payload={"pr_number": 7, "pr_url": github},
         ordinal=0,
         moment=T0,
     )
-    assert pr is not None and "https://x/pull/7" in pr.text and "Pull Request #7" in pr.subject
+    assert (
+        pr is not None and github in pr.text and pr.subject.startswith("[AgentForge] PR #7 creado")
+    )
+    # A pull request URL outside github.com is never linked.
+    elsewhere = policy.draft(
+        CTX,
+        kind=RunEventKind.PULL_REQUEST_OPENED,
+        payload={"pr_number": 7, "pr_url": "https://evil.example/pull/7"},
+        ordinal=0,
+        moment=T0,
+    )
+    assert elsewhere is not None and "evil.example" not in elsewhere.html
 
 
 def test_enqueuer_dedups_per_event_and_recipient_and_threads_a_run():
@@ -411,10 +442,69 @@ def test_priority_level_keeps_approvals_failures_and_outcomes_only():
         NotificationKind.SCOPE_PENDING,
         NotificationKind.RUN_COMPLETED,
         NotificationKind.PUBLISH_PENDING,
-        NotificationKind.PULL_REQUEST_OPENED,
-        NotificationKind.RUN_PUBLISHED,
+        NotificationKind.PULL_REQUEST_OPENED,  # ``run_published`` dedups into this one
         NotificationKind.RUN_FAILED,
     ]
-    assert len(verbose.drafts(run, noisy, moment=T0)) == 11
+    assert len(verbose.drafts(run, noisy, moment=T0)) == 10
     assert {NotificationKind.PLAN_PENDING, NotificationKind.RUN_CANCELLED} <= PRIORITY_KINDS
     assert NotificationKind.DEVELOPER_STARTED not in PRIORITY_KINDS
+
+
+def test_goal_events_become_goal_notifications_with_their_own_thread_and_dedup():
+    """ADR 0012 §2.8: goal notifications reuse the outbox; priority keeps the human-facing ones."""
+    from uuid import uuid4
+
+    from app.contracts.goals import GoalEventKind
+    from app.goals.ports import GoalEvent
+    from app.notifications import GoalContext
+
+    policy = NotificationPolicy(base_url="https://agentforge.example")
+    goal = GoalContext(
+        goal_id=uuid4(), project_id="sandbox-gh", repository_id="sandbox-demo", objective="Objetivo"
+    )
+    moment = datetime(2026, 10, 30, 10, 0, tzinfo=UTC)
+    needs = policy.draft_goal(
+        goal,
+        kind=GoalEventKind.NEEDS_HUMAN,
+        payload={"reason": "merge_pending", "task_key": "a", "pr_number": 7},
+        ordinal=12,
+        moment=moment,
+    )
+    assert needs is not None and needs.kind is NotificationKind.GOAL_NEEDS_HUMAN
+    assert needs.subject == "[AgentForge] Acción requerida: fusionar el PR #7 — sandbox-gh"
+    assert "Objetivo:" in needs.text and f"/api/v1/goals/{goal.goal_id}" in needs.text
+    assert "Pull Request: #7" in needs.text and "Tarea: a" in needs.text
+    assert (
+        policy.draft_goal(
+            goal, kind=GoalEventKind.CAPACITY_WAIT, payload={}, ordinal=0, moment=moment
+        )
+        is None
+    )
+    done = policy.draft_goal(
+        goal,
+        kind=GoalEventKind.GOAL_PARTIAL,
+        payload={"tasks": 3, "succeeded": 2, "failed": 1, "code": "pr_closed"},
+        ordinal=0,
+        moment=moment,
+    )
+    assert done is not None and done.kind is NotificationKind.GOAL_PARTIAL
+    priority = NotificationEnqueuer(policy, recipients=["ops@example.test"], level="priority")
+    drafts = priority.goal_drafts(
+        goal,
+        [
+            (1, GoalEvent(kind=GoalEventKind.GOAL_CREATED, payload={"decomposition": "plan"})),
+            (2, GoalEvent(kind=GoalEventKind.NEEDS_HUMAN, ordinal=12, payload={"reason": "x"})),
+            (3, GoalEvent(kind=GoalEventKind.GOAL_COMPLETED, payload={"tasks": 1})),
+        ],
+        moment=moment,
+    )
+    assert [d.kind for d in drafts] == [
+        NotificationKind.GOAL_NEEDS_HUMAN,
+        NotificationKind.GOAL_COMPLETED,
+    ]
+    assert all(d.goal_id == goal.goal_id and d.run_id is None for d in drafts)
+    assert drafts[0].dedup_key == f"goal:{goal.goal_id}:goal_needs_human:12:ops@example.test"
+    assert drafts[0].message_id.startswith(f"<agentforge.goal.{goal.goal_id}.goal_needs_human.12@")
+    verbose = NotificationEnqueuer(policy, recipients=["ops@example.test"], level="verbose")
+    created = [(1, GoalEvent(kind=GoalEventKind.GOAL_CREATED))]
+    assert len(verbose.goal_drafts(goal, created, moment=moment)) == 1

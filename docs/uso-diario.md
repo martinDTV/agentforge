@@ -20,11 +20,12 @@ local, `.env` (0600) y, para que Developer y QA ejecuten pruebas, el Runner alca
 
 `status` resume todo lo que importa: `api.running`, `health` (`database`, `schema`,
 `checkpoints` y `notifications`: `worker` cuando el worker de correo está activo, `disabled`
-sin correo), `alembic` (`0009 (head)` esperado), `worker` y los recuentos de la bandeja de
+sin correo), `alembic` (`0010 (head)` esperado), `worker` y los recuentos de la bandeja de
 salida por estado. `GET /health/ready` devuelve la misma información.
 
 Valores predeterminados seguros: `GITHUB_WRITE_ENABLED=false` (nada sale del equipo),
-`NOTIFICATIONS_LEVEL=priority`, `ROUTER_DEFAULT_MODE=auto`.
+`NOTIFICATIONS_LEVEL=priority`, `ROUTER_DEFAULT_MODE=auto`, sin `PUBLIC_APP_URL` (los correos
+indican los comandos de la terminal en lugar de un enlace a la API local).
 
 ## 2. Crear una tarea
 
@@ -49,6 +50,36 @@ Modos de ruta:
 Equivalente HTTP: `POST /api/v1/runs` con `task`, `project_id`, `workflow_kind: development`,
 `repository_id` y opcionalmente `route_mode`.
 
+## 2b. Asignar un objetivo (Fase 8)
+
+En lugar de crear cada tarea a mano, describe el objetivo y deja que el Supervisor lo
+convierta en ejecuciones, una a la vez:
+
+```bash
+uv run python -m scripts.agentforge goal \
+  "Añade validación de correo al registro de usuarios, con pruebas, y documenta el módulo" \
+  --repository sandbox-github [--decomposition auto|single|plan] [--max-tasks 5] \
+  [--max-usd 25] [--deadline-days 7]
+uv run python -m scripts.agentforge goals [--status active|blocked|...]
+uv run python -m scripts.agentforge goal-show <goal_id>     # tareas, ejecuciones hijas, qué espera
+uv run python -m scripts.agentforge goal-events <goal_id>
+uv run python -m scripts.agentforge goal-cancel <goal_id>
+```
+
+Qué ocurre: con `auto`, el Smart Router decide si el objetivo cabe en una sola ejecución
+(`fast`) o necesita planificación; con `plan`, Planner y Architect proponen de 1 a 5 tareas
+con dependencias y **tú apruebas el plan** (`approve <plan_run_id>`, etapa `plan`). Después el
+Supervisor crea la primera tarea como una ejecución normal y tú apruebas su alcance y su
+publicación como siempre. Una tarea que depende de otra solo empieza cuando **fusionas el
+Pull Request** de la anterior: la plataforma lo comprueba en GitHub y en el espejo; un PR
+abierto no basta. `goal-show` indica qué ejecución espera qué decisión y, si el objetivo está
+`blocked`, por qué (`decision_pending`, `merge_pending`, `task_failed`, `pr_closed`, …).
+
+Límites: una hija activa por objetivo, presupuesto agregado de llamadas y USD reservado antes
+de crear cada hija, plazo de 7 días por defecto. Una hija fallida no se vuelve a crear sola:
+revisa su código de error y decide. Repositorios sin remoto (sin PR) solo admiten
+`--decomposition single`. El Supervisor nunca aprueba nada: no tiene `runs:approve`.
+
 ## 3. Aprobar el alcance
 
 Recibirás "Alcance pendiente de aprobación". Revisa y decide:
@@ -56,7 +87,7 @@ Recibirás "Alcance pendiente de aprobación". Revisa y decide:
 ```bash
 uv run python -m scripts.agentforge pending <run_id>   # archivos, acciones, pruebas, digest
 uv run python -m scripts.agentforge approve <run_id>   # pide los 8 primeros caracteres del digest
-uv run python -m scripts.agentforge reject  <run_id>
+uv run python -m scripts.agentforge reject  <run_id> --reason "por qué"   # el motivo se registra y se envía por correo
 ```
 
 La aprobación viaja con el digest exacto mostrado: si la propuesta cambia, la decisión no
@@ -91,7 +122,14 @@ pendientes; ejecución completada; Pull Request creado; publicada; fallo; cancel
 caducidad. Con `verbose` se añaden la ruta elegida, la planeación, Developer y QA paso a paso.
 Todos los correos de una ejecución van en el mismo hilo.
 
-## 6. Actualizar la base de datos (migración 0009)
+## 6. Actualizar la base de datos (migraciones 0009 y 0010)
+
+La migración 0010 (Fase 8) añade `goals`, `goal_tasks` y `goal_events`, y permite que una fila
+de `notification_outbox` pertenezca a un objetivo en lugar de a una ejecución; no modifica
+filas existentes. Se aplica con el mismo procedimiento que la 0009 (respaldo, API parada,
+`uv run alembic upgrade head`, `alembic current` debe decir `0010 (head)`). El downgrade a 0009
+elimina las tres tablas y se niega mientras exista alguna notificación de objetivo.
+
 
 La migración 0009 añade `notification_outbox`, `route_decisions` y las columnas `route` y
 `route_mode` de `runs`; no modifica ni borra filas existentes. Plan, con la API parada:

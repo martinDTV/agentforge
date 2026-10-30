@@ -26,6 +26,7 @@ def test_ready_is_ok_against_a_migrated_database(
             "database": "ok",
             "schema": "ok",
             "checkpoints": "memory",
+            "notifications": "disabled",
         }
         # Fase 2 behaviour is intact with a database attached.
         created = client.post(RUNS, json={"task": "Crear módulo de pacientes con pruebas"})

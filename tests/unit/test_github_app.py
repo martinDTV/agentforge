@@ -13,6 +13,7 @@ import pytest
 
 from app.git.remote import RemoteSpec
 from app.infrastructure.github import (
+    PULLS_READ_PERMISSIONS,
     READ_ONLY_PERMISSIONS,
     GitHubAppCredentials,
     GitHubClient,
@@ -130,9 +131,14 @@ def test_write_permissions_never_reach_github():
         provider.token_for(INSTALLATION_ID, NAME, permissions={"contents": "write"})
     assert exc.value.code == "permission_not_allowed"
     with pytest.raises(GitHubError) as exc:
-        provider.token_for(INSTALLATION_ID, NAME, permissions={"pull_requests": "read"})
+        provider.token_for(INSTALLATION_ID, NAME, permissions={"pull_requests": "write"})
     assert exc.value.code == "permission_not_allowed"
     assert fake.requests == []  # refused locally, before any HTTP request
+    # Reading pull requests (integration evidence for goals, ADR 0012) is allowed without
+    # writes, but the installation itself must grant it: the fake does not here.
+    with pytest.raises(GitHubError) as exc:
+        provider.token_for(INSTALLATION_ID, NAME, permissions={"pull_requests": "read"})
+    assert exc.value.code == "token_request_rejected"
 
 
 def test_github_failures_map_to_stable_codes_without_payloads():
@@ -351,3 +357,34 @@ def test_installation_details_and_branch_heads_are_read_as_the_app_and_the_insta
     with pytest.raises(GitHubError) as exc:
         client.branch_head(token.reveal(), OWNER, NAME, "main")
     assert exc.value.code == "github_protocol_error"
+
+
+def test_pull_request_merge_state_is_read_with_a_read_only_token():
+    """Integration evidence for goals (ADR 0012): ``merged_at`` and ``merge_commit_sha`` come
+    from GitHub; with a squash merge the merge commit differs from the head."""
+    fake, client, _credentials, provider, _clock = setup()
+    fake.app_permissions = {"contents": "read", "metadata": "read", "pull_requests": "read"}
+    fake.branches["agentforge/run"] = "a" * 40
+    fake.pulls[1] = {
+        "number": 1,
+        "html_url": "https://github.test/pull/1",
+        "state": "open",
+        "draft": True,
+        "head": {"ref": "agentforge/run", "sha": "a" * 40},
+        "base": {"ref": "main"},
+    }
+    token = provider.token_for(INSTALLATION_ID, NAME, permissions=PULLS_READ_PERMISSIONS)
+    assert token.permissions == dict(PULLS_READ_PERMISSIONS)
+    pr = client.get_pull_request(token.reveal(), OWNER, NAME, 1)
+    assert pr.state == "open" and not pr.merged and pr.merge_commit_sha is None
+    fake.merge_pull_request(1, merge_commit_sha="c" * 40, squash=True)
+    pr = client.get_pull_request(token.reveal(), OWNER, NAME, 1)
+    assert pr.merged and pr.merged_at is not None and pr.merge_commit_sha == "c" * 40
+    assert pr.merge_commit_sha != pr.head_sha
+    fake.close_pull_request(1)
+    pr = client.get_pull_request(token.reveal(), OWNER, NAME, 1)
+    assert pr.state == "closed" and not pr.merged
+    # Writes are still refused when the provider has no write scopes.
+    with pytest.raises(GitHubError) as exc:
+        provider.token_for(INSTALLATION_ID, NAME, permissions={"pull_requests": "write"})
+    assert exc.value.code == "permission_not_allowed"

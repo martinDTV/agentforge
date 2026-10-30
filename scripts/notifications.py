@@ -62,7 +62,8 @@ async def run(args: argparse.Namespace) -> int:
                     json.dumps(
                         {
                             "id": item.id,
-                            "run_id": str(item.run_id)[:8],
+                            "run_id": str(item.run_id)[:8] if item.run_id else None,
+                            "goal_id": str(item.goal_id)[:8] if item.goal_id else None,
                             "kind": item.kind.value,
                             "status": item.status.value,
                             "attempts": item.attempts,

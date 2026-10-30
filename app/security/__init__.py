@@ -1,4 +1,5 @@
 from .automation import AGENT_ROLE, AUTOMATION_ISSUER, AutomationIdentity
+from .delegation import DELEGATION_ISSUER, delegated_principal, is_delegated
 from .errors import (
     AuthenticationError,
     PermissionDeniedError,
@@ -37,6 +38,7 @@ __all__ = [
     "AGENT_ROLE",
     "AUTOMATION_ISSUER",
     "DEFAULT_AGENT_GRANTS",
+    "DELEGATION_ISSUER",
     "DEFAULT_ROLE_PERMISSIONS",
     "ENABLED_RISK_CLASSES",
     "LEGACY_OWNER",
@@ -63,4 +65,6 @@ __all__ = [
     "ToolAuthorizationPolicy",
     "ToolDecision",
     "VerificationRules",
+    "delegated_principal",
+    "is_delegated",
 ]

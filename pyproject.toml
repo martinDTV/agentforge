@@ -1,6 +1,6 @@
 [project]
 name = "agentforge"
-version = "0.5.0"
+version = "0.8.0"
 description = "Fase 5: FastAPI + LangGraph + Claude (Vertex AI) + PostgreSQL + OIDC + Tool Gateway, worktrees Git y ejecución aislada con un runner Podman rootless"
 requires-python = ">=3.11"
 dependencies = [

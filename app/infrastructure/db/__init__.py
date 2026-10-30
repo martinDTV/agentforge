@@ -9,6 +9,8 @@ from .fake import (
     InMemoryRunRepository,
     InMemoryToolInvocationRepository,
 )
+from .fake_goals import InMemoryGoalRepository
+from .goals import SqlAlchemyGoalRepository
 from .mirror_syncs import SqlAlchemyMirrorSyncRepository
 from .notifications import SqlAlchemyNotificationOutbox, SqlAlchemyRouteDecisionRepository
 from .publications import SqlAlchemyPublicationRepository
@@ -20,6 +22,7 @@ __all__ = [
     "Base",
     "Database",
     "DatabaseUnavailableError",
+    "InMemoryGoalRepository",
     "InMemoryMirrorSyncRepository",
     "InMemoryNotificationOutbox",
     "InMemoryRouteDecisionRepository",
@@ -27,6 +30,7 @@ __all__ = [
     "InMemoryRunRepository",
     "InMemoryToolInvocationRepository",
     "SchemaMismatchError",
+    "SqlAlchemyGoalRepository",
     "SqlAlchemyMirrorSyncRepository",
     "SqlAlchemyNotificationOutbox",
     "SqlAlchemyRouteDecisionRepository",

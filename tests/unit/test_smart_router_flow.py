@@ -243,7 +243,7 @@ async def test_a_small_task_takes_the_fast_route_and_is_notified_at_each_transit
     )
     assert (
         "Ruta seleccionada: fast" in sender.sent[1].subject
-        and "Scoper prepara el alcance" in sender.sent[1].text
+        and "directa al Scoper" in sender.sent[1].text
     )
 
 
