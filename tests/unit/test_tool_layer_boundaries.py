@@ -54,3 +54,31 @@ def test_domain_and_orchestration_do_not_depend_on_the_homelab():
     ):
         for module in (APP / layer).rglob("*.py"):
             assert not words.search(module.read_text()), module
+
+
+def test_the_goal_domain_imports_only_contracts_and_the_coordinator_never_approves():
+    """ADR 0012: ``app/goals`` is pure; the coordinator reaches runs only through the
+    launcher's create/decisions/cancel and never touches GitHub, Git or the sandbox."""
+    allowed = ("app.contracts", "app.security")  # same rule as app/tools: pure packages only
+    for module in (APP / "goals").glob("*.py"):
+        for name in _imports(module):
+            assert not name.startswith("app.") or name.startswith(allowed), (module.name, name)
+    coordinator = APP / "orchestration" / "goals.py"
+    imported = _imports(coordinator)
+    for forbidden in (
+        "app.infrastructure.github",
+        "app.infrastructure.git",
+        "app.infrastructure.sandbox",
+        "app.tools",
+        "app.sandbox",
+        "app.workspaces",
+        "fastapi",
+        "sqlalchemy",
+    ):
+        assert not any(i.startswith(forbidden) for i in imported), forbidden
+    source = coordinator.read_text()
+    assert ".approve(" not in source and ".resume(" not in source
+    assert "generate_structured" not in source  # no model in the supervision loop
+    # Only the integration probe (platform code) talks to GitHub for goals.
+    probe = APP / "infrastructure" / "github" / "integration.py"
+    assert "PULLS_READ_PERMISSIONS" in probe.read_text()
