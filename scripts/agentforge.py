@@ -193,6 +193,9 @@ def run(argv: Sequence[str] | None = None, *, client: httpx.Client | None = None
         if name in ("approve", "reject"):
             p.add_argument("--yes", action="store_true", help="no interactive confirmation")
             p.add_argument("--digest", default=None, help="full digest, non-interactive")
+            p.add_argument(
+                "--reason", default=None, help="motivo formal de la decisión (se registra)"
+            )
     goal = sub.add_parser("goal", help="create a goal (Fase 8)")
     goal.add_argument("text")
     goal.add_argument("--repository", default=_env("AGENTFORGE_REPOSITORY"))
@@ -355,6 +358,8 @@ def run(argv: Sequence[str] | None = None, *, client: httpx.Client | None = None
         payload: dict[str, Any] = {"approved": approved, "stage": stage}
         if digest is not None:
             payload["publish_digest" if stage == "publish" else "scope_digest"] = digest
+        if args.reason:
+            payload["reason"] = args.reason[:500]
         r = client.post(f"/runs/{args.run_id}/approve", json=payload, headers=h)
         if r.status_code != 200:
             return _fail(r)

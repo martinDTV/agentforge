@@ -197,6 +197,9 @@ class RunDecisionRecord(Base):
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scope_digest: Mapped[str | None] = mapped_column(String(64))
+    # Optional formal reason written by the human (migration 0011). Shown in mails as the
+    # recorded motive of a decision; never a model's text.
+    reason: Mapped[str | None] = mapped_column(String(500))
 
     __table_args__ = (
         UniqueConstraint("run_id", "stage", name="uq_run_decisions_run_id_stage"),

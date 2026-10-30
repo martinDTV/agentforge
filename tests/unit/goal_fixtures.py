@@ -235,6 +235,18 @@ class FakeLauncher:
         await self._move(run_id, S.RESUME_PENDING, pending_stage=DecisionStage.PLAN)
         await self._move(run_id, S.REJECTED, llm_calls=2)
 
+    async def refuse_plan_after_claim(self, run_id: UUID, lease: Any) -> None:
+        """The decision was claimed (``resume_pending``, lease held): project the outcome."""
+        row = await self.repository.get_run(run_id)
+        assert row is not None and row.status is S.RESUME_PENDING
+        updated = await self.repository.project(
+            run_id,
+            RunProjection(status=S.REJECTED, llm_calls=2, plan=row.plan),
+            lease=lease,
+            release=True,
+        )
+        assert updated is not None
+
 
 class FakeProbe:
     """Scripted integration evidence: ``state`` per pull request number, and which commits

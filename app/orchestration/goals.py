@@ -470,10 +470,22 @@ class GoalCoordinator:
                 pending_stage=row.pending_stage,
                 error_code=row.error.code if row.error else None,
             )
-            ctx.event(GoalEventKind.PLAN_REFUSED, run_id=str(row.id), code=code)
+            decided_by, reason = await self._last_decision(row.id)
+            ctx.event(
+                GoalEventKind.PLAN_REFUSED,
+                run_id=str(row.id),
+                code=code,
+                decided_by=decided_by,
+                reason=reason,
+            )
             status = _G.CANCELLED if row.status is _S.CANCELLED else _G.FAILED
             await self._finish(
-                ctx, status, code=f"plan_{code}", message="la planificación no fue aprobada"
+                ctx,
+                status,
+                code=f"plan_{code}",
+                message="la planificación no fue aprobada",
+                reason=reason,
+                decided_by=decided_by,
             )
             return
         if row.status in (_S.WAITING_APPROVAL, _S.RESUME_PENDING):
@@ -490,6 +502,14 @@ class GoalCoordinator:
                     stage="plan",
                     deadline=row.approval_deadline.isoformat() if row.approval_deadline else None,
                 )
+
+    async def _last_decision(self, run_id: UUID) -> tuple[str | None, str | None]:
+        """Who took the last recorded decision of a run and the formal reason, if any."""
+        decisions = await self._runs.list_decisions(run_id)
+        if not decisions:
+            return None, None
+        last = decisions[-1]
+        return last.decided_by, last.reason
 
     async def _waiting_since(self, row: PersistedRun, now: datetime) -> datetime:
         """When the run started waiting: its ``waiting_approval`` event, else its last update."""
@@ -705,15 +725,30 @@ class GoalCoordinator:
         )
         patch.status = _T.FAILED
         patch.last_error_code = code
-        ctx.event(
-            GoalEventKind.TASK_FAILED,
-            ordinal=task.ordinal * 4 + min(task.attempt, 3),
-            task_key=task.task_key,
-            run_id=str(row.id),
-            code=code,
-            attempt=task.attempt,
+        decided_by, reason = (
+            await self._last_decision(row.id) if row.status is _S.REJECTED else (None, None)
         )
-        ctx.needs_human(NeedsHumanReason.TASK_FAILED, task, code=code)
+        failure: dict[str, Any] = {
+            "task_key": task.task_key,
+            "run_id": str(row.id),
+            "code": code,
+            "attempt": task.attempt,
+        }
+        if decided_by:
+            failure["decided_by"] = decided_by
+        if reason:
+            failure["reason"] = reason
+        if row.error is not None:
+            failure["message"] = row.error.message[:300]
+        ctx.event(
+            GoalEventKind.TASK_FAILED, ordinal=task.ordinal * 4 + min(task.attempt, 3), **failure
+        )
+        ctx.needs_human(
+            NeedsHumanReason.TASK_FAILED,
+            task,
+            code=code,
+            **({"reason": reason} if reason else {}),
+        )
         await self._patch(ctx, task, patch)
 
     async def _record_scope(
@@ -1145,6 +1180,8 @@ class GoalCoordinator:
         message: str | None = None,
         actor: str | None = None,
         withdraw: bool = True,
+        reason: str | None = None,
+        decided_by: str | None = None,
     ) -> None:
         tasks = list(ctx.tasks.values())
         patch = GoalPatch(
@@ -1174,7 +1211,29 @@ class GoalCoordinator:
             payload["code"] = code
         if actor:
             payload["decided_by"] = actor
-        ctx.events.append(GoalEvent(kind=kind, payload=payload, actor_subject=actor))
+        elif decided_by:
+            payload["decided_by"] = decided_by
+        if reason:
+            payload["reason"] = reason
+        if message:
+            payload["message"] = message[:300]
+        # Notification material (never persisted): the roster of tasks with their outcome.
+        roster = [
+            {
+                "task_key": t.task_key,
+                "title": t.title,
+                "status": t.status.value,
+                "pr_number": t.pr_number,
+                "pr_url": t.pr_url,
+                "merged": t.status is _T.MERGED,
+                "code": t.last_error_code,
+            }
+            for t in sorted(tasks, key=lambda t: t.ordinal)
+        ]
+        context = {"tasks": roster, "usage": ctx.goal.usage.model_dump(mode="json")}
+        ctx.events.append(
+            GoalEvent(kind=kind, payload=payload, actor_subject=actor, context=context)
+        )
         if withdraw and status in (_G.CANCELLED, _G.EXPIRED):
             await self._withdraw_children(ctx, reason=status.value)
         await self._flush(ctx)

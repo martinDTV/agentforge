@@ -129,6 +129,8 @@ class GoalEvent(BaseModel):
     ordinal: int = Field(default=0, ge=0)
     payload: dict[str, Any] = Field(default_factory=dict)
     actor_subject: str | None = None
+    # Ephemeral notification material (see ``RunEvent.context``); never persisted.
+    context: dict[str, Any] = Field(default_factory=dict, exclude=True, repr=False)
 
 
 class PersistedGoalEvent(GoalEvent):

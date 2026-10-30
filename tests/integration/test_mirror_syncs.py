@@ -16,7 +16,7 @@ T0 = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 
 
 def test_0007_adds_the_mirror_audit_table_and_downgrades_cleanly(empty_database_url: str):
-    assert expected_head_revision() == "0010"
+    assert expected_head_revision() == "0011"
     migrate(empty_database_url, "0006")
     engine = create_engine(empty_database_url)
     try:

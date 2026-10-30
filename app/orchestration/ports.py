@@ -121,6 +121,10 @@ class RunEvent(BaseModel):
     checkpoint_id: str | None = None
     # Human/service principal behind the event; None for agent and system events.
     actor_subject: str | None = None
+    # Ephemeral material for the notification of this event (a proposal summary, file
+    # paths, a QA verdict). Never persisted: ``exclude=True`` keeps it out of the audit
+    # row; an event rebuilt from history simply has none and gets a plainer mail.
+    context: dict[str, Any] = Field(default_factory=dict, exclude=True, repr=False)
 
 
 class PersistedEvent(RunEvent):
@@ -159,6 +163,8 @@ class DecisionRecord(BaseModel):
     applied_at: datetime | None = None
     decided_by: str | None = None
     scope_digest: str | None = None
+    # Formal reason written by the human (migration 0011); None for older decisions.
+    reason: str | None = None
 
 
 class DecisionClaim(BaseModel):
@@ -324,6 +330,7 @@ class RunRepository(Protocol):
         ttl_seconds: float,
         decided_by: str | None,
         scope_digest: str | None = None,
+        reason: str | None = None,
     ) -> DecisionClaim | None:
         """Atomic ``waiting_approval -> resume_pending`` plus the decision row for
         ``stage`` (unique per run and stage). Stage ``plan`` also writes

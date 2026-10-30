@@ -382,6 +382,10 @@ class InMemoryRunRepository:
                 project_id=run.project_id,
                 task=run.task,
                 workflow_kind=run.workflow_kind.value,
+                plan=run.plan,
+                publication=run.publication,
+                error_code=run.error.code if run.error else None,
+                pending_stage=run.pending_stage.value if run.pending_stage else None,
             )
             self.outbox.insert(self._notifications.drafts(context, new, moment=self.clock()))
         return inserted
@@ -431,6 +435,7 @@ class InMemoryRunRepository:
         ttl_seconds: float,
         decided_by: str | None,
         scope_digest: str | None = None,
+        reason: str | None = None,
     ) -> DecisionClaim | None:
         self._enter("claim_decision")
         current = self.runs.get(run_id)
@@ -451,6 +456,7 @@ class InMemoryRunRepository:
             decided_at=now,
             decided_by=decided_by,
             scope_digest=scope_digest,
+            reason=reason,
         )
         generation = current.lease_generation + 1
         self._store(
@@ -474,6 +480,8 @@ class InMemoryRunRepository:
             payload["approved_by" if approved else "rejected_by"] = decided_by
         if scope_digest is not None:
             payload["scope_digest"] = scope_digest
+        if reason:
+            payload["reason"] = reason
         key = (RunEventKind.APPROVAL_RECORDED, stage.event_ordinal)
         if any((e.kind, e.ordinal) == key for e in self.events.get(run_id, [])):
             # Mirror PostgreSQL: claim_decision inserts the event directly, so a

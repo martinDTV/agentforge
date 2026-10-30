@@ -42,7 +42,7 @@ G, T = GoalStatus, GoalTaskStatus
 
 
 def test_0010_adds_goals_tables_and_the_outbox_goal_reference(empty_database_url: str):
-    assert expected_head_revision() == "0010"
+    assert expected_head_revision() == "0011"
     migrate(empty_database_url, "0009")
     engine = create_engine(empty_database_url)
     try:

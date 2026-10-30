@@ -124,4 +124,4 @@ def test_run_id_is_uuid_and_documents_thread_id():
 
 
 def test_alembic_head_is_the_latest_migration():
-    assert expected_head_revision() == "0010"
+    assert expected_head_revision() == "0011"

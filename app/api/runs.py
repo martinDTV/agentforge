@@ -171,6 +171,7 @@ async def approve_run(
         stage=body.stage,
         scope_digest=body.scope_digest,
         publish_digest=body.publish_digest,
+        reason=body.reason,
     )
 
 
@@ -208,6 +209,7 @@ async def list_run_decisions(
                 applied_at=d.applied_at,
                 scope_digest=d.scope_digest if d.stage is not DecisionStage.PUBLISH else None,
                 publish_digest=d.scope_digest if d.stage is DecisionStage.PUBLISH else None,
+                reason=d.reason,
             )
             for d in view.decisions
         ],

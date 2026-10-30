@@ -352,6 +352,7 @@ class RunService:
         stage: DecisionStage | None = None,
         scope_digest: str | None = None,
         publish_digest: str | None = None,
+        reason: str | None = None,
     ) -> RunResponse:
         """Record and apply a human decision for the stage the run waits for.
 
@@ -420,6 +421,7 @@ class RunService:
                 ttl_seconds=self._policy.lease_ttl_seconds,
                 decided_by=principal.subject,
                 scope_digest=digest,
+                reason=(reason or "").strip() or None,
             )
             if claim is None:
                 raise RunNotFoundError(run_id)
