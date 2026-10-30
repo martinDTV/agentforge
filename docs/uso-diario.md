@@ -24,7 +24,8 @@ sin correo), `alembic` (`0010 (head)` esperado), `worker` y los recuentos de la 
 salida por estado. `GET /health/ready` devuelve la misma información.
 
 Valores predeterminados seguros: `GITHUB_WRITE_ENABLED=false` (nada sale del equipo),
-`NOTIFICATIONS_LEVEL=priority`, `ROUTER_DEFAULT_MODE=auto`.
+`NOTIFICATIONS_LEVEL=priority`, `ROUTER_DEFAULT_MODE=auto`, sin `PUBLIC_APP_URL` (los correos
+indican los comandos de la terminal en lugar de un enlace a la API local).
 
 ## 2. Crear una tarea
 
@@ -86,7 +87,7 @@ Recibirás "Alcance pendiente de aprobación". Revisa y decide:
 ```bash
 uv run python -m scripts.agentforge pending <run_id>   # archivos, acciones, pruebas, digest
 uv run python -m scripts.agentforge approve <run_id>   # pide los 8 primeros caracteres del digest
-uv run python -m scripts.agentforge reject  <run_id>
+uv run python -m scripts.agentforge reject  <run_id> --reason "por qué"   # el motivo se registra y se envía por correo
 ```
 
 La aprobación viaja con el digest exacto mostrado: si la propuesta cambia, la decisión no

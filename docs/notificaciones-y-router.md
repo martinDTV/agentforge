@@ -36,7 +36,7 @@ AGENTFORGE_SMTP_USERNAME=notificacione.agentforge@gmail.com
 AGENTFORGE_SMTP_APP_PASSWORD=<contraseña de aplicación de 16 caracteres>
 AGENTFORGE_EMAIL_FROM=notificacione.agentforge@gmail.com
 AGENTFORGE_EMAIL_TO=vazquezmartin1240@gmail.com
-AGENTFORGE_PUBLIC_URL=http://127.0.0.1:8011
+# PUBLIC_APP_URL=https://…   # solo si existe un destino https accesible; sin él, instrucciones de CLI
 NOTIFICATIONS_LEVEL=priority   # o verbose
 ```
 
@@ -103,8 +103,8 @@ la planeación, Developer iniciado y completado, QA iniciado, correcciones y QA 
   puede reconocer el duplicado; todos los correos de una ejecución van en el mismo hilo.
 - Un fallo del correo nunca afecta a la ejecución: el grafo no espera al envío y el worker
   nunca toca `runs`.
-- Contenido: proyecto, tarea (recortada), id corto, etapa, estado, fecha, siguiente acción y
-  enlace; texto plano más HTML sencillo. Nunca secretos ni archivos del repositorio.
+- Contenido: cada correo dice qué ocurrió, en qué estado queda y qué sigue (ver «Diseño de
+  los correos»). Nunca secretos, código ni archivos del repositorio.
 
 ### Avisos de objetivo (Fase 8)
 
@@ -115,6 +115,41 @@ presupuesto agotado), `goal_completed`, `goal_partial`, `goal_failed`, `goal_can
 publicada y dependencia fusionada. Cada objetivo tiene su propio hilo
 (`<agentforge.goal.<id>.thread@…>`); los correos de sus ejecuciones hijas siguen llegando como
 hasta ahora.
+
+### Diseño de los correos
+
+Asunto: `[AgentForge] <qué ocurrió> — <proyecto>`, sin hashes ni identificadores largos
+(`Acción requerida: aprobar alcance — sandbox-github`, `QA necesita correcciones (ronda 2) —
+sandbox-github`, `PR #12 creado — sandbox-github`, `Plan rechazado — sandbox-github`,
+`Objetivo cerrado: plan rechazado — sandbox-github`). Cuerpo HTML de 600 px con tablas y CSS
+en línea, sin imágenes, scripts ni fuentes remotas, legible en Gmail y móvil; estado con
+palabra y símbolo (pendiente ●, en curso ◐, completado ✓, rechazado o fallido ✕), resumen,
+hechos clave, listas (tareas, archivos, pruebas, riesgos), bloque «Qué sigue» con los comandos
+de la terminal, enlaces identificados y detalles técnicos al final. La alternativa `text/plain`
+contiene toda la información del HTML.
+
+Veracidad: el correo distingue tres fuentes y nunca mezcla ni inventa. Los hechos de la
+plataforma (estado, etapa, archivos, comprobaciones, PR). El **motivo registrado** por la
+persona que decidió (`reason`, opcional en `POST /runs/{id}/approve` y `--reason` en la CLI,
+migración 0011); si no lo hay, el correo dice «Sin motivo registrado». El texto del modelo
+(resúmenes del Planner, Scoper, Developer o QA) va marcado como «del modelo», escapado y nunca
+convertido en enlace. Los códigos de error se explican con una frase neutral de una tabla fija;
+un código desconocido se muestra tal cual. Un rechazo nombra su etapa (plan, alcance o
+publicación), sus consecuencias y el trabajo que se conserva; el cierre de un objetivo por una
+decisión humana se presenta como consecuencia de esa decisión.
+
+Enlaces: el Pull Request enlaza a GitHub (solo `https://github.com/...`). Los enlaces a la
+propia plataforma solo aparecen con `PUBLIC_APP_URL` configurado (https, sin credenciales, sin
+loopback); sin él, el correo indica los comandos de `scripts.agentforge`. Ningún enlace aprueba
+nada ni lleva tokens. Previsualización local sin enviar nada:
+
+```bash
+uv run python -m scripts.notifications_preview               # .local/notifications-preview.html
+uv run python -m scripts.notifications_preview --public-url https://agentforge.example
+```
+
+Un solo correo por resultado: la aprobación de QA en un repositorio con remoto no anuncia
+«completada» (sigue la publicación) y `run_published` comparte clave con el correo del PR.
 
 ### Ver y recuperar notificaciones
 
