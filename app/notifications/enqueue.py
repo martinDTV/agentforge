@@ -46,6 +46,7 @@ PRIORITY_KINDS: frozenset[NotificationKind] = frozenset(
         NotificationKind.RUN_PUBLISHED,
         NotificationKind.RUN_CANCELLED,
         NotificationKind.RUN_EXPIRED,
+        NotificationKind.RUN_REJECTED,
         NotificationKind.GOAL_NEEDS_HUMAN,
         NotificationKind.GOAL_COMPLETED,
         NotificationKind.GOAL_PARTIAL,
@@ -93,13 +94,23 @@ class NotificationEnqueuer:
         drafts: list[OutboxDraft] = []
         if not self._recipients:
             return drafts
+        seen: set[str] = set()
         for event_id, event in events:
             draft = self._policy.draft(
-                run, kind=event.kind, payload=event.payload, ordinal=event.ordinal, moment=moment
+                run,
+                kind=event.kind,
+                payload=event.payload,
+                ordinal=event.ordinal,
+                moment=moment,
+                context=event.context,
             )
             if draft is None or not self.wants(draft.kind):
                 continue
             for recipient in self._recipients:
+                key = draft.dedup_key(run.run_id, recipient)
+                if key in seen:
+                    continue  # two events describing one outcome (PR opened + published)
+                seen.add(key)
                 drafts.append(
                     OutboxDraft(
                         run_context=run,
@@ -109,7 +120,7 @@ class NotificationEnqueuer:
                         subject=draft.subject,
                         text_body=draft.text,
                         html_body=draft.html,
-                        dedup_key=draft.dedup_key(run.run_id, recipient),
+                        dedup_key=key,
                         message_id=message_id_for(
                             run.run_id, draft.kind, draft.ordinal, self._domain
                         ),
@@ -130,7 +141,12 @@ class NotificationEnqueuer:
             return drafts
         for event_id, event in events:
             draft = self._policy.draft_goal(
-                goal, kind=event.kind, payload=event.payload, ordinal=event.ordinal, moment=moment
+                goal,
+                kind=event.kind,
+                payload=event.payload,
+                ordinal=event.ordinal,
+                moment=moment,
+                context=event.context,
             )
             if draft is None or not self.wants(draft.kind):
                 continue

@@ -505,16 +505,16 @@ async def test_a_full_run_mails_both_approvals_and_the_pull_request_without_even
     # emits run_approved only for the publish node.
     assert by_kind[RunEventKind.RUN_APPROVED] == [2]
     mails = [i.kind for i in sorted(await outbox.list_items(limit=100), key=lambda i: i.id)]
+    # QA approval on a remote repository does not claim "completed" (publication follows)
+    # and ``run_published`` dedups into the pull request mail: one mail per real outcome.
     assert mails == [
         NotificationKind.SCOPE_PENDING,
-        NotificationKind.RUN_COMPLETED,
         NotificationKind.PUBLISH_PENDING,
         NotificationKind.PULL_REQUEST_OPENED,
-        NotificationKind.RUN_PUBLISHED,
     ]
     sender = FakeEmailSender()
     report = await NotificationWorker(outbox, sender, clock=clock).run_once()
-    assert report.sent == 5
-    opened = next(m for m in sender.sent if "Pull Request" in m.subject)
+    assert report.sent == 3
+    opened = next(m for m in sender.sent if "PR #" in m.subject)
     assert done.publication["pr_url"] in opened.text and "ghs_" not in opened.text
     assert all(m.references == sender.sent[0].references for m in sender.sent)  # one thread

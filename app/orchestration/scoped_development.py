@@ -561,7 +561,11 @@ def build_scoped_development_graph(
 
     async def qa_node(state: DevelopmentState, config: RunnableConfig) -> dict[str, Any]:
         try:
-            return await session_for(state, config).qa_node(state)
+            update = await session_for(state, config).qa_node(state)
+            if update.get("completed"):
+                # Tells the audit (and the mails) whether a publication follows.
+                update["publication_expected"] = runtime.policy_for(state).remote is not None
+            return update
         except (DevelopmentFailure, PolicyError) as exc:
             return _failure(exc)
 
