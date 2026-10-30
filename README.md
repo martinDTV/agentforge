@@ -2,7 +2,7 @@
 
 Plataforma multiagente para planificación y revisión arquitectónica de tareas de desarrollo, con FastAPI, LangGraph, Claude (Anthropic) vía Vertex AI, aprobación humana y contratos Pydantic.
 
-**Versión 0.5.0 — Fase 5 completada.** AgentForge planifica una tarea de desarrollo, revisa la arquitectura del plan con un ciclo acotado de retroalimentación entre dos agentes y detiene el flujo hasta una aprobación humana. Todo el estado vive en PostgreSQL y sobrevive a reinicios y caídas. Existe un Tool Gateway con auditoría, repositorios Git administrados con un worktree por ejecución y un runner de ejecución aislada validado en Linux real, **pero ningún agente usa todavía herramientas, ninguna herramienta de escritura, ejecución o red está habilitada y ningún runner está desplegado**: todavía no es una plataforma de desarrollo autónomo — ver [Qué hace y qué no](#qué-hace-y-qué-no-hace-todavía), [Runner](#runner-paquete-independiente) y [Roadmap](#roadmap-por-fases).
+**Versión 0.8.0.** AgentForge toma una tarea, enruta su complejidad (Smart Router), propone un alcance con un agente de solo lectura, exige la aprobación humana de ese alcance por digest, deja que Developer y QA trabajen en un worktree aislado con las pruebas ejecutadas en un Runner remoto, pide una segunda aprobación y publica un Pull Request en borrador en GitHub; un Supervisor determinista coordina objetivos de varias tareas con dependencias verificadas por fusión y cada paso avisa por correo. **No fusiona Pull Requests, no escribe en ramas protegidas y ejecuta una sola tarea por repositorio a la vez**: el estado exacto de cada fase está en [Qué hace y qué no](#qué-hace-y-qué-no-hace-todavía) y en el [Roadmap](#roadmap-por-fases).
 
 ## Qué hace y qué no hace todavía
 
