@@ -106,6 +106,16 @@ la planeación, Developer iniciado y completado, QA iniciado, correcciones y QA 
 - Contenido: proyecto, tarea (recortada), id corto, etapa, estado, fecha, siguiente acción y
   enlace; texto plano más HTML sencillo. Nunca secretos ni archivos del repositorio.
 
+### Avisos de objetivo (Fase 8)
+
+Los objetivos usan la misma bandeja (`notification_outbox.goal_id`) y los mismos niveles:
+`priority` envía `goal_needs_human` (decisión o fusión pendientes, tarea fallida, PR cerrado,
+presupuesto agotado), `goal_completed`, `goal_partial`, `goal_failed`, `goal_cancelled` y
+`goal_expired`; `verbose` añade creación, planificación solicitada, tarea lista, iniciada,
+publicada y dependencia fusionada. Cada objetivo tiene su propio hilo
+(`<agentforge.goal.<id>.thread@…>`); los correos de sus ejecuciones hijas siguen llegando como
+hasta ahora.
+
 ### Ver y recuperar notificaciones
 
 ```bash
