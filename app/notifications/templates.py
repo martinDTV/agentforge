@@ -16,6 +16,9 @@ class NotificationContent:
     next_action: str | None = None
     details: list[tuple[str, str]] = field(default_factory=list)
     link: str | None = None
+    # A goal's notification reuses the layout with its own labels (ADR 0012 §2.8).
+    subject_label: str = "Ejecución"
+    task_label: str = "Tarea"
 
     @property
     def short_run_id(self) -> str:
@@ -37,11 +40,11 @@ def render_text(content: NotificationContent, headline: str) -> str:
         f"AgentForge — {headline}",
         "",
         f"Proyecto:   {content.project}",
-        f"Ejecución:  {content.short_run_id} ({content.run_id})",
+        f"{content.subject_label + ':':<12}{content.short_run_id} ({content.run_id})",
         f"Etapa:      {content.stage}",
         f"Estado:     {content.status}",
         f"Fecha:      {content.moment.isoformat(timespec='seconds')}",
-        f"Tarea:      {_task_snippet(content.task)}",
+        f"{content.task_label + ':':<12}{_task_snippet(content.task)}",
     ]
     for label, value in content.details:
         lines.append(f"{label + ':':<12}{value}")
@@ -60,11 +63,11 @@ def render_html(content: NotificationContent, headline: str) -> str:
     esc = html.escape
     rows = [
         ("Proyecto", content.project),
-        ("Ejecución", f"{content.short_run_id} ({content.run_id})"),
+        (content.subject_label, f"{content.short_run_id} ({content.run_id})"),
         ("Etapa", content.stage),
         ("Estado", content.status),
         ("Fecha", content.moment.isoformat(timespec="seconds")),
-        ("Tarea", _task_snippet(content.task)),
+        (content.task_label, _task_snippet(content.task)),
         *content.details,
     ]
 

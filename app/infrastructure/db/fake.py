@@ -736,7 +736,8 @@ class InMemoryNotificationOutbox:
             now = self.clock()
             self.items[self._next] = OutboxItem(
                 id=self._next,
-                run_id=d.run_context.run_id,
+                run_id=d.run_id,
+                goal_id=d.goal_id,
                 event_id=d.event_id,
                 kind=d.kind,
                 recipient=d.recipient,

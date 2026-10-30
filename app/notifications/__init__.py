@@ -18,7 +18,7 @@ from .contracts import (
     SendOutcome,
 )
 from .enqueue import PRIORITY_KINDS, NotificationEnqueuer, NotificationLevel, OutboxDraft
-from .policy import NotificationDraft, NotificationPolicy, RunContext
+from .policy import GoalContext, NotificationDraft, NotificationPolicy, RunContext
 from .templates import render_html, render_subject, render_text
 from .worker import BACKOFF_SECONDS, NotificationWorker, WorkerReport
 
@@ -26,6 +26,7 @@ __all__ = [
     "BACKOFF_SECONDS",
     "EmailMessage",
     "EmailSender",
+    "GoalContext",
     "NotificationDraft",
     "NotificationEnqueuer",
     "NotificationLevel",

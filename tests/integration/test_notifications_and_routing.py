@@ -36,7 +36,7 @@ T0 = datetime(2026, 10, 27, tzinfo=UTC)
 
 
 def test_0009_adds_outbox_route_decisions_and_route_columns(empty_database_url: str):
-    assert expected_head_revision() == "0009"
+    assert expected_head_revision() == "0010"
     migrate(empty_database_url, "0008")
     engine = create_engine(empty_database_url)
     try:

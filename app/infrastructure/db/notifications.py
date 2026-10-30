@@ -24,6 +24,7 @@ def _to_item(row: NotificationOutboxRecord) -> OutboxItem:
     return OutboxItem(
         id=row.id,
         run_id=row.run_id,
+        goal_id=row.goal_id,
         event_id=row.event_id,
         kind=NotificationKind(row.kind),
         recipient=row.recipient,
@@ -45,7 +46,8 @@ def _to_item(row: NotificationOutboxRecord) -> OutboxItem:
 def outbox_rows(drafts: Sequence[OutboxDraft]) -> list[dict[str, Any]]:
     return [
         {
-            "run_id": d.run_context.run_id,
+            "run_id": d.run_id,
+            "goal_id": d.goal_id,
             "event_id": d.event_id,
             "kind": d.kind.value,
             "recipient": d.recipient,

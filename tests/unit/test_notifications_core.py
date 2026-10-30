@@ -418,3 +418,63 @@ def test_priority_level_keeps_approvals_failures_and_outcomes_only():
     assert len(verbose.drafts(run, noisy, moment=T0)) == 11
     assert {NotificationKind.PLAN_PENDING, NotificationKind.RUN_CANCELLED} <= PRIORITY_KINDS
     assert NotificationKind.DEVELOPER_STARTED not in PRIORITY_KINDS
+
+
+def test_goal_events_become_goal_notifications_with_their_own_thread_and_dedup():
+    """ADR 0012 §2.8: goal notifications reuse the outbox; priority keeps the human-facing ones."""
+    from uuid import uuid4
+
+    from app.contracts.goals import GoalEventKind
+    from app.goals.ports import GoalEvent
+    from app.notifications import GoalContext
+
+    policy = NotificationPolicy(base_url="https://agentforge.example")
+    goal = GoalContext(
+        goal_id=uuid4(), project_id="sandbox-gh", repository_id="sandbox-demo", objective="Objetivo"
+    )
+    moment = datetime(2026, 10, 30, 10, 0, tzinfo=UTC)
+    needs = policy.draft_goal(
+        goal,
+        kind=GoalEventKind.NEEDS_HUMAN,
+        payload={"reason": "merge_pending", "task_key": "a", "pr_number": 7},
+        ordinal=12,
+        moment=moment,
+    )
+    assert needs is not None and needs.kind is NotificationKind.GOAL_NEEDS_HUMAN
+    assert "Pull Request espera fusión" in needs.subject
+    assert "Objetivo:" in needs.text and f"/api/v1/goals/{goal.goal_id}" in needs.text
+    assert "PR:         7" in needs.text and "Tarea:      a" in needs.text
+    assert (
+        policy.draft_goal(
+            goal, kind=GoalEventKind.CAPACITY_WAIT, payload={}, ordinal=0, moment=moment
+        )
+        is None
+    )
+    done = policy.draft_goal(
+        goal,
+        kind=GoalEventKind.GOAL_PARTIAL,
+        payload={"tasks": 3, "succeeded": 2, "failed": 1, "code": "pr_closed"},
+        ordinal=0,
+        moment=moment,
+    )
+    assert done is not None and done.kind is NotificationKind.GOAL_PARTIAL
+    priority = NotificationEnqueuer(policy, recipients=["ops@example.test"], level="priority")
+    drafts = priority.goal_drafts(
+        goal,
+        [
+            (1, GoalEvent(kind=GoalEventKind.GOAL_CREATED, payload={"decomposition": "plan"})),
+            (2, GoalEvent(kind=GoalEventKind.NEEDS_HUMAN, ordinal=12, payload={"reason": "x"})),
+            (3, GoalEvent(kind=GoalEventKind.GOAL_COMPLETED, payload={"tasks": 1})),
+        ],
+        moment=moment,
+    )
+    assert [d.kind for d in drafts] == [
+        NotificationKind.GOAL_NEEDS_HUMAN,
+        NotificationKind.GOAL_COMPLETED,
+    ]
+    assert all(d.goal_id == goal.goal_id and d.run_id is None for d in drafts)
+    assert drafts[0].dedup_key == f"goal:{goal.goal_id}:goal_needs_human:12:ops@example.test"
+    assert drafts[0].message_id.startswith(f"<agentforge.goal.{goal.goal_id}.goal_needs_human.12@")
+    verbose = NotificationEnqueuer(policy, recipients=["ops@example.test"], level="verbose")
+    created = [(1, GoalEvent(kind=GoalEventKind.GOAL_CREATED))]
+    assert len(verbose.goal_drafts(goal, created, moment=moment)) == 1

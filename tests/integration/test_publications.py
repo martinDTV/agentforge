@@ -25,7 +25,7 @@ T0 = datetime(2026, 10, 27, tzinfo=UTC)
 def test_0008_adds_published_and_the_publications_table_and_guards_the_downgrade(
     empty_database_url: str,
 ):
-    assert expected_head_revision() == "0009"
+    assert expected_head_revision() == "0010"
     migrate(empty_database_url, "0007")
     engine = create_engine(empty_database_url)
     try:
