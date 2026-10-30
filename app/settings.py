@@ -226,6 +226,16 @@ class Settings(DatabaseSettings):
     router_default_mode: Literal["auto", "fast", "full"] = "auto"
     router_confidence_threshold: float = Field(default=0.7, ge=0.5, le=1.0)
 
+    # Goal Supervisor (Fase 8, ADR 0012). Active only when the development workflow
+    # exists (repositories and policies configured). The limits below are platform
+    # wide; each goal carries its own ``GoalLimits`` snapshot.
+    supervisor_enabled: bool = True
+    supervisor_tick_seconds: float = Field(default=60.0, ge=0)
+    supervisor_max_active_children: int = Field(default=3, ge=1, le=16)
+    supervisor_max_active_per_repository: int = Field(default=1, ge=1, le=16)
+    supervisor_lease_seconds: float = Field(default=60.0, gt=0)
+    supervisor_creating_timeout_seconds: float = Field(default=1800.0, gt=0)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

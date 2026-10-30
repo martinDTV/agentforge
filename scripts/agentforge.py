@@ -8,6 +8,15 @@
     uv run python -m scripts.agentforge approve <run_id>      # shows the proposal, asks, approves
     uv run python -m scripts.agentforge reject <run_id>
     uv run python -m scripts.agentforge events <run_id>
+    uv run python -m scripts.agentforge goal "Objetivo de alto nivel" \\
+        --repository sandbox-github [--decomposition auto|single|plan] [--max-tasks 5]
+    uv run python -m scripts.agentforge goals [--status active]
+    uv run python -m scripts.agentforge goal-show <goal_id>     # tasks, child runs, what waits
+    uv run python -m scripts.agentforge goal-events <goal_id>
+    uv run python -m scripts.agentforge goal-cancel <goal_id>
+
+Goals (Fase 8) turn one objective into child runs through the deterministic
+Supervisor; their approvals are still taken per run with ``approve <run_id>``.
 
 The identity is ``AGENTFORGE_SUBJECT`` (default: the OS user) with the
 ``project_operator`` role on ``--project`` (default ``AGENTFORGE_PROJECT``); with
@@ -82,6 +91,51 @@ def _summary(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _goal_summary(goal: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "goal_id": goal.get("goal_id"),
+        "status": goal.get("status"),
+        "decomposition": goal.get("decomposition"),
+        "route": goal.get("route"),
+        "plan_run_id": goal.get("plan_run_id"),
+        "blocked_reasons": goal.get("blocked_reasons") or None,
+        "usage": goal.get("usage"),
+        "deadline": goal.get("deadline"),
+        "error": goal.get("error"),
+    }
+
+
+def _describe_goal(goal: dict[str, Any]) -> list[str]:
+    lines = [
+        f"Objetivo {goal.get('goal_id')}: {goal.get('status')}",
+        f"Repositorio: {goal.get('repository_id')} · descomposición {goal.get('decomposition')}"
+        + (f" · ruta {goal['route']}" if goal.get("route") else ""),
+    ]
+    if goal.get("plan_run_id"):
+        lines.append(f"Planificación: {goal['plan_run_id']}")
+    if goal.get("blocked_reasons"):
+        lines.append("Bloqueado por: " + ", ".join(goal["blocked_reasons"]))
+    for t in goal.get("tasks", []):
+        waiting = f" espera {t['pending_stage']}" if t.get("pending_stage") else ""
+        deps = f" ← {', '.join(t['dependencies'])}" if t.get("dependencies") else ""
+        pr = f" PR #{t['pr_number']}" if t.get("pr_number") else ""
+        err = f" [{t['last_error_code']}]" if t.get("last_error_code") else ""
+        run = f" run {str(t.get('run_id'))[:8]}" if t.get("run_id") else ""
+        lines.append(
+            f"  - {t.get('task_key'):10} {t.get('status'):14}{run}{waiting}{pr}{err}{deps}"
+        )
+    usage = goal.get("usage") or {}
+    lines.append(
+        f"Uso: {usage.get('tasks_created', 0)} tareas creadas · "
+        f"{usage.get('llm_calls_used', 0)} llamadas · "
+        f"reserva {usage.get('reserved_model_calls', 0)} llamadas / "
+        f"{usage.get('reserved_usd', 0)} USD"
+    )
+    if goal.get("error"):
+        lines.append(f"Error: {goal['error']}")
+    return lines
+
+
 def _describe(pending: dict[str, Any]) -> list[str]:
     stage = pending.get("stage")
     proposal = pending.get("proposal") or {}
@@ -139,6 +193,19 @@ def run(argv: Sequence[str] | None = None, *, client: httpx.Client | None = None
         if name in ("approve", "reject"):
             p.add_argument("--yes", action="store_true", help="no interactive confirmation")
             p.add_argument("--digest", default=None, help="full digest, non-interactive")
+    goal = sub.add_parser("goal", help="create a goal (Fase 8)")
+    goal.add_argument("text")
+    goal.add_argument("--repository", default=_env("AGENTFORGE_REPOSITORY"))
+    goal.add_argument("--decomposition", choices=["auto", "single", "plan"], default=None)
+    goal.add_argument("--max-tasks", type=int, default=None)
+    goal.add_argument("--max-usd", type=float, default=None)
+    goal.add_argument("--deadline-days", type=float, default=None)
+    goals_cmd = sub.add_parser("goals", help="list goals")
+    goals_cmd.add_argument("--status", default=None)
+    goals_cmd.add_argument("--limit", type=int, default=20)
+    for name in ("goal-show", "goal-events", "goal-cancel"):
+        p = sub.add_parser(name)
+        p.add_argument("goal_id")
     args = parser.parse_args(argv)
     own_client = client is None
     client = client or httpx.Client(base_url=args.api, timeout=1800.0)
@@ -162,6 +229,68 @@ def run(argv: Sequence[str] | None = None, *, client: httpx.Client | None = None
                 return _fail(r)
             print(json.dumps(_summary(r.json()), ensure_ascii=False, indent=1))
             return 0
+        if args.command == "goal":
+            if not args.project or not args.repository:
+                raise SystemExit(
+                    "goal requiere --project y --repository (o AGENTFORGE_PROJECT/REPOSITORY)"
+                )
+            goal_body: dict[str, Any] = {
+                "objective": args.text,
+                "project_id": args.project,
+                "repository_id": args.repository,
+            }
+            if args.decomposition:
+                goal_body["decomposition"] = args.decomposition
+            limits: dict[str, Any] = {}
+            if args.max_tasks is not None:
+                limits["max_tasks"] = args.max_tasks
+            if args.max_usd is not None:
+                limits["max_total_usd"] = args.max_usd
+            if args.deadline_days is not None:
+                limits["deadline_seconds"] = args.deadline_days * 86_400
+            if limits:
+                goal_body["limits"] = limits
+            r = client.post("/goals", json=goal_body, headers=h)
+            if r.status_code not in (200, 201):
+                return _fail(r)
+            print("\n".join(_describe_goal(r.json())))
+            return 0
+        if args.command == "goals":
+            goal_params: dict[str, Any] = {"limit": args.limit}
+            if args.status:
+                goal_params["status"] = args.status
+            if args.project:
+                goal_params["project_id"] = args.project
+            r = client.get("/goals", params=goal_params, headers=h)
+            if r.status_code != 200:
+                return _fail(r)
+            for item in r.json().get("items", []):
+                print(json.dumps(item, ensure_ascii=False))
+            return 0
+        if args.command == "goal-show":
+            r = client.get(f"/goals/{args.goal_id}", headers=h)
+            return (
+                _fail(r)
+                if r.status_code != 200
+                else print("\n".join(_describe_goal(r.json()))) or 0
+            )
+        if args.command == "goal-events":
+            r = client.get(f"/goals/{args.goal_id}/events", params={"limit": 100}, headers=h)
+            if r.status_code != 200:
+                return _fail(r)
+            for e in r.json().get("items", []):
+                print(
+                    f"{e.get('created_at', '')}  {e.get('kind'):22} "
+                    f"{json.dumps(e.get('payload', {}), ensure_ascii=False)[:120]}"
+                )
+            return 0
+        if args.command == "goal-cancel":
+            r = client.post(f"/goals/{args.goal_id}/cancel", headers=h)
+            return (
+                _fail(r)
+                if r.status_code != 200
+                else print(json.dumps(_goal_summary(r.json()), ensure_ascii=False, indent=1)) or 0
+            )
         if args.command == "runs":
             params: dict[str, Any] = {"limit": args.limit}
             if args.status:

@@ -16,6 +16,7 @@ from typing import Any
 from uuid import UUID
 
 from app.exceptions import DomainError
+from app.goals.ports import GoalCursor
 from app.orchestration.ports import RunCursor
 
 CURSOR_VERSION = 1
@@ -82,3 +83,21 @@ def decode_event_cursor(token: str, *, filters_fingerprint: str) -> int:
     if not isinstance(event_id, int) or isinstance(event_id, bool) or event_id < 0:
         raise InvalidCursorError()
     return event_id
+
+
+def encode_goal_cursor(created_at: datetime, goal_id: UUID, *, filters_fingerprint: str) -> str:
+    return _encode(
+        {"k": "goals", "f": filters_fingerprint, "t": created_at.isoformat(), "id": str(goal_id)}
+    )
+
+
+def decode_goal_cursor(token: str, *, filters_fingerprint: str) -> GoalCursor:
+    payload = _decode(token, kind="goals", filters_fingerprint=filters_fingerprint)
+    try:
+        created_at = datetime.fromisoformat(str(payload["t"]))
+        goal_id = UUID(str(payload["id"]))
+    except (KeyError, ValueError, TypeError) as exc:
+        raise InvalidCursorError() from exc
+    if created_at.tzinfo is None:
+        raise InvalidCursorError()
+    return GoalCursor(created_at=created_at, id=goal_id)

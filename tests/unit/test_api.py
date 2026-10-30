@@ -132,5 +132,10 @@ def test_api_is_versioned(client: TestClient):
         f"{RUNS}/{{run_id}}/resume",
         f"{RUNS}/{{run_id}}/events",
         "/api/v1/admin/recovery/sweeps",
+        "/api/v1/goals",
+        "/api/v1/goals/{goal_id}",
+        "/api/v1/goals/{goal_id}/events",
+        "/api/v1/goals/{goal_id}/cancel",
+        "/api/v1/goals/{goal_id}/reconcile",
     }
     assert client.post("/runs", json=TASK).status_code == 404
