@@ -112,6 +112,9 @@ class GoalLimits(BaseModel):
     deadline_seconds: float = Field(default=7 * 86_400.0, gt=0, le=14 * 86_400.0)
     merge_reminder_seconds: float = Field(default=86_400.0, gt=0, le=7 * 86_400.0)
     decision_reminder_seconds: float = Field(default=86_400.0, gt=0, le=7 * 86_400.0)
+    # H2: last notice before a decision window closes (only when the window is long enough
+    # for it to fall after the midway reminder). Older goals load with the default.
+    final_notice_seconds: float = Field(default=3_600.0, ge=60.0, le=86_400.0)
 
 
 class CreateGoal(BaseModel):

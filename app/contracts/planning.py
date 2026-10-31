@@ -1,6 +1,11 @@
 from collections.abc import Mapping, Sequence
+from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+# Structured failure of a planning run whose plan never met the platform constraints.
+PLAN_INVALID_CODE = "plan_invalid"
+MAX_CONTEXT_PATHS = 300
 
 
 class DevelopmentTask(BaseModel):
@@ -31,6 +36,43 @@ class DevelopmentPlan(BaseModel):
         if cycle:
             raise ValueError("Las dependencias forman un ciclo: " + " -> ".join(cycle))
         return self
+
+
+class PlanConstraints(BaseModel):
+    """Deterministic facts of the platform a plan must respect (H1, ADR 0012).
+
+    Data, never authority: the planning gate enforces them and the Planner and the
+    Architect only read them. Built by the platform from the repository policy and
+    the goal limits; nothing here comes from model text.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_tasks: int | None = Field(default=None, ge=1, le=64)
+    writable_globs: list[str] = Field(default_factory=list, max_length=32)
+    denied_globs: list[str] = Field(default_factory=list, max_length=96)
+    repository_paths: list[str] = Field(default_factory=list, max_length=MAX_CONTEXT_PATHS)
+    listing_complete: bool = False
+    programs: list[str] = Field(default_factory=list, max_length=8)
+    max_files_per_task: int | None = Field(default=None, ge=1)
+
+
+PlanViolationCode = Literal[
+    "too_many_tasks",
+    "duplicate_task_id",
+    "path_denied",
+    "path_outside_policy",
+]
+
+
+class PlanViolation(BaseModel):
+    """One deterministic reason a plan cannot be presented to a human."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    code: PlanViolationCode
+    detail: str = Field(min_length=1, max_length=300)
+    task_id: str | None = None
 
 
 class ArchitectureDecision(BaseModel):

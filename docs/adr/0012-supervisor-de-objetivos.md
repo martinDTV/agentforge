@@ -500,6 +500,38 @@ Primer objetivo real (`7bd42940`, `decomposition=plan`, sandbox `agentforge-sand
 
 **Mejora futura (no implementada; requiere autorización)**: antes de proponer un plan, Planner y Architect deben ver los contratos existentes y las pruebas de aceptación del repositorio, y el objetivo debe conocer el estado real de la base (PRs de la plataforma publicados y sin fusionar). Encaja en el Paso 4 (Architect con contexto del repositorio, §4.8.2): la plataforma construye el contexto con los mismos filtros del Scoper (listado, archivos clave, rutas de pruebas, `README`), lo pasa como dato a Planner y Architect, y el Architect recibe la instrucción explícita de comprobar que el plan no contradice las pruebas de aceptación ni depende de código ausente en la base. Complemento barato y determinista para el Paso 2: al crear un objetivo, avisar en `goal_created` cuando el repositorio tenga PRs de AgentForge abiertos (`publications` con `pr_number` y sin `merge_evidence`), porque cualquier plan que asuma ese código fallará en QA.
 
+## Notas de implementación H1 y H2 (2026-10-31, estabilización 1.0)
+
+Motivadas por tres incidentes reales: dos planes de objetivo que murieron en la aprobación
+humana (uno contradecía las pruebas de aceptación; otro proponía tres tareas con `max_tasks=2`
+y un `NOTES.md` fuera de las rutas escribibles) y una caducidad de alcance etiquetada como
+`expired:plan`.
+
+- **H1, compuerta de plan.** `PlanConstraints` (`app/contracts/planning.py`) reúne hechos
+  deterministas: `max_tasks` del objetivo, globs escribibles y prohibidos de la política,
+  listado del espejo filtrado por los globs excluidos y prohibidos, programas de QA y archivos
+  por tarea. El coordinador los construye en `_plan_constraints` (el listado llega por el
+  puerto `RepositoryListing`, que implementa `GitHubIntegrationProbe` con `ls-tree` de solo
+  lectura sobre el espejo; su ausencia nunca bloquea). `RunService.create` los siembra en el
+  estado (`plan_constraints`) y el nodo `plan_gate` (`app/projects/plan_gate.py`) valida cada
+  plan entre Planner y Architect: tareas de más, ids repetidos y rutas que el plan crearía
+  fuera de política. Reutiliza el bucle de revisión con retroalimentación fija (sin llamada al
+  Architect) y termina `plan_invalid` cuando se agotan `max_revisions` o el presupuesto,
+  conservando `plan` y `plan_violations`; `plan_gate_rejected` lo audita. Planner y Architect
+  reciben las restricciones como texto de datos (`policy_context_text`), sin autoridad alguna.
+  La ruta `full` del flujo de desarrollo siembra las mismas restricciones desde el router.
+  Límite conocido: la regla de rutas exige un listado; sin espejo, la compuerta solo comprueba
+  estructura y el Scoper filtra después.
+- **H2, caducidades y recordatorios.** `expire_waiting_runs` escribe `error_code='expired:<etapa>'`
+  y el evento `run_expired{stage, deadline, code}` antes de anular `pending_stage`;
+  `failure_code_for_run` prefiere ese código y, para rechazos, la etapa de la decisión
+  registrada. `GoalLimits.final_notice_seconds` (3600 por defecto) y `reminders_due` producen
+  el recordatorio de mitad de ventana y el aviso final (`plan_final_notice`,
+  `decision_final_notice`), cada uno con su ordinal `needs_human`; `REASONS_PER_TASK` pasa de
+  8 a 16 (los objetivos activos durante el cambio podrían recibir un recordatorio repetido, nunca
+  una colisión). Los contratos `scope_digest` y `publish_digest` no cambian; una decisión
+  caducada sigue sin poder reutilizarse.
+
 ## 10. Riesgos
 
 - **Carga de aprobaciones humanas**: hasta `n` alcances y `n` publicaciones más el plan; mitigación: secuencial por defecto, avisos con digest, vista del objetivo con todo lo pendiente.

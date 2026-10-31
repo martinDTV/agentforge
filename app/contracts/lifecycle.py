@@ -8,6 +8,7 @@ in their conditional writes so a stale or late projection can never move a
 run backwards or out of a terminal state.
 """
 
+from datetime import datetime
 from enum import StrEnum
 
 
@@ -147,6 +148,7 @@ class RunEventKind(StrEnum):
     PLANNER_COMPLETED = "planner_completed"
     ARCHITECT_REVIEWED = "architect_reviewed"
     REVISION_REQUESTED = "revision_requested"
+    PLAN_GATE_REJECTED = "plan_gate_rejected"  # H1: deterministic plan violations
     WAITING_APPROVAL = "waiting_approval"
     APPROVAL_RECORDED = "approval_recorded"
     APPROVAL_APPLIED = "approval_applied"
@@ -169,3 +171,18 @@ class RunEventKind(StrEnum):
     RUN_FAILED = "run_failed"
     RUN_INTERRUPTED = "run_interrupted"
     RUN_RESUMED = "run_resumed"
+
+
+def expired_code(stage: "DecisionStage | None") -> str:
+    """Stable error code of a decision that expired at ``stage`` (``expired:<stage>``).
+
+    Written by the sweep before the row forgets its pending stage, so goals, audits
+    and mails name the stage that actually expired (H2).
+    """
+    return f"expired:{stage.value if stage is not None else 'plan'}"
+
+
+def expired_message(stage: "DecisionStage | None", deadline: "datetime | None") -> str:
+    name = stage.value if stage is not None else "plan"
+    when = deadline.isoformat() if deadline is not None else "sin plazo registrado"
+    return f"La decisión de {name} caducó sin respuesta humana (plazo: {when})."

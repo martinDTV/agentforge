@@ -284,3 +284,58 @@ async def test_two_decisions_on_one_run_keep_their_own_event_ordinals(
         assert (RunEventKind.APPROVAL_APPLIED, 2, "publish") in recorded
     finally:
         await database.dispose()
+
+
+async def test_expiry_keeps_the_stage_in_the_row_the_event_and_closes_the_window_for_good(
+    checkpoint_database_url: str,
+):
+    """H2: the sweep writes ``expired:<stage>`` and the event names the stage before the
+    row forgets it; an expired decision can never be claimed afterwards."""
+    database = Database(checkpoint_database_url)
+    repository = SqlAlchemyRunRepository(database.session_factory)
+    try:
+        for stage in ("scope", "publish"):
+            run_id = uuid.uuid4()
+            await repository.create_run(
+                run_id,
+                "task",
+                owner="p",
+                ttl_seconds=60,
+                owner_subject="olivia",
+                project_id=PROJECT,
+                workflow_kind=WorkflowKind.DEVELOPMENT,
+            )
+            async with database.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE runs SET status='waiting_approval', pending_stage=:stage, "
+                        "approval_deadline = now() - interval '1 minute', lease_owner=NULL, "
+                        "lease_expires_at=NULL WHERE id=:id"
+                    ),
+                    {"id": run_id, "stage": stage},
+                )
+            expired = await repository.expire_waiting_runs(now=datetime.now(UTC), limit=10)
+            row = next(r for r in expired if r.id == run_id)
+            assert row.status is S.EXPIRED and row.pending_stage is None
+            assert row.error is not None and row.error.code == f"expired:{stage}"
+            assert "caducó" in row.error.message
+            events = await repository.list_events(run_id, after_id=None, limit=20)
+            event = next(e for e in events if e.kind is RunEventKind.RUN_EXPIRED)
+            assert event.payload["stage"] == stage and event.payload["code"] == f"expired:{stage}"
+            assert event.payload["deadline"]
+            # Closed for good: nothing pending, no second expiry, no late claim.
+            assert await repository.get_pending_decision(run_id) is None
+            again = await repository.expire_waiting_runs(now=datetime.now(UTC), limit=10)
+            assert all(r.id != run_id for r in again)
+            late = await repository.claim_decision(
+                run_id,
+                DecisionStage(stage),
+                True,
+                owner="api-late",
+                ttl_seconds=30,
+                decided_by="human-late",
+                scope_digest="a" * 64,
+            )
+            assert late is None or not late.claimed
+    finally:
+        await database.dispose()

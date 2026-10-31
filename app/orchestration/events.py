@@ -112,6 +112,7 @@ EXECUTED_BY: dict[str, str] = {
     "prepare_publication": "agentforge:publisher",
     "publish": "agentforge:publisher",
     "router": "agentforge:platform",
+    "plan_gate": "agentforge:platform",  # H1: deterministic, no model
 }
 # Events that a human decision causes directly: attributed to that human.
 HUMAN_CAUSED: frozenset[RunEventKind] = frozenset(
@@ -194,6 +195,22 @@ def events_from_update(
             )
         if "error" in delta:
             error = delta["error"] or {}
+            if node == "plan_gate" and delta.get("plan_violations"):
+                # H1: the last, decisive rejection keeps its violation codes in the audit.
+                events.append(
+                    RunEvent(
+                        kind=RunEventKind.PLAN_GATE_REJECTED,
+                        ordinal=revision,
+                        payload={
+                            "revision": revision,
+                            "violations": [str(v.get("code")) for v in delta["plan_violations"]][
+                                :16
+                            ],
+                            "final": True,
+                            "executed_by": EXECUTED_BY["plan_gate"],
+                        },
+                    )
+                )
             failed: dict[str, Any] = {"node": node, "code": error.get("code", "unknown")}
             if node in EXECUTED_BY:
                 failed["executed_by"] = EXECUTED_BY[node]
@@ -333,6 +350,20 @@ def events_from_update(
                     },
                 )
             )
+        elif node == "plan_gate":
+            violations = delta.get("plan_violations") or []
+            if violations:
+                events.append(
+                    RunEvent(
+                        kind=RunEventKind.PLAN_GATE_REJECTED,
+                        ordinal=revision,
+                        payload={
+                            "revision": revision,
+                            "violations": [str(v.get("code")) for v in violations][:16],
+                            "final": "error" in delta,
+                        },
+                    )
+                )
         elif node == "architect":
             review = delta.get("architecture") or {}
             events.append(
@@ -384,6 +415,7 @@ def events_from_update(
 _NODE_BY_KIND: dict[RunEventKind, str] = {
     RunEventKind.PLANNER_COMPLETED: "planner",
     RunEventKind.REVISION_REQUESTED: "planner",
+    RunEventKind.PLAN_GATE_REJECTED: "plan_gate",
     RunEventKind.ARCHITECT_REVIEWED: "architect",
     RunEventKind.SCOPE_PROPOSED: "scoper",
     RunEventKind.DEVELOPER_COMPLETED: "developer",
@@ -445,7 +477,11 @@ def transition_events(previous: RunLifecycleStatus, updated: PersistedRun) -> li
     if status is RunLifecycleStatus.CANCELLED:
         return [RunEvent(kind=RunEventKind.RUN_CANCELLED)]
     if status is RunLifecycleStatus.EXPIRED:
-        return [RunEvent(kind=RunEventKind.RUN_EXPIRED)]
+        expired = updated.error.code if updated.error else ""
+        payload: dict[str, Any] = {}
+        if expired.startswith("expired:"):
+            payload = {"code": expired, "stage": expired.split(":", 1)[1]}
+        return [RunEvent(kind=RunEventKind.RUN_EXPIRED, payload=payload)]
     return []
 
 

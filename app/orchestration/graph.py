@@ -10,10 +10,16 @@ from langgraph.types import interrupt
 from app.agents.architect import ArchitectAgent
 from app.agents.planner import PlannerAgent
 from app.contracts.execution import RunError
-from app.contracts.planning import ArchitectureReview, DevelopmentPlan
+from app.contracts.planning import (
+    PLAN_INVALID_CODE,
+    ArchitectureReview,
+    DevelopmentPlan,
+    PlanConstraints,
+)
 from app.infrastructure.llm.errors import LLMError
 from app.infrastructure.llm.port import LLMPort
 from app.orchestration.limits import RunLimits
+from app.projects.plan_gate import policy_context_text, validate_plan
 
 BUDGET_EXCEEDED_CODE = "llm_budget_exceeded"
 
@@ -71,6 +77,10 @@ class RunState(TypedDict, total=False):
     plan_approved: bool
     # Goal Supervisor (ADR 0012, D4): the child comes from an approved goal plan.
     planned_upstream: dict[str, Any]
+    # Planning gate (H1): deterministic constraints the plan must respect (data built by
+    # the platform) and the violations found in the current plan, kept as evidence.
+    plan_constraints: dict[str, Any]
+    plan_violations: list[dict[str, Any]]
     # Written by the governed qa node when QA approves: True when the repository has a
     # remote, so the run continues into publication instead of ending ``completed``.
     publication_expected: bool
@@ -105,6 +115,14 @@ class PlanningNodes:
             )
             return {"error": error.model_dump()}
 
+        def constraints_of(state: RunState) -> PlanConstraints | None:
+            raw = state.get("plan_constraints")
+            return PlanConstraints.model_validate(raw) if raw else None
+
+        def context_of(state: RunState) -> str | None:
+            constraints = constraints_of(state)
+            return policy_context_text(constraints) if constraints is not None else None
+
         def planner_node(state: RunState) -> dict[str, Any]:
             if (blocked := budget_exhausted(state)) is not None:
                 return blocked
@@ -115,10 +133,43 @@ class PlanningNodes:
                     state["task"],
                     previous_plan=previous,
                     feedback=state.get("feedback", []),
+                    context=context_of(state),
                 )
             except LLMError as exc:
                 return {"llm_calls": 1, "error": _error_payload(exc)}
             return {"plan": plan.model_dump(), "revision": revision, "llm_calls": 1}
+
+        def plan_gate_node(state: RunState) -> dict[str, Any]:
+            """Deterministic check of the plan against the platform constraints (H1).
+
+            No model call. A violated plan goes back to the planner with the
+            violations as feedback while revisions and budget allow it; otherwise
+            the run fails ``plan_invalid`` keeping the plan and the violations as
+            evidence. A human never sees a plan that breaks the constraints.
+            """
+            constraints = constraints_of(state)
+            if constraints is None:
+                return {"plan_violations": []}
+            plan = DevelopmentPlan.model_validate(state["plan"])
+            violations = [v.model_dump() for v in validate_plan(plan, constraints)]
+            if not violations:
+                return {"plan_violations": [], "feedback": []}
+            revisions_left = state.get("revision", 0) < limits.max_revisions
+            round_fits_budget = state.get("llm_calls", 0) + 2 <= limits.max_llm_calls
+            if revisions_left and round_fits_budget:
+                return {
+                    "plan_violations": violations,
+                    "feedback": [str(v["detail"]) for v in violations],
+                }
+            summary = "; ".join(str(v["detail"]) for v in violations)
+            error = RunError(
+                code=PLAN_INVALID_CODE,
+                message=(
+                    "El plan no cumple las restricciones de la plataforma tras las revisiones "
+                    f"permitidas: {summary}"
+                )[:2000],
+            )
+            return {"plan_violations": violations, "error": error.model_dump()}
 
         def architect_node(state: RunState) -> dict[str, Any]:
             if (blocked := budget_exhausted(state)) is not None:
@@ -126,7 +177,10 @@ class PlanningNodes:
             plan = DevelopmentPlan.model_validate(state["plan"])
             try:
                 review: ArchitectureReview = architect.execute(
-                    task=state["task"], plan=plan, revision=state.get("revision", 0)
+                    task=state["task"],
+                    plan=plan,
+                    revision=state.get("revision", 0),
+                    context=context_of(state),
                 )
             except LLMError as exc:
                 return {"llm_calls": 1, "error": _error_payload(exc)}
@@ -138,7 +192,18 @@ class PlanningNodes:
             }
 
         self.planner = planner_node
+        self.plan_gate = plan_gate_node
         self.architect = architect_node
+
+    @staticmethod
+    def route_after_planner(state: RunState) -> str:
+        return END if "error" in state else "plan_gate"
+
+    @staticmethod
+    def route_after_gate(state: RunState) -> str:
+        if "error" in state:
+            return END
+        return "planner" if state.get("plan_violations") else "architect"
 
     def route_after_architect(self, state: RunState) -> str:
         if "error" in state:
@@ -156,9 +221,10 @@ def build_state_graph(llm: LLMPort, limits: RunLimits | None = None) -> RunState
     """Assemble (not compile) the Planner <-> Architect -> Approval graph.
 
     Flow:
-      START -> planner -> architect -> approval -> END
-                 ^            |
-                 +-- revise --+   (architect rejected, revisions and budget left)
+      START -> planner -> plan_gate -> architect -> approval -> END
+                 ^            |            |
+                 +-- revise --+------------+   (gate violation or architect rejection,
+                                                revisions and budget left)
 
     Any node may instead write ``error`` and route to END, which the API
     reports as ``failed``. Only ``LLMError`` is handled this way: anything
@@ -185,16 +251,19 @@ def build_state_graph(llm: LLMPort, limits: RunLimits | None = None) -> RunState
             raise ValueError("Aprobación inválida")
         return {"approved": response["approved"]}
 
-    def route_after_planner(state: RunState) -> str:
-        return END if "error" in state else "architect"
-
     builder = StateGraph(RunState)
     builder.add_node("planner", nodes.planner)
+    builder.add_node("plan_gate", nodes.plan_gate)
     builder.add_node("architect", nodes.architect)
     builder.add_node("approval", approval_node)
     builder.add_edge(START, "planner")
     builder.add_conditional_edges(
-        "planner", route_after_planner, {"architect": "architect", END: END}
+        "planner", nodes.route_after_planner, {"plan_gate": "plan_gate", END: END}
+    )
+    builder.add_conditional_edges(
+        "plan_gate",
+        nodes.route_after_gate,
+        {"planner": "planner", "architect": "architect", END: END},
     )
     builder.add_conditional_edges(
         "architect",

@@ -46,6 +46,7 @@ from app.projects import (
     ProjectPolicyRegistry,
     RepositoryPolicy,
     check_against_policy,
+    constraints_from_policy,
     filter_scope,
     hidden_from_agents,
     injection_signals,
@@ -286,12 +287,19 @@ def build_scoped_development_graph(
                 )
                 calls = 1 if decision.classifier_used else 0
             await runtime.record_route(run_id, decision)
-            return {
+            update: dict[str, Any] = {
                 "route": decision.route.value,
                 "route_mode": mode.value,
                 "route_decision": decision.model_dump(mode="json"),
                 "llm_calls": calls,
             }
+            if decision.route is Route.FULL and not state.get("plan_constraints"):
+                # H1: the full route plans inside this run; the Planner and the gate
+                # get the repository policy as data (no listing yet: no worktree).
+                update["plan_constraints"] = constraints_from_policy(
+                    policy, max_tasks=None
+                ).model_dump(mode="json")
+            return update
         except (PolicyError, LLMError) as exc:
             return _failure(exc)
 
@@ -574,9 +582,6 @@ def build_scoped_development_graph(
             return END
         return "planner" if state.get("route") == Route.FULL.value else "scoper"
 
-    def after_planner(state: DevelopmentState) -> str:
-        return END if state.get("error") else "architect"
-
     def after_plan_decision(state: DevelopmentState) -> str:
         if state.get("error") or state.get("plan_approved") is not True:
             return END
@@ -617,6 +622,7 @@ def build_scoped_development_graph(
     builder = StateGraph(DevelopmentState)
     builder.add_node("router", router_node)
     builder.add_node("planner", planning.planner)
+    builder.add_node("plan_gate", planning.plan_gate)
     builder.add_node("architect", planning.architect)
     builder.add_node("approve_plan", approve_plan_node)
     builder.add_node("scoper", scoper_node)
@@ -632,7 +638,14 @@ def build_scoped_development_graph(
     builder.add_conditional_edges(
         "router", after_router, {"planner": "planner", "scoper": "scoper", END: END}
     )
-    builder.add_conditional_edges("planner", after_planner, {"architect": "architect", END: END})
+    builder.add_conditional_edges(
+        "planner", planning.route_after_planner, {"plan_gate": "plan_gate", END: END}
+    )
+    builder.add_conditional_edges(
+        "plan_gate",
+        planning.route_after_gate,
+        {"planner": "planner", "architect": "architect", END: END},
+    )
     builder.add_conditional_edges(
         "architect",
         planning.route_after_architect,

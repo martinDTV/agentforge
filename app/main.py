@@ -445,6 +445,7 @@ def create_app(
                 probe=probe,
                 limits=supervisor_policy or SupervisorLimits(),
                 owner=service.owner,
+                listing=probe if isinstance(probe, GitHubIntegrationProbe) else None,
             )
             goal_service = GoalService(
                 coordinator,

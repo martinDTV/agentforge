@@ -163,3 +163,59 @@ def test_task_text_is_bounded_and_fingerprints_fold_case_and_whitespace():
     assert a == fingerprint("repo", "añade greet(name) en src/app.py")
     assert a != fingerprint("other", "añade greet(name) en src/app.py")
     assert len(a) == 64
+
+
+# -- H2: stage-aware failure codes and reminders ---------------------------------------------------
+
+
+def test_failure_codes_take_the_stage_from_the_error_code_or_the_recorded_decision():
+    from app.contracts.lifecycle import RunLifecycleStatus as S
+    from app.goals import NeedsHumanReason, needs_human_ordinal, reminders_due
+
+    # The sweep clears ``pending_stage`` but writes ``expired:<stage>`` first (H2).
+    assert (
+        failure_code_for_run(S.EXPIRED, pending_stage=None, error_code="expired:scope")
+        == "expired:scope"
+    )
+    assert (
+        failure_code_for_run(S.EXPIRED, pending_stage=None, error_code="expired:publish")
+        == "expired:publish"
+    )
+    # A rejection names the stage of the decision a human recorded.
+    assert (
+        failure_code_for_run(
+            S.REJECTED, pending_stage=None, error_code=None, decided_stage=DecisionStage.SCOPE
+        )
+        == "rejected:scope"
+    )
+    # ``plan`` only when nothing better is known (a planning run has no other stage).
+    assert failure_code_for_run(S.EXPIRED, pending_stage=None, error_code=None) == "expired:plan"
+    # Every reason, stage pair owns a distinct ordinal, final notices included.
+    ordinals = {
+        needs_human_ordinal(t, reason, stage=stage)
+        for t in (-1, 0, 1)
+        for reason in NeedsHumanReason
+        for stage in (0, 1, 2)
+    }
+    assert len(ordinals) == 3 * len(NeedsHumanReason) * 3
+    # 24-hour window: midway at 12 h, final notice at 23 h, each exactly once per state.
+    since, deadline = T0, T0 + timedelta(hours=24)
+    kwargs = dict(since=since, reminder_seconds=86_400, final_notice_seconds=3_600)
+    assert reminders_due(now=T0 + timedelta(hours=11), deadline=deadline, **kwargs) == (
+        False,
+        False,
+    )
+    assert reminders_due(now=T0 + timedelta(hours=12, minutes=1), deadline=deadline, **kwargs) == (
+        True,
+        False,
+    )
+    assert reminders_due(now=T0 + timedelta(hours=22, minutes=59), deadline=deadline, **kwargs) == (
+        True,
+        False,
+    )
+    assert reminders_due(now=T0 + timedelta(hours=23), deadline=deadline, **kwargs) == (True, True)
+    # A 1-hour window has no room for a distinct final notice: only the midway one.
+    short = T0 + timedelta(hours=1)
+    assert reminders_due(now=T0 + timedelta(minutes=59), deadline=short, **kwargs) == (True, False)
+    # Without a deadline there is never a final notice; the midway reminder waits a day.
+    assert reminders_due(now=T0 + timedelta(hours=25), deadline=None, **kwargs) == (True, False)
