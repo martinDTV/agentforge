@@ -199,10 +199,32 @@ def constraints_from_policy(
     )
 
 
+# Paths whose mere existence a planning model has no reason to learn.
+_SENSITIVE_LISTING_GLOBS: tuple[str, ...] = (
+    "**/.env",
+    "**/.env.*",
+    "**/*.pem",
+    "**/*.key",
+    "**/*secret*",
+    "**/*credential*",
+    "**/id_rsa*",
+    "**/id_ed25519*",
+    "**/.netrc",
+    "**/.npmrc",
+    "**/.pypirc",
+    "**/*.tfstate*",
+)
+
+
 def filter_listing(paths: Iterable[str], policy: RepositoryPolicy) -> list[str]:
     """Repository paths safe to show to a planning model: sorted, canonical, without the
-    excluded context files (``AGENTS.md`` and friends) nor denied paths."""
-    hidden = (*policy.all_excluded_context_globs, *policy.all_denied_globs)
+    excluded context files (``AGENTS.md`` and friends) nor secret-looking paths.
+
+    Denied but ordinary files (acceptance tests, CI definitions) stay listed on purpose:
+    the gate must know they exist so that merely naming them is never a violation, and
+    the context tells the model they are prohibited.
+    """
+    hidden = (*policy.all_excluded_context_globs, *_SENSITIVE_LISTING_GLOBS)
     out: list[str] = []
     for path in sorted(set(paths)):
         if not path or path.startswith(("/", "../")) or ".." in path.split("/"):

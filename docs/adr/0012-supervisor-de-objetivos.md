@@ -509,7 +509,7 @@ y un `NOTES.md` fuera de las rutas escribibles) y una caducidad de alcance etiqu
 
 - **H1, compuerta de plan.** `PlanConstraints` (`app/contracts/planning.py`) reúne hechos
   deterministas: `max_tasks` del objetivo, globs escribibles y prohibidos de la política,
-  listado del espejo filtrado por los globs excluidos y prohibidos, programas de QA y archivos
+  listado del espejo sin los archivos de contexto excluidos ni rutas sensibles (los archivos prohibidos siguen listados para que nombrarlos nunca cuente como crearlos), programas de QA y archivos
   por tarea. El coordinador los construye en `_plan_constraints` (el listado llega por el
   puerto `RepositoryListing`, que implementa `GitHubIntegrationProbe` con `ls-tree` de solo
   lectura sobre el espejo; su ausencia nunca bloquea). `RunService.create` los siembra en el

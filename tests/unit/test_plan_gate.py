@@ -112,11 +112,16 @@ E2_VALID_PLAN = DevelopmentPlan(
 )
 
 
+SANDBOX_POLICY = policy(denied_globs=["tests/test_acceptance.py"])
+
+
 def sandbox_constraints(max_tasks: int | None = 2) -> PlanConstraints:
+    """Built exactly like the coordinator does: one policy filters the listing and
+    provides the globs, so a protected file stays known while being prohibited."""
     return constraints_from_policy(
-        policy(denied_globs=["tests/test_acceptance.py"]),
+        SANDBOX_POLICY,
         max_tasks=max_tasks,
-        repository_paths=filter_listing(SANDBOX_LISTING, policy()),
+        repository_paths=filter_listing(SANDBOX_LISTING, SANDBOX_POLICY),
         listing_complete=True,
     )
 
@@ -193,10 +198,26 @@ def test_extract_paths_is_conservative():
     assert extract_paths(text) == ["src/x.py", "tests/t_y.py", "README.md", "docs/guide.md"]
 
 
-def test_listing_filter_hides_agent_instructions_and_denied_paths():
-    shown = filter_listing([*SANDBOX_LISTING, ".env", ".github/workflows/ci.yml"], policy())
-    assert "AGENTS.md" not in shown and ".env" not in shown
-    assert ".github/workflows/ci.yml" not in shown and "README.md" in shown
+def test_listing_filter_hides_agent_instructions_and_secrets_but_keeps_protected_files():
+    shown = filter_listing(
+        [*SANDBOX_LISTING, ".env", "config/secrets.json", ".github/workflows/ci.yml"],
+        SANDBOX_POLICY,
+    )
+    assert "AGENTS.md" not in shown and ".env" not in shown and "config/secrets.json" not in shown
+    # Prohibited yet existing files stay visible: naming them must never read as creating them.
+    assert "tests/test_acceptance.py" in shown and ".github/workflows/ci.yml" in shown
+    assert "README.md" in shown
+
+
+def test_naming_a_protected_existing_file_is_never_a_violation_with_the_production_filter():
+    """Regression: hiding denied files from the listing made the gate flag the plan a human
+    had approved (it mentions tests/test_acceptance.py as a file not to touch)."""
+    plan = DevelopmentPlan(
+        summary="p",
+        tasks=[task("t", "T", "Mantener tests/test_acceptance.py intacto y crear src/a.py", "ok")],
+    )
+    assert validate_plan(plan, sandbox_constraints()) == []
+    assert "tests/test_acceptance.py" in policy_context_text(sandbox_constraints())
 
 
 def test_policy_context_is_data_about_the_platform_not_instructions():
