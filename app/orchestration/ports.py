@@ -187,6 +187,14 @@ class RunCursor(BaseModel):
     id: UUID
 
 
+class PublicationAvailability(Protocol):
+    """Can this instance publish ``repository_id``? (P1). Answered from configuration only:
+    the Publisher exists (``GITHUB_WRITE_ENABLED``) and the repository is allow-listed.
+    Asking never creates tokens nor touches GitHub."""
+
+    def allows(self, repository_id: str) -> bool: ...
+
+
 class RunRepository(Protocol):
     # -- rows -----------------------------------------------------------------
 

@@ -28,7 +28,8 @@ class PublicationState(StrEnum):
 
 _S = PublicationState
 ALLOWED: dict[PublicationState, frozenset[PublicationState]] = {
-    _S.UNAVAILABLE: frozenset(),
+    # Publication was disabled when the run got there; enabling it and resuming prepares.
+    _S.UNAVAILABLE: frozenset({_S.PREPARED}),
     _S.PREPARED: frozenset({_S.APPROVED, _S.REJECTED, _S.FAILED}),
     _S.APPROVED: frozenset({_S.PUSHED, _S.FAILED}),
     _S.PUSHED: frozenset({_S.OPENED, _S.FAILED, _S.CANCELLED_AFTER_PUSH}),
@@ -74,7 +75,7 @@ class PublicationProgress(BaseModel):
 
     @property
     def terminal(self) -> bool:
-        return self.state in (_S.PUBLISHED, _S.REJECTED, _S.UNAVAILABLE, _S.CANCELLED_AFTER_PUSH)
+        return self.state in (_S.PUBLISHED, _S.REJECTED, _S.CANCELLED_AFTER_PUSH)
 
 
 def advance(

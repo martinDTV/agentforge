@@ -55,6 +55,14 @@ ERROR_EXPLANATIONS: dict[str, str] = {
         "o rutas) tras las revisiones permitidas; ninguna persona llegó a verlo."
     ),
     "expired": "La decisión pendiente caducó sin respuesta humana dentro de su ventana.",
+    "publish_unavailable": (
+        "La publicación no está habilitada en esta instancia (GITHUB_WRITE_ENABLED o "
+        "PUBLISH_ALLOWED_REPOSITORIES); el trabajo se conserva hasta que se habilite y se reanude."
+    ),
+    "publication_missing": (
+        "La ejecución terminó sin Pull Request en un repositorio con remoto: no hay nada "
+        "publicado ni fusionable."
+    ),
     "development_budget_exceeded": "Se agotó el presupuesto de llamadas, tokens o coste.",
     "llm_timeout": "El proveedor del modelo no respondió a tiempo.",
     "llm_unavailable": "El proveedor del modelo no estaba disponible.",
@@ -1227,6 +1235,40 @@ class NotificationPolicy:
                 "Revisa y fusiona el Pull Request en GitHub (cualquier modalidad de fusión sirve).",
                 "Si ya no procede, cancela el objetivo.",
             )
+        elif reason == "publication_unavailable":
+            headline = (
+                f"Publicación deshabilitada: {task} espera" if task else "Publicación deshabilitada"
+            )
+            summary = (
+                "Developer y QA terminaron, pero esta instancia no puede publicar (escritura en "
+                "GitHub deshabilitada o repositorio fuera de la lista permitida). El trabajo se "
+                "conserva en el worktree y la ejecución queda interrumpida, nunca completada."
+            )
+            facts.append(("Código", code or "publish_unavailable"))
+            steps = (
+                "Arranca la API con GITHUB_WRITE_ENABLED=true y PUBLISH_ALLOWED_REPOSITORIES "
+                "que incluya el repositorio.",
+                "Reanuda la ejecución; preparará el plan de publicación y pedirá tu aprobación.",
+            )
+            if run_id:
+                cli = (f"uv run python -m scripts.agentforge show {run_id}",) + cli
+        elif reason == "publication_missing":
+            headline = (
+                f"La tarea {task} terminó sin Pull Request" if task else "Tarea sin Pull Request"
+            )
+            summary = (
+                "La ejecución terminó sin publicar en un repositorio con remoto, así que no hay "
+                "fusión que verificar. Las tareas que dependen de ella siguen pendientes hasta "
+                "que decidas."
+            )
+            facts.append(("Código", code or "publication_missing"))
+            steps = (
+                "Revisa los eventos de la ejecución.",
+                "Si el trabajo sigue haciendo falta, crea un objetivo o tarea nueva con la "
+                "publicación habilitada; si no, cancela el objetivo.",
+            )
+            if run_id:
+                cli = (f"uv run python -m scripts.agentforge events {run_id}",) + cli
         elif reason == "merge_unverified":
             headline = "Fusión declarada por GitHub pero ausente en el espejo"
             summary = (

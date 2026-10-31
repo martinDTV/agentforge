@@ -160,6 +160,22 @@ class GoalDependencyCycleError(DomainError):
         super().__init__("Las dependencias del plan forman un ciclo: " + " -> ".join(cycle))
 
 
+class PublishUnavailableError(ConflictError):
+    """A remote repository was asked for work whose only outcome is a Pull Request, but
+    publication is not enabled in this instance (P1): refuse before any budget is spent."""
+
+    code = "publish_unavailable"
+
+    def __init__(self, repository_id: str) -> None:
+        super().__init__(
+            f"La publicación hacia '{repository_id}' no está habilitada en esta instancia. "
+            "Arranca la API con GITHUB_WRITE_ENABLED=true y PUBLISH_ALLOWED_REPOSITORIES que "
+            f"incluya '{repository_id}' antes de crear ejecuciones u objetivos sobre un "
+            "repositorio con remoto; la aprobación humana de la publicación sigue siendo "
+            "obligatoria."
+        )
+
+
 class GoalDependenciesUnsupportedError(DomainError):
     code = "goal_dependencies_unsupported"
 

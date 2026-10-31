@@ -442,3 +442,36 @@ def test_final_notice_mails_say_last_call_and_show_the_deadline():
         moment=MOMENT,
     )
     assert invalid is not None and "plan inválido" in invalid.subject
+
+
+def test_publication_unavailable_and_missing_mails_name_the_configuration_not_a_merge():
+    policy = NotificationPolicy()
+    goal = GoalContext(
+        goal_id=uuid4(), project_id="sandbox", repository_id="sandbox", objective="Objetivo"
+    )
+    run_id = str(uuid4())
+    unavailable = policy.draft_goal(
+        goal,
+        kind=GoalEventKind.NEEDS_HUMAN,
+        payload={
+            "reason": "publication_unavailable",
+            "stage": "publish",
+            "task_key": "T1",
+            "run_id": run_id,
+            "code": "publish_unavailable",
+        },
+        ordinal=11,
+        moment=MOMENT,
+    )
+    assert unavailable is not None and "Publicación deshabilitada" in unavailable.subject
+    assert "GITHUB_WRITE_ENABLED=true" in unavailable.text and "fusión" not in unavailable.subject
+    assert "interrumpida" in unavailable.text
+    missing = policy.draft_goal(
+        goal,
+        kind=GoalEventKind.NEEDS_HUMAN,
+        payload={"reason": "publication_missing", "task_key": "T1", "run_id": run_id},
+        ordinal=12,
+        moment=MOMENT,
+    )
+    assert missing is not None and "sin Pull Request" in missing.subject
+    assert "GitHub" not in missing.subject and "espejo" not in missing.text

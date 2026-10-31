@@ -230,6 +230,7 @@ class GoalEventKind(StrEnum):
     TASK_PUBLISHED = "task_published"
     DEPENDENCY_MERGED = "dependency_merged"
     MERGE_UNVERIFIED = "merge_unverified"
+    PUBLICATION_MISSING = "publication_missing"  # P2: no Pull Request where one was required
     PROBE_FAILED = "probe_failed"
     PR_CLOSED = "pr_closed"
     TASK_FAILED = "task_failed"

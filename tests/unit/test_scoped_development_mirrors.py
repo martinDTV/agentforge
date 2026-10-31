@@ -111,6 +111,7 @@ class MirrorWorld:
         self.model.register(QAReview, QAReview(approved=True, summary="ok", issues=[]))
         self.now = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
         self.runtime = DevelopmentRuntime(
+            runs=self.repository,
             policies=self.lab.policies,
             workspaces=self.manager,
             git=self.lab.adapter,
@@ -187,7 +188,10 @@ async def test_the_mirror_is_refreshed_and_verified_before_the_scoper_runs(tmp_p
     # Approval carries the base into the development phase and the run completes.
     digest = pending.scope_digest
     done = await service.approve(run_id, True, OPERATOR, scope_digest=digest)
-    assert done.status is S.COMPLETED
+    # P1: this world has a remote but no Publisher, so the verified work must not be
+    # discarded as ``completed``: the run stops, resumable, with the reason on the row.
+    assert done.status is S.INTERRUPTED
+    assert done.publication is not None and done.publication["state"] == "unavailable"
     assert (worktree.path / "tests/test_greet.py").is_file()
     assert (worktree.path / "AGENTS.md").read_text() == AGENTS_MD  # never written
     # GitHub only ever saw the platform's token flow; no second mint for the whole run.

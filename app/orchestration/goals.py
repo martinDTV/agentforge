@@ -88,6 +88,7 @@ from app.orchestration.exceptions import (
     GoalNotCancellableError,
     GoalNotFoundError,
     GoalReconcileInProgressError,
+    PublishUnavailableError,
     RepositoryNotAuthorizedError,
     RunAlreadyExistsError,
     RunNotCancellableError,
@@ -95,7 +96,7 @@ from app.orchestration.exceptions import (
     ShuttingDownError,
 )
 from app.orchestration.limits import RunLimits
-from app.orchestration.ports import PersistedRun, RunRepository
+from app.orchestration.ports import PersistedRun, PublicationAvailability, RunRepository
 from app.orchestration.runs import CreateResult, DecisionsView
 from app.projects import (
     PolicyError,
@@ -728,8 +729,15 @@ class GoalCoordinator:
     def _publication(self, row: PersistedRun) -> dict[str, Any]:
         return row.publication or {}
 
+    def _remote(self, goal: PersistedGoal) -> bool:
+        try:
+            return self._policy(goal).remote is not None
+        except PolicyError:
+            return False
+
     async def _apply_run(self, ctx: _Reconcile, task: PersistedGoalTask, row: PersistedRun) -> None:
-        new_status = task_status_for_run(row.status)
+        remote = self._remote(ctx.goal)
+        new_status = task_status_for_run(row.status, remote=remote)
         publication = self._publication(row)
         patch = TaskPatch(llm_calls=row.llm_calls)
         for name in ("head_sha", "pr_number", "pr_url"):
@@ -738,6 +746,22 @@ class GoalCoordinator:
                 setattr(patch, name, value)
         if publication.get("base_sha") and task.base_sha is None:
             patch.base_sha = str(publication["base_sha"])
+        if row.status is _S.INTERRUPTED and publication.get("state") == "unavailable":
+            # P1/P2: the child did its work but publication is disabled here. It waits for
+            # the operator (enable, restart, resume), not for recovery: block the goal with
+            # the real reason instead of pretending it still runs.
+            if task.status is not _T.WAITING_HUMAN or task.waiting_stage != "publish":
+                patch.status = _T.WAITING_HUMAN
+                patch.waiting_since = ctx.now
+                patch.waiting_stage = "publish"
+            ctx.needs_human(
+                NeedsHumanReason.PUBLICATION_UNAVAILABLE,
+                task,
+                stage="publish",
+                code=str(publication.get("code") or "publish_unavailable"),
+            )
+            await self._patch(ctx, task, patch)
+            return
         if new_status is _T.WAITING_HUMAN:
             stage = row.pending_stage
             stage_name = stage.value if stage is not None else "plan"
@@ -812,6 +836,10 @@ class GoalCoordinator:
             error_code=row.error.code if row.error else None,
             decided_stage=decided_stage,
         )
+        if row.status is _S.COMPLETED:
+            # P2: ``completed`` without a Pull Request in a remote repository is not a
+            # delivery; name the configuration failure, never a merge.
+            code = str(publication.get("code") or "publication_missing")
         patch.status = _T.FAILED
         patch.last_error_code = code
         failure: dict[str, Any] = {
@@ -956,7 +984,18 @@ class GoalCoordinator:
             dependents = dependents_of(graph, task.task_key)
             if not dependents:
                 continue
-            if task.pr_number is None or self._probe is None:
+            if task.pr_number is None:
+                # P2: a published task without a Pull Request never reached GitHub; there
+                # is no merge to verify. Dependents stay pending until a human decides.
+                ctx.event(
+                    GoalEventKind.PUBLICATION_MISSING,
+                    ordinal=task.ordinal,
+                    task_key=task.task_key,
+                    code="publication_missing",
+                )
+                ctx.needs_human(NeedsHumanReason.PUBLICATION_MISSING, task)
+                continue
+            if self._probe is None:
                 ctx.event(
                     GoalEventKind.MERGE_UNVERIFIED,
                     ordinal=task.ordinal,
@@ -1341,12 +1380,19 @@ class GoalCoordinator:
     def _calls_used(ctx: _Reconcile) -> int:
         return ctx.plan_calls + sum(t.llm_calls for t in ctx.tasks.values())
 
-    @staticmethod
-    def _standing_reasons(ctx: _Reconcile) -> set[str]:
+    def _standing_reasons(self, ctx: _Reconcile) -> set[str]:
         """Reasons derived from durable state (not from this tick's transitions), so a goal
         stays ``blocked`` across restarts for as long as the condition holds."""
         reasons: set[str] = set()
+        remote = self._remote(ctx.goal)
         for task in ctx.tasks.values():
+            if (
+                remote
+                and task.status is _T.PUBLISHED
+                and task.pr_number is None
+                and dependents_of(ctx.graph, task.task_key)
+            ):
+                reasons.add(NeedsHumanReason.PUBLICATION_MISSING.value)
             if task.status is not _T.FAILED:
                 continue
             code = task.last_error_code or ""
@@ -1471,7 +1517,9 @@ class GoalService:
         router: SmartRouter | None = None,
         planning_limits: RunLimits | None = None,
         clock: Callable[[], datetime] | None = None,
+        publishing: PublicationAvailability | None = None,
     ) -> None:
+        self._publishing = publishing
         self._coordinator = coordinator
         self._goals = coordinator.goals
         self._authz = authorization
@@ -1497,6 +1545,14 @@ class GoalService:
             raise RepositoryNotAuthorizedError(body.repository_id, project) from exc
         if policy.remote is None and body.decomposition is not GoalDecomposition.SINGLE:
             raise GoalDependenciesUnsupportedError(body.repository_id)  # D2
+        if (
+            policy.remote is not None
+            and self._publishing is not None
+            and not self._publishing.allows(body.repository_id)
+        ):
+            # P1: every task of this goal must end as a Pull Request; refuse before the
+            # planning run spends anything or asks a human for anything.
+            raise PublishUnavailableError(body.repository_id)
         limits = resolve_limits(
             body.limits,
             planning_calls=self._planning_limits.max_llm_calls,

@@ -91,6 +91,7 @@ from .development import (
 )
 from .graph import PlanningNodes
 from .limits import RunLimits
+from .ports import PersistedRun, RunRepository
 from .publication import PublicationNodes, PublicationRuntime
 
 SCOPE_STAGE = "scope"
@@ -127,6 +128,8 @@ class DevelopmentRuntime:
     # Fase 7, Paso 3 (ADR 0011): the Publisher. ``None`` = publication disabled:
     # runs on remote repositories end ``completed`` and nothing leaves the host.
     publisher: PublicationRuntime | None = None
+    # Run rows, for publication progress that must be recorded even without a Publisher (P1).
+    runs: RunRepository | None = None
     # Smart Router. ``None`` keeps the historical behaviour: every run goes fast
     # unless the request asks for ``full``.
     router: SmartRouter | None = None
@@ -139,12 +142,26 @@ class DevelopmentRuntime:
         if self.route_decisions is not None:
             await self.route_decisions.record(run_id, decision)
 
+    def _runs_repository(self) -> RunRepository | None:
+        if self.runs is not None:
+            return self.runs
+        return self.publisher.runs if self.publisher is not None else None
+
+    async def runs_get(self, run_id: UUID) -> PersistedRun | None:
+        runs = self._runs_repository()
+        return await runs.get_run(run_id) if runs is not None else None
+
     async def runs_set_publication(self, run_id: UUID, progress: PublicationProgress) -> None:
-        """Record a non-progressing publication state (unavailable, failed at prepare)."""
-        if self.publisher is None:
+        """Record a non-progressing publication state (unavailable, failed at prepare).
+
+        Works without a Publisher (P1): ``unavailable`` is exactly the state that exists
+        because there is none, and the sweep and the Supervisor need to read it.
+        """
+        runs = self._runs_repository()
+        if runs is None:
             return
-        stamped = progress.model_copy(update={"updated_at": self.publisher.clock()})
-        await self.publisher.runs.set_publication(run_id, stamped.as_json())
+        stamped = progress.model_copy(update={"updated_at": self.clock()})
+        await runs.set_publication(run_id, stamped.as_json())
 
     def policy_for(self, state: DevelopmentState) -> RepositoryPolicy:
         return self.policies.require(state["repository_id"], state["project_id"])
