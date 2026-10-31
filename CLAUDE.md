@@ -10,6 +10,10 @@ Antes de implementar o modificar cualquier componente de FastAPI (routers, schem
 - Toda desviación intencional respecto a la skill debe documentarse como ADR en `docs/adr/`.
 - Ver `docs/adr/0001-layout-por-capa-tecnica.md` para la decisión sobre por qué `app/` está organizado por capa técnica (`agents/`, `contracts/`, `infrastructure/`, `orchestration/`, `api/`) y no por módulo de negocio. Ver `docs/adr/0002-politica-de-errores-reintentos-y-presupuesto-llm.md` para la política de errores LLM, reintentos y presupuesto por run.
 
+## Conducción de ejecuciones (I0.1)
+
+`RunService.create`, `approve` y `resume` responden cuando el trabajo es durable (fila + lease + checkpoint de entrada escrito con `as_node=START`; decisión registrada; lease e intento) y conducen el grafo en una tarea del proceso bajo el mismo lease (`drive_mode="background"`, el de la API); la tarea nunca es el registro: una caída la retoma el barrido desde el checkpoint y un run con solo su checkpoint de entrada (`status.never_started`) se reanuda siempre, sigue `running` para los lectores y nunca es `interrupted`. Operadores y pruebas del motor usan `drive_mode="inline"`. Las pruebas de la API siguen la ejecución con `tests.conftest.settle`; no se añaden colas, tablas ni servicios para esto. Ver la actualización I0.1 en `docs/adr/0004-leases-recuperacion-e-idempotencia.md`.
+
 ## Seguridad
 
 `app/security/` no importa FastAPI: ahí viven `Principal`, la verificación de tokens y la política de autorización; `app/api/security.py` solo las adapta a dependencias. Los servicios reciben el principal como argumento. `AUTH_MODE=disabled` y `OIDC_JWKS_FILE` existen solo para local y pruebas y Settings los rechaza en staging/production. Nunca registrar tokens ni correos: en logs y auditoría se usa el sujeto opaco. Ver `docs/adr/0005-identidad-y-autorizacion.md`.
