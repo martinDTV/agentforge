@@ -20,7 +20,7 @@ from app.contracts.lifecycle import (
     RunLifecycleStatus,
     WorkflowKind,
 )
-from app.contracts.planning import ArchitectureReview, DevelopmentPlan
+from app.contracts.planning import ArchitectureReview, DevelopmentPlan, PlanConstraints
 from app.contracts.routing import RouteMode
 from app.infrastructure.db.errors import DatabaseUnavailableError
 from app.orchestration.events import (
@@ -280,6 +280,7 @@ class RunService:
         repository_id: str | None = None,
         route_mode: RouteMode | None = None,
         planned_upstream: PlannedUpstream | None = None,
+        plan_constraints: PlanConstraints | None = None,
     ) -> CreateResult:
         self._ensure_accepting()
         # Authorization first: nothing is written until the principal may
@@ -288,6 +289,10 @@ class RunService:
         kind = WorkflowKind(workflow_kind) if workflow_kind is not None else self._workflow_kind
         graph = self._graph_for(kind)
         graph_input: dict[str, Any] = {"task": task, "workflow_kind": kind.value}
+        if plan_constraints is not None:
+            # H1: deterministic facts the plan must respect, built by the caller
+            # (the goal Supervisor) from policy and limits; never from model text.
+            graph_input["plan_constraints"] = plan_constraints.model_dump(mode="json")
         if kind is WorkflowKind.DEVELOPMENT:
             # Writing inside a worktree is a separate human permission (ADR 0009)
             # and the repository must carry an explicit policy for the project.

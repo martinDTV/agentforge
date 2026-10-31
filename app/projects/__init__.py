@@ -4,6 +4,14 @@ loaded in ``lifespan``; never shown to a model."""
 
 from .errors import PolicyError
 from .globs import compile_glob, matches_any
+from .plan_gate import (
+    PLAN_CONTEXT_PROGRAMS,
+    constraints_from_policy,
+    extract_paths,
+    filter_listing,
+    policy_context_text,
+    validate_plan,
+)
 from .policy import (
     DEFAULT_DENIED_GLOBS,
     DEFAULT_EXCLUDED_CONTEXT_GLOBS,
@@ -20,6 +28,12 @@ from .untrusted import (
 )
 
 __all__ = [
+    "PLAN_CONTEXT_PROGRAMS",
+    "constraints_from_policy",
+    "extract_paths",
+    "filter_listing",
+    "policy_context_text",
+    "validate_plan",
     "DATA_BOUNDARY_NOTICE",
     "DEFAULT_DENIED_GLOBS",
     "DEFAULT_EXCLUDED_CONTEXT_GLOBS",

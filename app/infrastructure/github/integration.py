@@ -124,6 +124,24 @@ class GitHubIntegrationProbe:
             ),
         )
 
+    async def list_paths(
+        self, repository_id: str, project_id: str, *, limit: int
+    ) -> list[str] | None:
+        """Paths of the mirrored default branch, as the mirror is right now (H1).
+
+        Advisory for the Planner and the plan gate: the child run refreshes the mirror
+        before scoping, so a slightly stale listing only costs a revision round at worst.
+        A missing mirror is reported as an ``IntegrationError`` and the caller plans
+        without a listing.
+        """
+        spec = self._spec(repository_id, project_id)
+        path = self._mirrors.path_for(spec, project_id)
+        ref = f"refs/remotes/origin/{spec.default_branch}"
+        try:
+            return await asyncio.to_thread(self._git.list_paths, path, ref, max_entries=limit)
+        except Exception as exc:  # noqa: BLE001 - any git failure means "no listing"
+            raise IntegrationError("mirror_listing_unavailable", str(exc)[:200]) from exc
+
     async def contains(
         self, repository_id: str, project_id: str, *, ancestor: str, descendant: str
     ) -> bool:

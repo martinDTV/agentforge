@@ -27,12 +27,26 @@ class NeedsHumanReason(StrEnum):
     PR_CLOSED = "pr_closed"
     BUDGET_EXHAUSTED = "budget_exhausted"
     PLAN_REFUSED = "plan_refused"
+    # H2: a last notice shortly before a decision window closes. Appended at the end so
+    # the ordinal slots of the reasons above stay where goals created earlier put them.
+    PLAN_FINAL_NOTICE = "plan_final_notice"
+    DECISION_FINAL_NOTICE = "decision_final_notice"
 
+
+# A final notice blocks the goal under the reason it reminds about, not under its own name.
+BLOCKING_REASON: dict[NeedsHumanReason, NeedsHumanReason] = {
+    NeedsHumanReason.PLAN_FINAL_NOTICE: NeedsHumanReason.PLAN_PENDING,
+    NeedsHumanReason.DECISION_FINAL_NOTICE: NeedsHumanReason.DECISION_PENDING,
+}
 
 _REASON_INDEX: dict[NeedsHumanReason, int] = {
     reason: index for index, reason in enumerate(NeedsHumanReason)
 }
-REASONS_PER_TASK = 8
+# Slots per task in the ``needs_human`` ordinal space. Raised from 8 to 16 with the final
+# notices (2026-10-31): ordinals of goals that were active across that change may differ
+# from the ones they would get today, which can only produce one extra reminder, never a
+# collision between different reasons.
+REASONS_PER_TASK = 16
 assert len(_REASON_INDEX) <= REASONS_PER_TASK
 
 
@@ -74,11 +88,21 @@ def failure_code_for_run(
     *,
     pending_stage: DecisionStage | None,
     error_code: str | None,
+    decided_stage: DecisionStage | None = None,
 ) -> str:
-    """Stable code of why a child is a failure for its goal."""
+    """Stable code of why a child is a failure for its goal.
+
+    The stage of a refused or expired decision comes, in order, from the run's own
+    error code (the sweep writes ``expired:<stage>`` before clearing ``pending_stage``),
+    from the stage still pending on the row, or from the stage of the decision a human
+    recorded (``decided_stage``). ``plan`` is only the last resort.
+    """
     if status is _S.FAILED:
         return error_code or "failed"
-    stage = pending_stage.value if pending_stage is not None else "plan"
+    if status is _S.EXPIRED and error_code and error_code.startswith("expired:"):
+        return error_code
+    known = pending_stage or decided_stage
+    stage = known.value if known is not None else "plan"
     if status is _S.REJECTED:
         return f"rejected:{stage}"
     if status is _S.EXPIRED:
@@ -88,6 +112,17 @@ def failure_code_for_run(
     return status.value
 
 
+def reminder_at(
+    *, since: datetime, reminder_seconds: float, deadline: datetime | None = None
+) -> datetime:
+    """When the midway reminder is due: ``since + reminder`` or, when the decision has a
+    deadline, half of the window, whichever comes first."""
+    at = since + timedelta(seconds=reminder_seconds)
+    if deadline is not None and deadline > since:
+        at = min(at, since + (deadline - since) / 2)
+    return at
+
+
 def reminder_due(
     *,
     since: datetime,
@@ -95,9 +130,46 @@ def reminder_due(
     reminder_seconds: float,
     deadline: datetime | None = None,
 ) -> bool:
-    """A human has had the decision for too long: at ``since + reminder`` or, when the
-    decision has a deadline, at half of the window, whichever comes first."""
-    at = since + timedelta(seconds=reminder_seconds)
-    if deadline is not None and deadline > since:
-        at = min(at, since + (deadline - since) / 2)
-    return now >= at
+    """A human has had the decision for too long (see ``reminder_at``)."""
+    return now >= reminder_at(since=since, reminder_seconds=reminder_seconds, deadline=deadline)
+
+
+def final_notice_at(
+    *,
+    since: datetime,
+    reminder_seconds: float,
+    final_notice_seconds: float,
+    deadline: datetime | None,
+) -> datetime | None:
+    """When the last notice before the window closes is due, or ``None`` when the window
+    has no deadline or is too short for a second, distinct notice (the final notice must
+    fall strictly after the midway reminder)."""
+    if deadline is None or deadline <= since:
+        return None
+    at = deadline - timedelta(seconds=final_notice_seconds)
+    midway = reminder_at(since=since, reminder_seconds=reminder_seconds, deadline=deadline)
+    return at if at > midway else None
+
+
+def reminders_due(
+    *,
+    since: datetime,
+    now: datetime,
+    reminder_seconds: float,
+    final_notice_seconds: float,
+    deadline: datetime | None = None,
+) -> tuple[bool, bool]:
+    """``(midway_due, final_due)`` for a pending human decision (H2).
+
+    Both are pure functions of durable facts, so every tick and every process after a
+    restart compute the same answer; the ``needs_human`` ordinal space keeps each notice
+    unique per task, reason and stage, which is what makes them idempotent.
+    """
+    midway = now >= reminder_at(since=since, reminder_seconds=reminder_seconds, deadline=deadline)
+    final_at = final_notice_at(
+        since=since,
+        reminder_seconds=reminder_seconds,
+        final_notice_seconds=final_notice_seconds,
+        deadline=deadline,
+    )
+    return midway, final_at is not None and now >= final_at

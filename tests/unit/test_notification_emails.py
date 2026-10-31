@@ -378,3 +378,67 @@ def test_goal_context_and_run_context_default_fields_keep_older_callers_working(
     run = run_context()
     assert run.plan is None and run.publication is None and run.pending_stage is None
     assert MOMENT == datetime(2026, 10, 30, 18, 25, 30, tzinfo=UTC)
+
+
+# -- H2: expired mails name the real stage; final notices exist -----------------------------------
+
+
+def test_expired_mails_name_the_stage_from_the_error_code_or_the_event_payload():
+    policy = NotificationPolicy()
+    from_row = policy.draft(
+        run_context(error_code="expired:scope"),
+        kind=RunEventKind.RUN_EXPIRED,
+        payload={},
+        ordinal=0,
+        moment=MOMENT,
+    )
+    assert from_row is not None and "etapa de alcance" in from_row.text
+    from_event = policy.draft(
+        run_context(),
+        kind=RunEventKind.RUN_EXPIRED,
+        payload={"stage": "publish", "code": "expired:publish"},
+        ordinal=0,
+        moment=MOMENT,
+    )
+    assert from_event is not None and "etapa de publicación" in from_event.text
+
+
+def test_final_notice_mails_say_last_call_and_show_the_deadline():
+    policy = NotificationPolicy()
+    goal = GoalContext(
+        goal_id=uuid4(), project_id="sandbox", repository_id="sandbox", objective="Objetivo"
+    )
+    run_id = str(uuid4())
+    scope = policy.draft_goal(
+        goal,
+        kind=GoalEventKind.NEEDS_HUMAN,
+        payload={
+            "reason": "decision_final_notice",
+            "stage": "scope",
+            "task_key": "T1",
+            "run_id": run_id,
+            "deadline": "2026-11-01T01:01:59+00:00",
+        },
+        ordinal=7,
+        moment=MOMENT,
+    )
+    assert scope is not None and "Última llamada" in scope.subject
+    assert "alcance" in scope.subject and "T1" in scope.subject
+    assert "2026-11-01" in scope.text and "nunca aprueba por ti" in scope.text
+    assert f"pending {run_id}" in scope.text
+    plan = policy.draft_goal(
+        goal,
+        kind=GoalEventKind.NEEDS_HUMAN,
+        payload={"reason": "plan_final_notice", "stage": "plan", "run_id": run_id},
+        ordinal=8,
+        moment=MOMENT,
+    )
+    assert plan is not None and "plan del objetivo" in plan.subject
+    invalid = policy.draft_goal(
+        goal,
+        kind=GoalEventKind.GOAL_FAILED,
+        payload={"code": "plan_invalid", "tasks": 0, "succeeded": 0, "failed": 0},
+        ordinal=0,
+        moment=MOMENT,
+    )
+    assert invalid is not None and "plan inválido" in invalid.subject

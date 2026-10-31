@@ -323,6 +323,18 @@ class LocalGitAdapter:
         )
         return completed.returncode == 0
 
+    def list_paths(self, repository_path: Path, ref: str, *, max_entries: int = 2000) -> list[str]:
+        """Paths tracked at ``ref`` (``ls-tree -r --name-only``), read-only, capped.
+
+        Platform-only, used on mirrors to tell the Planner which files exist (H1).
+        Never run on a worktree an agent can write to, never with a model-provided ref.
+        """
+        completed = self._run(
+            ["ls-tree", "-r", "--name-only", "-z", validate_ref(ref)], cwd=repository_path
+        )
+        paths = [item for item in completed.stdout.split("\0") if item]
+        return paths[: max(0, max_entries)]
+
     # -- bare mirrors (platform only; ADR 0010) --------------------------------------------
 
     def init_bare(self, path: Path) -> None:

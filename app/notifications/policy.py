@@ -50,6 +50,11 @@ ERROR_EXPLANATIONS: dict[str, str] = {
     "publication_scan_failed": "El escaneo previo bloqueó la publicación (contenido sensible).",
     "base_moved": "La rama base avanzó desde la aprobación del alcance; no se publica sobre ella.",
     "llm_budget_exceeded": "Se alcanzó el presupuesto de llamadas al modelo de la ejecución.",
+    "plan_invalid": (
+        "El plan no cumplió las restricciones de la plataforma (número de tareas, dependencias "
+        "o rutas) tras las revisiones permitidas; ninguna persona llegó a verlo."
+    ),
+    "expired": "La decisión pendiente caducó sin respuesta humana dentro de su ventana.",
     "development_budget_exceeded": "Se agotó el presupuesto de llamadas, tokens o coste.",
     "llm_timeout": "El proveedor del modelo no respondió a tiempo.",
     "llm_unavailable": "El proveedor del modelo no estaba disponible.",
@@ -415,7 +420,10 @@ class NotificationPolicy:
                 0,
             )
         if kind is K.RUN_EXPIRED:
-            stage = _stage(run.pending_stage) if run.pending_stage else None
+            raw_stage = payload.get("stage") or run.pending_stage
+            if not raw_stage and run.error_code and run.error_code.startswith("expired:"):
+                raw_stage = run.error_code.split(":", 1)[1]
+            stage = _stage(raw_stage) if raw_stage else None
             return (
                 _K.RUN_EXPIRED,
                 self._base(
@@ -1181,6 +1189,29 @@ class NotificationPolicy:
                     f"uv run python -m scripts.agentforge pending {run_id}",
                     f"uv run python -m scripts.agentforge approve {run_id}",
                 ) + cli
+        elif reason in ("plan_final_notice", "decision_final_notice"):
+            what = (
+                "el plan del objetivo"
+                if reason == "plan_final_notice"
+                else (f"{stage or 'la etapa pendiente'}" + (f" de {task}" if task else ""))
+            )
+            headline = f"Última llamada: decidir {what}"
+            summary = (
+                "La ventana de decisión está a punto de cerrarse"
+                + (f" ({deadline})" if deadline else "")
+                + ". Si caduca, la ejecución termina como caducada"
+                + (" y la tarea falla" if reason == "decision_final_notice" else "")
+                + "; la plataforma nunca aprueba por ti."
+            )
+            steps = (
+                "Decide ahora desde la terminal o la API; la aprobación se liga a la propuesta "
+                "mostrada.",
+            )
+            if run_id:
+                cli = (
+                    f"uv run python -m scripts.agentforge pending {run_id}",
+                    f"uv run python -m scripts.agentforge approve {run_id}",
+                ) + cli
         elif reason == "merge_pending":
             headline = (
                 f"Acción requerida: fusionar el PR #{number}"
@@ -1298,6 +1329,7 @@ class NotificationPolicy:
             label = {
                 "rejected:plan": "plan rechazado",
                 "expired:plan": "plan caducado sin decisión",
+                "invalid": "plan inválido según las restricciones de la plataforma",
                 "cancelled": "planificación cancelada",
             }.get(outcome, f"planificación no aprobada ({outcome})")
             headline = f"Objetivo cerrado: {label}"

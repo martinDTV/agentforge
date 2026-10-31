@@ -18,6 +18,8 @@ from app.contracts.lifecycle import (
     RunLifecycleStatus,
     WorkflowKind,
     can_transition,
+    expired_code,
+    expired_message,
 )
 from app.contracts.tools import InvocationStatus
 from app.git.mirrors import MirrorSync
@@ -610,6 +612,7 @@ class InMemoryRunRepository:
                 and run.approval_deadline < now
                 and self._lease_free(run)
             ):
+                stage, deadline = run.pending_stage, run.approval_deadline
                 expired.append(
                     self._store(
                         run.model_copy(
@@ -617,12 +620,28 @@ class InMemoryRunRepository:
                                 "status": RunLifecycleStatus.EXPIRED,
                                 "pending_stage": None,
                                 "approval_deadline": None,
+                                "error": RunError(
+                                    code=expired_code(stage),
+                                    message=expired_message(stage, deadline),
+                                ),
                                 "updated_at": self.clock(),
                             }
                         )
                     )
                 )
-                self._append(run.id, [RunEvent(kind=RunEventKind.RUN_EXPIRED)])
+                self._append(
+                    run.id,
+                    [
+                        RunEvent(
+                            kind=RunEventKind.RUN_EXPIRED,
+                            payload={
+                                "stage": stage.value if stage is not None else "plan",
+                                "deadline": deadline.isoformat() if deadline else None,
+                                "code": expired_code(stage),
+                            },
+                        )
+                    ],
+                )
         return expired
 
     # -- test helpers ---------------------------------------------------------

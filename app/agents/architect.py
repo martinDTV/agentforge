@@ -19,6 +19,7 @@ class ArchitectAgent:
         task: str,
         plan: DevelopmentPlan,
         revision: int = 0,
+        context: str | None = None,
     ) -> ArchitectureReview:
         revision_note = (
             f"Este es el plan revisado número {revision}. "
@@ -26,10 +27,13 @@ class ArchitectAgent:
             if revision > 0
             else ""
         )
+        prompt = f"{revision_note}Solicitud:\n{task}\n\nPlan:\n{plan.model_dump_json(indent=2)}"
+        if context:
+            # Platform constraints as data: the architect reviews against them but
+            # cannot relax them; the deterministic gate already enforced them.
+            prompt = f"{prompt}\n\n{context}"
         return self.llm.generate_structured(
             system_prompt=SYSTEM_PROMPT,
-            user_prompt=(
-                f"{revision_note}Solicitud:\n{task}\n\nPlan:\n{plan.model_dump_json(indent=2)}"
-            ),
+            user_prompt=prompt,
             schema=ArchitectureReview,
         )

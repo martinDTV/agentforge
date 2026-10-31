@@ -29,6 +29,8 @@ from app.contracts.lifecycle import (
     RunEventKind,
     RunLifecycleStatus,
     WorkflowKind,
+    expired_code,
+    expired_message,
     sources_for,
 )
 from app.notifications import NotificationEnqueuer, RunContext
@@ -789,37 +791,60 @@ class SqlAlchemyRunRepository:
             return await self._load(session, run_id)
 
     async def expire_waiting_runs(self, *, now: datetime, limit: int) -> list[PersistedRun]:
-        candidates = (
-            select(RunRecord.id)
-            .where(
-                RunRecord.status == RunLifecycleStatus.WAITING_APPROVAL,
-                RunRecord.approval_deadline.is_not(None),
-                RunRecord.approval_deadline < now,
-                _LEASE_FREE,
-            )
-            .order_by(RunRecord.approval_deadline)
-            .limit(limit)
-            .with_for_update(skip_locked=True)
-            .cte("expired_candidates")
-        )
+        """Close the waiting runs whose decision window passed (the sweep's expiry).
+
+        H2: the stage that expired is written as ``error_code='expired:<stage>'`` and
+        into the ``run_expired`` event *before* ``pending_stage`` is cleared, so goals,
+        audits and mails never have to guess it. Rows are locked with ``SKIP LOCKED``
+        so two sweepers never expire the same run twice.
+        """
         async with self._tx() as session:
-            ids = (
+            rows = (
+                await session.execute(
+                    select(RunRecord.id, RunRecord.pending_stage, RunRecord.approval_deadline)
+                    .where(
+                        RunRecord.status == RunLifecycleStatus.WAITING_APPROVAL,
+                        RunRecord.approval_deadline.is_not(None),
+                        RunRecord.approval_deadline < now,
+                        _LEASE_FREE,
+                    )
+                    .order_by(RunRecord.approval_deadline)
+                    .limit(limit)
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
+            expired: list[PersistedRun] = []
+            for run_id, raw_stage, deadline in rows:
+                stage = (
+                    raw_stage
+                    if isinstance(raw_stage, DecisionStage) or raw_stage is None
+                    else DecisionStage(str(raw_stage))
+                )
                 await session.execute(
                     update(RunRecord)
-                    .where(RunRecord.id == candidates.c.id)
+                    .where(
+                        RunRecord.id == run_id,
+                        RunRecord.status == RunLifecycleStatus.WAITING_APPROVAL,
+                    )
                     .values(
                         status=RunLifecycleStatus.EXPIRED,
                         pending_stage=None,
                         approval_deadline=None,
+                        error_code=expired_code(stage),
+                        error_message=expired_message(stage, deadline),
                         updated_at=func.now(),
                     )
-                    .returning(RunRecord.id)
                 )
-            ).scalars()
-            expired: list[PersistedRun] = []
-            for run_id in list(ids):
                 session.add(
-                    RunEventRecord(run_id=run_id, kind=RunEventKind.RUN_EXPIRED, payload={})
+                    RunEventRecord(
+                        run_id=run_id,
+                        kind=RunEventKind.RUN_EXPIRED,
+                        payload={
+                            "stage": stage.value if stage is not None else "plan",
+                            "deadline": deadline.isoformat() if deadline is not None else None,
+                            "code": expired_code(stage),
+                        },
+                    )
                 )
                 await session.flush()
                 run = await self._load(session, run_id)

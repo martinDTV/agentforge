@@ -40,10 +40,16 @@ from app.contracts.goals import (
     PlannedUpstream,
 )
 from app.contracts.lifecycle import DecisionStage, RunLifecycleStatus, WorkflowKind
-from app.contracts.planning import DevelopmentPlan
+from app.contracts.planning import (
+    MAX_CONTEXT_PATHS,
+    PLAN_INVALID_CODE,
+    DevelopmentPlan,
+    PlanConstraints,
+)
 from app.contracts.routing import Route, RouteMode
 from app.exceptions import DomainError
 from app.goals import (
+    BLOCKING_REASON,
     PLANNING_RESERVATION_USD,
     SUPERVISOR_ACTOR,
     DependencyCycleError,
@@ -66,6 +72,7 @@ from app.goals import (
     fingerprint,
     needs_human_ordinal,
     reminder_due,
+    reminders_due,
     resolve_limits,
     single_task_text,
     stage_ordinal,
@@ -90,7 +97,13 @@ from app.orchestration.exceptions import (
 from app.orchestration.limits import RunLimits
 from app.orchestration.ports import PersistedRun, RunRepository
 from app.orchestration.runs import CreateResult, DecisionsView
-from app.projects import PolicyError, ProjectPolicyRegistry, RepositoryPolicy
+from app.projects import (
+    PolicyError,
+    ProjectPolicyRegistry,
+    RepositoryPolicy,
+    constraints_from_policy,
+    filter_listing,
+)
 from app.routing import SmartRouter
 from app.security import (
     AuthorizationPolicy,
@@ -126,11 +139,21 @@ class RunLauncher(Protocol):
         repository_id: str | None = None,
         route_mode: RouteMode | None = None,
         planned_upstream: PlannedUpstream | None = None,
+        plan_constraints: PlanConstraints | None = None,
     ) -> CreateResult: ...
 
     async def decisions(self, run_id: str, principal: Principal) -> DecisionsView: ...
 
     async def cancel(self, run_id: str, principal: Principal) -> Any: ...
+
+
+class RepositoryListing(Protocol):
+    """Read-only listing of the mirrored base of a repository (H1): the paths the Planner
+    may be told about. Best effort: ``None`` or an error only means "no listing"."""
+
+    async def list_paths(
+        self, repository_id: str, project_id: str, *, limit: int
+    ) -> list[str] | None: ...
 
 
 @dataclass(frozen=True)
@@ -196,7 +219,7 @@ class _Reconcile:
     def needs_human(
         self, reason: NeedsHumanReason, task: PersistedGoalTask | None = None, **payload: Any
     ) -> None:
-        self.blocked.add(reason.value)
+        self.blocked.add(BLOCKING_REASON.get(reason, reason).value)
         if task is not None:
             payload.setdefault("task_key", task.task_key)
             if task.run_id is not None:
@@ -227,6 +250,7 @@ class GoalCoordinator:
         limits: SupervisorLimits | None = None,
         clock: Callable[[], datetime] | None = None,
         owner: str | None = None,
+        listing: RepositoryListing | None = None,
     ) -> None:
         self._goals = goals
         self._runs = runs
@@ -234,6 +258,7 @@ class GoalCoordinator:
         self._policies = policies
         self._planning_limits = planning_limits or RunLimits()
         self._probe = probe
+        self._listing = listing
         self._limits = limits or SupervisorLimits()
         self._clock = clock or _now
         self._owner = owner or f"supervisor:{uuid4().hex[:8]}"
@@ -465,12 +490,13 @@ class GoalCoordinator:
             await self._materialise(ctx, row)
             return
         if row.status in (_S.REJECTED, _S.EXPIRED, _S.CANCELLED, _S.FAILED):
+            decided_by, reason, decided_stage = await self._last_decision(row.id)
             code = failure_code_for_run(
                 row.status,
                 pending_stage=row.pending_stage,
                 error_code=row.error.code if row.error else None,
+                decided_stage=decided_stage,
             )
-            decided_by, reason = await self._last_decision(row.id)
             ctx.event(
                 GoalEventKind.PLAN_REFUSED,
                 run_id=str(row.id),
@@ -479,37 +505,56 @@ class GoalCoordinator:
                 reason=reason,
             )
             status = _G.CANCELLED if row.status is _S.CANCELLED else _G.FAILED
+            if code == PLAN_INVALID_CODE:
+                message = (
+                    "la planificación no cumplió las restricciones de la plataforma: "
+                    + (row.error.message if row.error else "")
+                )[:1000]
+            else:
+                message = "la planificación no fue aprobada"
             await self._finish(
                 ctx,
                 status,
-                code=f"plan_{code}",
-                message="la planificación no fue aprobada",
+                code=code if code.startswith("plan_") else f"plan_{code}",
+                message=message,
                 reason=reason,
                 decided_by=decided_by,
             )
             return
         if row.status in (_S.WAITING_APPROVAL, _S.RESUME_PENDING):
             since = await self._waiting_since(row, ctx.now)
-            if reminder_due(
+            midway, final = reminders_due(
                 since=since,
                 now=ctx.now,
                 reminder_seconds=goal.limits.decision_reminder_seconds,
+                final_notice_seconds=goal.limits.final_notice_seconds,
                 deadline=row.approval_deadline,
-            ):
+            )
+            deadline_iso = row.approval_deadline.isoformat() if row.approval_deadline else None
+            if midway:
                 ctx.needs_human(
                     NeedsHumanReason.PLAN_PENDING,
                     run_id=str(row.id),
                     stage="plan",
-                    deadline=row.approval_deadline.isoformat() if row.approval_deadline else None,
+                    deadline=deadline_iso,
+                )
+            if final:
+                ctx.needs_human(
+                    NeedsHumanReason.PLAN_FINAL_NOTICE,
+                    run_id=str(row.id),
+                    stage="plan",
+                    deadline=deadline_iso,
                 )
 
-    async def _last_decision(self, run_id: UUID) -> tuple[str | None, str | None]:
-        """Who took the last recorded decision of a run and the formal reason, if any."""
+    async def _last_decision(
+        self, run_id: UUID
+    ) -> tuple[str | None, str | None, DecisionStage | None]:
+        """Who took the last recorded decision of a run, the formal reason and its stage."""
         decisions = await self._runs.list_decisions(run_id)
         if not decisions:
-            return None, None
+            return None, None, None
         last = decisions[-1]
-        return last.decided_by, last.reason
+        return last.decided_by, last.reason, last.stage
 
     async def _waiting_since(self, row: PersistedRun, now: datetime) -> datetime:
         """When the run started waiting: its ``waiting_approval`` event, else its last update."""
@@ -578,6 +623,35 @@ class GoalCoordinator:
         if updated is not None:
             ctx.goal = updated
 
+    async def _plan_constraints(self, goal: PersistedGoal) -> PlanConstraints | None:
+        """Deterministic facts the plan of ``goal`` must respect (H1): the repository policy,
+        the goal's task limit and, when a mirror is available, the filtered file listing.
+        The listing is a hint for the model and the gate; failing to obtain it never blocks
+        planning (the gate then skips the path rule that needs it)."""
+        try:
+            policy = self._policy(goal)
+        except PolicyError:
+            return None  # the launcher refuses the run with the real error
+        paths: list[str] = []
+        complete = False
+        if self._listing is not None:
+            try:
+                listed = await self._listing.list_paths(
+                    goal.repository_id, goal.project_id, limit=MAX_CONTEXT_PATHS + 1
+                )
+            except Exception as exc:  # noqa: BLE001 - a listing is advisory by contract
+                logger.warning("Listado del espejo no disponible para %s: %s", goal.id, exc)
+                listed = None
+            if listed is not None:
+                paths = filter_listing(listed, policy)
+                complete = len(listed) <= MAX_CONTEXT_PATHS
+        return constraints_from_policy(
+            policy,
+            max_tasks=goal.limits.max_tasks,
+            repository_paths=paths,
+            listing_complete=complete,
+        )
+
     async def _create_plan_run(self, goal: PersistedGoal) -> None:
         assert goal.plan_run_id is not None
         key = f"goal:{goal.id}:{PLAN_IDEMPOTENCY_SUFFIX}"
@@ -589,6 +663,7 @@ class GoalCoordinator:
                 run_id=str(goal.plan_run_id),
                 idempotency_key=key,
                 workflow_kind=WorkflowKind.PLANNING,
+                plan_constraints=await self._plan_constraints(goal),
             )
         except RunAlreadyExistsError:
             pass  # created by an earlier attempt: the next tick links it
@@ -683,17 +758,27 @@ class GoalCoordinator:
                     await self._record_scope(ctx, task, row)
                 return
             since = task.waiting_since or row.updated_at
-            if reminder_due(
+            midway, final = reminders_due(
                 since=since,
                 now=ctx.now,
                 reminder_seconds=ctx.goal.limits.decision_reminder_seconds,
+                final_notice_seconds=ctx.goal.limits.final_notice_seconds,
                 deadline=row.approval_deadline,
-            ):
+            )
+            deadline_iso = row.approval_deadline.isoformat() if row.approval_deadline else None
+            if midway:
                 ctx.needs_human(
                     NeedsHumanReason.DECISION_PENDING,
                     task,
                     stage=stage_name,
-                    deadline=row.approval_deadline.isoformat() if row.approval_deadline else None,
+                    deadline=deadline_iso,
+                )
+            if final:
+                ctx.needs_human(
+                    NeedsHumanReason.DECISION_FINAL_NOTICE,
+                    task,
+                    stage=stage_name,
+                    deadline=deadline_iso,
                 )
             await self._patch(ctx, task, patch)
             return
@@ -718,16 +803,17 @@ class GoalCoordinator:
             )
             await self._patch(ctx, task, patch)
             return
+        decided_by, reason, decided_stage = (
+            await self._last_decision(row.id) if row.status is _S.REJECTED else (None, None, None)
+        )
         code = failure_code_for_run(
             row.status,
             pending_stage=row.pending_stage,
             error_code=row.error.code if row.error else None,
+            decided_stage=decided_stage,
         )
         patch.status = _T.FAILED
         patch.last_error_code = code
-        decided_by, reason = (
-            await self._last_decision(row.id) if row.status is _S.REJECTED else (None, None)
-        )
         failure: dict[str, Any] = {
             "task_key": task.task_key,
             "run_id": str(row.id),
@@ -1646,6 +1732,7 @@ __all__ = [
     "GoalEventListing",
     "GoalListing",
     "GoalService",
+    "RepositoryListing",
     "RunLauncher",
     "SupervisorLimits",
     "event_read",

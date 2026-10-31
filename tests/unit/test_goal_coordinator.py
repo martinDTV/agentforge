@@ -15,7 +15,7 @@ from app.contracts.goals import (
     GoalStatus,
     GoalTaskStatus,
 )
-from app.contracts.lifecycle import RunLifecycleStatus, WorkflowKind
+from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus, WorkflowKind
 from app.contracts.routing import RouteMode
 from app.goals import IntegrationError
 from app.infrastructure.db import InMemoryGoalRepository, InMemoryRunRepository
@@ -70,6 +70,7 @@ class World:
             limits=limits or SupervisorLimits(creating_timeout_seconds=120),
             clock=self.clock,
             owner="coordinator-a",
+            listing=self.probe,
         )
         self.service = GoalService(
             self.coordinator,
@@ -477,6 +478,7 @@ async def test_a_restart_between_reserving_the_run_id_and_creating_it_yields_exa
         limits=SupervisorLimits(creating_timeout_seconds=120),
         clock=world.clock,
         owner="coordinator-b",
+        listing=world.probe,
     )
     await restarted.reconcile(goal_id)
     await restarted.wait_until_idle()
@@ -761,3 +763,134 @@ async def test_a_fast_routed_goal_creates_one_child_with_route_mode_fast():
     child = world.launcher.created[0]
     assert child["workflow_kind"] is WorkflowKind.DEVELOPMENT
     assert child["route_mode"] is RouteMode.FAST and child["planned_upstream"] is None
+
+
+# -- H1: plan constraints from policy and mirror -------------------------------------------------
+
+
+async def test_plan_runs_carry_the_policy_facts_and_the_filtered_listing():
+    world = World()
+    world.probe.paths = [
+        "AGENTS.md",
+        "README.md",
+        "src/mailcheck/validator.py",
+        "tests/test_acceptance.py",
+        ".env",
+    ]
+    goal_id = await world.create(
+        decomposition=GoalDecomposition.PLAN, limits=GoalLimits(max_tasks=2)
+    )
+    assert len(world.launcher.created) == 1
+    constraints = world.launcher.created[0]["plan_constraints"]
+    assert constraints is not None and constraints.max_tasks == 2
+    policy = world.policies.require(REPO, PROJECT)
+    assert constraints.writable_globs == list(policy.writable_globs)
+    assert set(policy.all_denied_globs) <= set(constraints.denied_globs)
+    assert constraints.repository_paths == [
+        "README.md",
+        "src/mailcheck/validator.py",
+        "tests/test_acceptance.py",
+    ]
+    assert constraints.listing_complete is True and constraints.programs
+    assert (await world.goal(goal_id)).status is G.PLANNING
+
+
+async def test_a_listing_failure_never_blocks_planning():
+    world = World()
+    world.probe.listing_error = IntegrationError("mirror_listing_unavailable", "no mirror")
+    await world.create(decomposition=GoalDecomposition.PLAN)
+    constraints = world.launcher.created[0]["plan_constraints"]
+    assert constraints is not None and constraints.repository_paths == []
+    assert constraints.max_tasks == 5 and constraints.listing_complete is False
+
+
+async def test_an_invalid_plan_closes_the_goal_with_a_structured_code():
+    world = World()
+    goal_id = await world.create(decomposition=GoalDecomposition.PLAN)
+    await world.launcher.fail(await world.plan_run(goal_id), "plan_invalid")
+    await world.tick(goal_id)
+    goal = await world.goal(goal_id)
+    assert goal.status is G.FAILED and goal.error is not None
+    assert goal.error.code == "plan_invalid"  # never ``plan_plan_invalid``
+    assert "restricciones" in goal.error.message
+    refused = [
+        e for e in await world.goals.list_events(goal_id) if e.kind is GoalEventKind.PLAN_REFUSED
+    ]
+    assert len(refused) == 1 and refused[0].payload["code"] == "plan_invalid"
+    assert await world.tasks(goal_id) == {} and len(world.launcher.created) == 1
+
+
+# -- H2: expiry keeps its stage; reminders are idempotent ----------------------------------------
+
+
+async def test_an_expired_scope_decision_is_recorded_with_its_stage_everywhere():
+    world = World()
+    goal_id = await world.create(decomposition=GoalDecomposition.SINGLE)
+    run_id = (await world.task(goal_id, "single")).run_id
+    assert run_id is not None
+    world.clock.advance(hours=25)  # past the 24h scope window of the fake launcher
+    await world.launcher.expire(run_id)
+    await world.tick(goal_id)
+    task = await world.task(goal_id, "single")
+    assert task.status is T.FAILED and task.last_error_code == "expired:scope"
+    row = await world.runs.get_run(run_id)
+    assert row is not None and row.error is not None and row.error.code == "expired:scope"
+    assert row.pending_stage is None and row.approval_deadline is None
+    expired = [
+        e
+        for e in await world.runs.list_events(run_id, after_id=None, limit=None)
+        if e.kind is RunEventKind.RUN_EXPIRED
+    ]
+    assert len(expired) == 1 and expired[0].payload["stage"] == "scope"
+    failed = [
+        e for e in await world.goals.list_events(goal_id) if e.kind is GoalEventKind.TASK_FAILED
+    ]
+    assert len(failed) == 1 and failed[0].payload["code"] == "expired:scope"
+    goal = await world.goal(goal_id)
+    assert goal.status is G.FAILED and goal.error is not None
+    assert goal.error.code == "expired:scope"
+
+
+async def test_reminders_fire_midway_and_one_hour_before_the_window_closes_once_each():
+    world = World()
+    goal_id = await world.create(decomposition=GoalDecomposition.SINGLE)
+
+    def notices() -> list[str]:
+        return [
+            str(e.payload["reason"])
+            for e in world.goals.events.get(goal_id, [])
+            if e.kind is GoalEventKind.NEEDS_HUMAN
+        ]
+
+    world.clock.advance(hours=13)
+    await world.tick(goal_id)
+    await world.tick(goal_id)
+    assert notices() == ["decision_pending"]
+    world.clock.advance(hours=10.1)  # 23 h 06 min into a 24 h window
+    await world.tick(goal_id)
+    await world.tick(goal_id)
+    assert notices() == ["decision_pending", "decision_final_notice"]
+    goal = await world.goal(goal_id)
+    assert goal.status is G.BLOCKED and goal.blocked_reasons == ["decision_pending"]
+    # A restarted coordinator recomputes the same durable facts and adds nothing.
+    restarted = GoalCoordinator(
+        goals=world.goals,
+        runs=world.runs,
+        launcher=world.launcher,
+        policies=world.policies,
+        planning_limits=RunLimits(max_llm_calls=6),
+        probe=world.probe,
+        limits=SupervisorLimits(creating_timeout_seconds=120),
+        clock=world.clock,
+        owner="coordinator-b",
+        listing=world.probe,
+    )
+    await restarted.reconcile(goal_id)
+    await restarted.wait_until_idle()
+    assert notices() == ["decision_pending", "decision_final_notice"]
+    final = [
+        e
+        for e in world.goals.events[goal_id]
+        if e.kind is GoalEventKind.NEEDS_HUMAN and e.payload["reason"] == "decision_final_notice"
+    ]
+    assert final[0].payload["stage"] == "scope" and final[0].payload["deadline"]

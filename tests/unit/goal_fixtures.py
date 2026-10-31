@@ -10,6 +10,7 @@ from uuid import UUID
 from app.contracts.execution import RunError
 from app.contracts.goals import MergeEvidence, PlannedUpstream
 from app.contracts.lifecycle import DecisionStage, RunLifecycleStatus, WorkflowKind
+from app.contracts.planning import PlanConstraints
 from app.contracts.routing import RouteMode
 from app.goals.ports import IntegrationError, MergeProbe
 from app.infrastructure.db import InMemoryRunRepository
@@ -93,6 +94,7 @@ class FakeLauncher:
         repository_id: str | None = None,
         route_mode: RouteMode | None = None,
         planned_upstream: PlannedUpstream | None = None,
+        plan_constraints: PlanConstraints | None = None,
     ) -> CreateResult:
         self.created.append(
             {
@@ -105,6 +107,7 @@ class FakeLauncher:
                 "repository_id": repository_id,
                 "route_mode": route_mode,
                 "planned_upstream": planned_upstream,
+                "plan_constraints": plan_constraints,
             }
         )
         if self.fail_create_with is not None:
@@ -223,6 +226,11 @@ class FakeLauncher:
     async def fail(self, run_id: UUID, code: str) -> None:
         await self._move(run_id, S.FAILED, error=RunError(code=code, message=code))
 
+    async def expire(self, run_id: UUID) -> None:
+        """What the recovery sweep does once the decision window passed on the test clock."""
+        expired = await self.repository.expire_waiting_runs(now=self.clock(), limit=50)
+        assert any(r.id == run_id for r in expired), "la ejecución no estaba caducada"
+
     async def reject(self, run_id: UUID) -> None:
         await self._move(run_id, S.RESUME_PENDING, pending_stage=DecisionStage.SCOPE)
         await self._move(run_id, S.REJECTED)
@@ -259,6 +267,8 @@ class FakeProbe:
         self.ancestry: set[tuple[str, str]] = set()  # (ancestor, descendant)
         self.fail_with: IntegrationError | None = None
         self.calls: list[tuple[str, int]] = []
+        self.paths: list[str] | None = None  # mirrored listing offered to the Planner (H1)
+        self.listing_error: Exception | None = None
 
     def merged(self, pr: int, merge_commit_sha: str, *, verified: bool = True) -> None:
         self.states[pr] = "merged"
@@ -287,6 +297,13 @@ class FakeProbe:
         self, repository_id: str, project_id: str, *, ancestor: str, descendant: str
     ) -> bool:
         return (ancestor, descendant) in self.ancestry or ancestor == descendant
+
+    async def list_paths(
+        self, repository_id: str, project_id: str, *, limit: int
+    ) -> list[str] | None:
+        if self.listing_error is not None:
+            raise self.listing_error
+        return None if self.paths is None else list(self.paths)[:limit]
 
 
 def plan_of(*tasks: tuple[str, list[str]]) -> dict[str, Any]:
