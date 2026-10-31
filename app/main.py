@@ -56,8 +56,8 @@ from app.orchestration.goals import GoalCoordinator, GoalService, SupervisorLimi
 from app.orchestration.graph import RunGraph, build_graph
 from app.orchestration.limits import RunLimits
 from app.orchestration.policy import RecoveryPolicy
-from app.orchestration.ports import PersistedRun, RunRepository
-from app.orchestration.publication import PublicationRuntime
+from app.orchestration.ports import PersistedRun, PublicationAvailability, RunRepository
+from app.orchestration.publication import PublicationGate, PublicationRuntime
 from app.orchestration.recovery import RecoveryService
 from app.orchestration.runs import RunService, TerminalHook
 from app.orchestration.scoped_development import (
@@ -139,6 +139,7 @@ def create_app(
     projects: ProjectPolicyRegistry | None = None,
     mirrors: MirrorService | None = None,
     publisher: PublicationRuntime | None = None,
+    publishing: PublicationAvailability | None = None,
     router: SmartRouter | None = None,
     notifications: NotificationEnqueuer | None = None,
     outbox: NotificationOutbox | None = None,
@@ -378,6 +379,7 @@ def create_app(
                     else InMemoryMirrorSyncRepository()
                 ),
                 publisher=publication_runtime,
+                runs=repo,
                 router=smart_router,
                 route_decisions=(
                     SqlAlchemyRouteDecisionRepository(db.session_factory)
@@ -400,6 +402,10 @@ def create_app(
             for hook in terminal_hooks:
                 await hook(row)
 
+        # P1: what the API may promise about publication, from configuration alone.
+        publication_gate: PublicationAvailability = publishing or PublicationGate(
+            publication_runtime
+        )
         service = RunService(
             planning_graph,
             repo,
@@ -410,6 +416,7 @@ def create_app(
             graphs=graphs,
             policies=policies,
             on_terminal=on_terminal,
+            publishing=publication_gate,
         )
         recovery = RecoveryService(service)
         goal_service: GoalService | None = None
@@ -454,6 +461,7 @@ def create_app(
                 runs=repo,
                 router=smart_router,
                 planning_limits=run_limits or RunLimits(),
+                publishing=publication_gate,
             )
             terminal_hooks.append(coordinator.on_run_terminal)
         app.state.goal_service = goal_service

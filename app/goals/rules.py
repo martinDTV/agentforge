@@ -31,6 +31,10 @@ class NeedsHumanReason(StrEnum):
     # the ordinal slots of the reasons above stay where goals created earlier put them.
     PLAN_FINAL_NOTICE = "plan_final_notice"
     DECISION_FINAL_NOTICE = "decision_final_notice"
+    # P2: a child ended without a Pull Request where one was required, or stopped because
+    # publication is disabled in this instance. Neither is ever read as a merge.
+    PUBLICATION_MISSING = "publication_missing"
+    PUBLICATION_UNAVAILABLE = "publication_unavailable"
 
 
 # A final notice blocks the goal under the reason it reminds about, not under its own name.
@@ -67,16 +71,20 @@ def stage_ordinal(stage: DecisionStage | None) -> int:
     return stage.event_ordinal if stage is not None else 0
 
 
-def task_status_for_run(status: RunLifecycleStatus) -> GoalTaskStatus:
+def task_status_for_run(status: RunLifecycleStatus, *, remote: bool = False) -> GoalTaskStatus:
     """Projection of a child's lifecycle status onto its task (ADR 0012 §2.2).
 
     ``interrupted`` stays ``running``: recovery decides what becomes of it, the
     goal only waits. ``approved`` (a planning run) is mapped by the coordinator
-    itself, never by this table.
+    itself, never by this table. ``completed`` counts as published only for a
+    repository without remote (P2): with a remote, the task's deliverable is a
+    Pull Request, so a run that ended without one did not deliver.
     """
     if status is _S.WAITING_APPROVAL:
         return _T.WAITING_HUMAN
-    if status in (_S.PUBLISHED, _S.COMPLETED, _S.APPROVED):
+    if status is _S.COMPLETED:
+        return _T.FAILED if remote else _T.PUBLISHED
+    if status in (_S.PUBLISHED, _S.APPROVED):
         return _T.PUBLISHED
     if status in (_S.FAILED, _S.REJECTED, _S.EXPIRED, _S.CANCELLED):
         return _T.FAILED

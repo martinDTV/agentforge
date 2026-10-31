@@ -101,6 +101,17 @@ class PublicationInterrupted(Exception):
         self.progress = progress
 
 
+class PublicationGate:
+    """``PublicationAvailability`` answered from the configured ``PublicationRuntime`` (P1):
+    no Publisher means nothing can be published; otherwise the allow-list decides."""
+
+    def __init__(self, runtime: "PublicationRuntime | None") -> None:
+        self._runtime = runtime
+
+    def allows(self, repository_id: str) -> bool:
+        return self._runtime is not None and self._runtime.allows(repository_id)
+
+
 @dataclass
 class PublicationRuntime:
     """Platform-only pieces the publication nodes need (never reachable by agents)."""
@@ -267,13 +278,28 @@ class PublicationNodes:
             return {}  # purely local repository: the run ends ``completed`` as before
         publisher = self._publisher
         if publisher is None or not publisher.allows(policy.repository_id):
+            # P1: the work is done and verified but nothing can leave the host. Never end
+            # ``completed`` (that silently discards the output): stop in a resumable
+            # state the operator can continue once publication is enabled.
+            row = await self._runtime.runs_get(run_id)
+            existing = PublicationProgress.from_json(row.publication if row else None)
+            if existing is not None and existing.state is not _S.UNAVAILABLE:
+                raise PublicationError(
+                    "publication_state_conflict",
+                    f"la ejecución ya tiene una publicación en estado {existing.state}",
+                )
             progress = PublicationProgress(
                 state=_S.UNAVAILABLE,
                 code="publish_unavailable",
-                detail="la publicación no está habilitada para este repositorio",
+                detail=(
+                    f"la publicación no está habilitada para {policy.repository_id}: arranca la "
+                    "API con GITHUB_WRITE_ENABLED=true y PUBLISH_ALLOWED_REPOSITORIES que lo "
+                    "incluya y reanuda la ejecución"
+                ),
+                retryable=True,
             )
             await self._runtime.runs_set_publication(run_id, progress)
-            return {"publication": progress.as_json()}
+            return {"publication": progress.as_json(), "publication_interrupted": True}
         spec = self._spec(policy)
         try:
             base = await self._runtime.refresh_mirror(policy)
@@ -338,6 +364,11 @@ class PublicationNodes:
             if existing is None:
                 progress = await self._persist(
                     run_id, progress, expected=None, plan=plan, policy=policy
+                )
+            elif existing.state is _S.UNAVAILABLE:
+                # Resumed after publication was enabled: the plan is built now.
+                progress = await self._persist(
+                    run_id, progress, expected=_S.UNAVAILABLE, plan=plan, policy=policy
                 )
             elif (
                 existing.state is _S.PREPARED and existing.publish_digest == progress.publish_digest

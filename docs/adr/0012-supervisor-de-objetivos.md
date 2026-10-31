@@ -532,6 +532,18 @@ y un `NOTES.md` fuera de las rutas escribibles) y una caducidad de alcance etiqu
   una colisión). Los contratos `scope_digest` y `publish_digest` no cambian; una decisión
   caducada sigue sin poder reutilizarse.
 
+## Nota de estabilización P2 (2026-10-31)
+
+`task_status_for_run` recibe `remote`: `completed` solo es `published` en repositorios sin remoto;
+con remoto es `failed` con `publication_missing` (o el código de `runs.publication`), porque el
+entregable de la tarea es el Pull Request. Una tarea `published` sin `pr_number` ya no produce
+`merge_unverified`: emite `publication_missing` (evento y motivo propios) y sus dependientes siguen
+`pending`; el motivo es duradero (`_standing_reasons`) e idempotente tras reinicios. Una hija
+`interrupted` con `publication.state = unavailable` se proyecta como `waiting_human` en etapa
+`publish` con el motivo `publication_unavailable`, que bloquea el objetivo hasta que el operador
+habilita la publicación y reanuda; al publicarse, la tarea continúa como siempre. `GoalService.create`
+aplica la misma compuerta `publish_unavailable` que `RunService.create` para repositorios con remoto.
+
 ## 10. Riesgos
 
 - **Carga de aprobaciones humanas**: hasta `n` alcances y `n` publicaciones más el plan; mitigación: secuencial por defecto, avisos con digest, vista del objetivo con todo lo pendiente.

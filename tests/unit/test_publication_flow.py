@@ -20,11 +20,12 @@ from app.infrastructure.git.publish import GitPublisher
 from app.infrastructure.github import GitHubPublisher, InstallationTokenProvider
 from app.orchestration.exceptions import (
     DecisionStaleError,
+    PublishUnavailableError,
     RunAlreadyDecidedError,
     RunNotResumableError,
 )
 from app.orchestration.graph import build_graph
-from app.orchestration.publication import PublicationRuntime
+from app.orchestration.publication import PublicationGate, PublicationRuntime
 from app.orchestration.recovery import RecoveryService
 from app.orchestration.runs import RunService
 from app.orchestration.scoped_development import build_scoped_development_graph
@@ -51,6 +52,17 @@ OMAR = human("omar", {"project_operator"})  # approves the scope
 PAULA = human("paula", {"project_operator"})  # approves the publication
 ALICE = human("alice", {"approver"})  # runs:approve without repos:publish
 VICTOR = human("victor", {"viewer"})
+
+
+class _LiveGate:
+    """The production gate reads a process-wide configuration; in tests the world's
+    publisher may change mid-test, so answer from its current value."""
+
+    def __init__(self, world: "PublishWorld") -> None:
+        self._world = world
+
+    def allows(self, repository_id: str) -> bool:
+        return PublicationGate(self._world.runtime.publisher).allows(repository_id)
 
 
 class PublishWorld(MirrorWorld):
@@ -95,7 +107,9 @@ class PublishWorld(MirrorWorld):
         )
         self.graph = build_scoped_development_graph(self.runtime)
 
-    def service(self, *, separation_of_duties: bool = False) -> RunService:  # type: ignore[override]
+    def service(self, *, separation_of_duties: bool = False, gated: bool = False) -> RunService:  # type: ignore[override]
+        """``gated=True`` wires the production creation guard (P1) over this world's
+        publisher; by default the guard is absent so the graph-level behaviour is tested."""
         return RunService(
             build_graph(self.model),
             self.repository,
@@ -106,6 +120,7 @@ class PublishWorld(MirrorWorld):
             },
             policies=self.lab.policies,
             clock=lambda: self.now,
+            publishing=_LiveGate(self) if gated else None,
         )
 
     def remote_heads(self) -> dict[str, str]:
@@ -433,26 +448,21 @@ async def test_secrets_in_the_diff_block_publication_before_any_plan(tmp_path: P
 async def test_without_the_write_flag_an_allowlist_or_the_grant_nothing_is_published(
     tmp_path: Path,
 ):
-    # 1. GITHUB_WRITE_ENABLED=false: the Publisher does not exist; the run ends completed.
+    # 1. GITHUB_WRITE_ENABLED=false: with the production guard (P1) a run on a remote
+    #    repository is refused before any model call; nothing is created or spent.
     world = PublishWorld(tmp_path / "off", write_enabled=False)
-    service = world.service()
-    run_id = await world.start(service)
-    pending = (await service.decisions(run_id, OPERATOR)).pending
-    assert pending is not None
-    done = await service.approve(run_id, True, OMAR, scope_digest=pending.scope_digest)
-    assert done.status is S.COMPLETED and done.pending_stage is None
-    assert world.agentforge_branches() == {} and world.lab.github.pulls == {}
-    assert all("write" not in i["permissions"].values() for i in world.lab.github.tokens.values())
-    # 2. Repository outside PUBLISH_ALLOWED_REPOSITORIES: completed, publication unavailable.
+    gated = world.service(gated=True)
+    with pytest.raises(PublishUnavailableError) as refused:
+        await world.start(gated)
+    assert refused.value.code == "publish_unavailable"
+    assert "GITHUB_WRITE_ENABLED=true" in str(refused.value)
+    assert world.model.calls == [] and world.agentforge_branches() == {}
+    assert world.lab.github.pulls == {}
+    # 2. Repository outside PUBLISH_ALLOWED_REPOSITORIES: same refusal, same reason.
     world2 = PublishWorld(tmp_path / "allow", allowed=frozenset({"other-repo"}))
-    service2 = world2.service()
-    run2 = await world2.start(service2)
-    pending2 = (await service2.decisions(run2, OPERATOR)).pending
-    assert pending2 is not None
-    done2 = await service2.approve(run2, True, OMAR, scope_digest=pending2.scope_digest)
-    assert done2.status is S.COMPLETED and done2.publication is not None
-    assert done2.publication["state"] == "unavailable"
-    assert world2.agentforge_branches() == {}
+    with pytest.raises(PublishUnavailableError):
+        await world2.start(world2.service(gated=True))
+    assert world2.agentforge_branches() == {} and world2.model.calls == []
     # 3. Installation without write grants: GitHub refuses the write token; nothing pushed.
     world3 = PublishWorld(tmp_path / "grant", installation_writes=False)
     service3 = world3.service()
@@ -462,6 +472,66 @@ async def test_without_the_write_flag_an_allowlist_or_the_grant_nothing_is_publi
     assert failed.error.code == "token_request_rejected"
     assert world3.agentforge_branches() == {} and world3.lab.github.pulls == {}
     assert failed.publication is not None and failed.publication["retryable"] is False
+
+
+async def test_a_verified_run_that_cannot_publish_stops_resumable_and_publishes_once_enabled(
+    tmp_path: Path,
+):
+    """P1 belt: publication disappears between creation and QA (flag turned off, allow-list
+    changed). The work is kept, the run is ``interrupted`` with ``publication.unavailable``,
+    the sweep never burns attempts on it, ``resume`` is refused while publication is still
+    disabled and, once enabled, prepares the plan and waits for the human publish decision.
+    Nothing reaches GitHub without that decision."""
+    world = PublishWorld(tmp_path)
+    service = world.service(gated=True)
+    run_id = await world.start(service)  # the guard allowed it: publication was enabled
+    publisher = world.runtime.publisher
+    world.runtime.publisher = None  # ... and then the instance lost it
+    pending = (await service.decisions(run_id, OPERATOR)).pending
+    assert pending is not None
+    stopped = await service.approve(run_id, True, OMAR, scope_digest=pending.scope_digest)
+    assert stopped.status is S.INTERRUPTED and stopped.pending_stage is None
+    assert stopped.publication is not None
+    assert stopped.publication["state"] == "unavailable"
+    assert stopped.publication["code"] == "publish_unavailable"
+    assert stopped.publication["retryable"] is True
+    row = await world.repository.get_run(uuid.UUID(run_id))
+    assert row is not None and row.status is S.INTERRUPTED
+    record = world.manager.get(uuid.UUID(run_id), PROJECT)
+    assert record is not None and not record.released  # the worktree keeps the work
+    assert world.agentforge_branches() == {} and world.lab.github.pulls == {}
+    # The sweep leaves it alone: no redrive, no attempt spent, still interrupted.
+    attempts_before = row.attempt
+    report = await RecoveryService(service).sweep()
+    assert report.outcomes.get("resumed", 0) == 0
+    row = await world.repository.get_run(uuid.UUID(run_id))
+    assert row is not None and row.status is S.INTERRUPTED
+    assert row.attempt == attempts_before
+    # Resume is refused while publication stays disabled.
+    with pytest.raises(RunNotResumableError):
+        await service.resume(run_id, PAULA)
+    # Enable publication (new process in reality) and resume: the plan is prepared now.
+    world.runtime.publisher = publisher
+    resumed = await world.service(gated=True).resume(run_id, PAULA)
+    assert resumed.status is S.WAITING_APPROVAL and resumed.pending_stage is DecisionStage.PUBLISH
+    assert resumed.publication is not None and resumed.publication["state"] == "prepared"
+    kinds = [
+        e.kind
+        for e in await world.repository.list_events(uuid.UUID(run_id), after_id=None, limit=None)
+    ]
+    assert RunEventKind.RUN_INTERRUPTED in kinds and RunEventKind.RUN_RESUMED in kinds
+    assert RunEventKind.PUBLICATION_PREPARED in kinds
+    # Still nothing remote until a human approves the publication: no branch, no pull
+    # request and no write token were ever requested (read tokens serve the mirror only).
+    assert world.agentforge_branches() == {} and world.lab.github.pulls == {}
+    assert all("write" not in i["permissions"].values() for i in world.lab.github.tokens.values())
+    assert world.model.calls, "Developer and QA ran exactly once; the resume cost no model call"
+    calls_before = len(world.model.calls)
+    digest = (await service.decisions(run_id, OPERATOR)).pending
+    assert digest is not None and digest.publish_digest
+    published = await service.approve(run_id, True, PAULA, publish_digest=digest.publish_digest)
+    assert published.status is S.PUBLISHED and len(world.lab.github.pulls) == 1
+    assert len(world.model.calls) == calls_before
 
 
 async def test_a_full_run_mails_both_approvals_and_the_pull_request_without_event_collisions(

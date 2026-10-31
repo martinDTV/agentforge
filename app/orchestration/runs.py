@@ -36,6 +36,7 @@ from app.orchestration.exceptions import (
     DecisionStaleError,
     IdempotencyKeyReusedError,
     LeaseLostError,
+    PublishUnavailableError,
     RepositoryNotAuthorizedError,
     RepositoryRequiredError,
     RunAlreadyDecidedError,
@@ -52,6 +53,7 @@ from app.orchestration.ports import (
     LeaseToken,
     PersistedEvent,
     PersistedRun,
+    PublicationAvailability,
     RunCursor,
     RunEvent,
     RunProjection,
@@ -75,11 +77,19 @@ _S = RunLifecycleStatus
 _WAITING = frozenset({_S.WAITING_APPROVAL, _S.RESUME_PENDING})
 
 
-_RESUMABLE_PUBLICATION_STATES = frozenset({"prepared", "approved", "pushed", "opened"})
+_RESUMABLE_PUBLICATION_STATES = frozenset(
+    {"unavailable", "prepared", "approved", "pushed", "opened"}
+)
+
+
+def _publication_unavailable(row: PersistedRun) -> bool:
+    """The run did its work but publication was disabled when it got there (P1)."""
+    return (row.publication or {}).get("state") == "unavailable"
 
 
 def _publication_resumable(row: PersistedRun) -> bool:
-    """A development run whose publication stopped midway or failed transiently (ADR 0011)."""
+    """A development run whose publication stopped midway or failed transiently (ADR 0011),
+    or never started because publication was disabled (P1): resumable once it is enabled."""
     publication = row.publication or {}
     state = publication.get("state")
     if state in _RESUMABLE_PUBLICATION_STATES:
@@ -205,6 +215,7 @@ class RunService:
         on_terminal: TerminalHook | None = None,
         clock: Callable[[], datetime] | None = None,
         default_route_mode: RouteMode = RouteMode.AUTO,
+        publishing: PublicationAvailability | None = None,
     ) -> None:
         # ``graph`` reads any run's checkpoint (every workflow shares RunState);
         # ``graphs`` says which compiled graph may *drive* each workflow kind.
@@ -215,6 +226,7 @@ class RunService:
         )
         self._policies = policies
         self._on_terminal = on_terminal
+        self._publishing = publishing
         self._default_route_mode = default_route_mode
         self._clock = clock or (lambda: datetime.now(UTC))
         self._repository = repository
@@ -303,9 +315,17 @@ class RunService:
             if self._policies is None:
                 raise WorkflowUnavailableError(kind.value)
             try:
-                self._policies.require(repository_id, project)
+                policy = self._policies.require(repository_id, project)
             except PolicyError as exc:
                 raise RepositoryNotAuthorizedError(repository_id, project) from exc
+            if (
+                policy.remote is not None
+                and self._publishing is not None
+                and not self._publishing.allows(repository_id)
+            ):
+                # P1: with a remote the only deliverable is a Pull Request; refuse now,
+                # before any model call, instead of ending ``completed`` with nothing.
+                raise PublishUnavailableError(repository_id)
             graph_input.update(
                 project_id=project,
                 repository_id=repository_id,
@@ -574,6 +594,17 @@ class RunService:
                     )
                 if not self._authz.has(principal, Permission.REPOS_PUBLISH):
                     raise PermissionDeniedError("Falta el permiso repos:publish.")
+                if _publication_unavailable(row):
+                    # P1: resuming only makes sense once publication exists for this
+                    # repository; otherwise the run would stop again where it stopped.
+                    state = await self._reader_for(row.workflow_kind).aget_state(_config(rid))
+                    repository_id = str(state.values.get("repository_id") or "")
+                    if self._publishing is None or not self._publishing.allows(repository_id):
+                        raise RunNotResumableError(
+                            run_id,
+                            "la publicación sigue deshabilitada para este repositorio: arranca "
+                            "la API con GITHUB_WRITE_ENABLED=true y PUBLISH_ALLOWED_REPOSITORIES",
+                        )
             if row.attempt >= self._policy.max_attempts:
                 raise RunNotResumableError(
                     run_id, f"agotó sus {self._policy.max_attempts} intentos"
@@ -664,6 +695,12 @@ class RunService:
                 return RecoveryOutcome.REPROJECTED
 
             if row.workflow_kind is WorkflowKind.DEVELOPMENT:
+                if _publication_unavailable(row):
+                    # P1: nothing to retry until an operator enables publication and
+                    # resumes by hand; the sweep leaves it interrupted without spending
+                    # an attempt. The worktree keeps the interrupted retention.
+                    await self._mark_interrupted(rid, snapshot, lease, row)
+                    return RecoveryOutcome.INTERRUPTED
                 if _publication_resumable(row):
                     # Publication is idempotent and costs no model call (ADR 0011):
                     # re-drive it, bounded by the same attempt limit.
@@ -713,8 +750,12 @@ class RunService:
                 # Re-enter the ``publish`` node: the plan and the decision stay as they
                 # are; only the transient marker is cleared, as if ``approve_publish``
                 # had just produced its verdict again.
+                # Without a plan yet (publication was unavailable, P1) re-enter at
+                # ``prepare_publication`` as if QA had just approved; with a plan, at
+                # ``publish`` as if ``approve_publish`` had just produced its verdict.
+                as_node = "qa" if _publication_unavailable(row) else "approve_publish"
                 await graph.aupdate_state(
-                    _config(rid), {"publication_interrupted": False}, as_node="approve_publish"
+                    _config(rid), {"publication_interrupted": False}, as_node=as_node
                 )
                 snapshot = await graph.aget_state(_config(rid))
             await self._project_status(rid, snapshot, _S.RUNNING, lease)

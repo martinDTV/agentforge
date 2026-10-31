@@ -223,6 +223,37 @@ class FakeLauncher:
         await self._move(run_id, S.RESUME_PENDING, pending_stage=DecisionStage.SCOPE)
         await self._move(run_id, S.COMPLETED, llm_calls=4)
 
+    async def complete_without_publication(self, run_id: UUID) -> None:
+        """A remote child that ended ``completed`` with no publication at all (the pre-P1
+        failure mode, kept to assert the Supervisor no longer calls it published)."""
+        await self.complete_locally(run_id)
+
+    async def resume(self, run_id: UUID) -> None:
+        """What ``RunService.resume`` does once publication is enabled again: the run is
+        driven into ``prepare_publication`` and waits for the human publish decision."""
+        await self._move(run_id, S.RUNNING)
+        await self._move(
+            run_id,
+            S.WAITING_APPROVAL,
+            pending_stage=DecisionStage.PUBLISH,
+            approval_deadline=self.clock() + self.approval_ttl,
+        )
+
+    async def publication_unavailable(self, run_id: UUID) -> None:
+        """What P1 produces when publication is disabled: work done, run interrupted, the
+        reason on the row, resumable once the operator enables publication."""
+        await self._move(run_id, S.RESUME_PENDING, pending_stage=DecisionStage.SCOPE)
+        await self._move(run_id, S.INTERRUPTED, llm_calls=4)
+        await self.repository.set_publication(
+            run_id,
+            {
+                "state": "unavailable",
+                "code": "publish_unavailable",
+                "detail": "la publicación no está habilitada",
+                "retryable": True,
+            },
+        )
+
     async def fail(self, run_id: UUID, code: str) -> None:
         await self._move(run_id, S.FAILED, error=RunError(code=code, message=code))
 

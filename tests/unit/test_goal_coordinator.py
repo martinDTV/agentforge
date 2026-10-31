@@ -23,6 +23,7 @@ from app.orchestration.exceptions import (
     GoalDependenciesUnsupportedError,
     GoalIdempotencyKeyReusedError,
     GoalNotCancellableError,
+    PublishUnavailableError,
 )
 from app.orchestration.goals import GoalCoordinator, GoalService, SupervisorLimits
 from app.orchestration.limits import RunLimits
@@ -52,6 +53,7 @@ class World:
         remote: bool = True,
         limits: SupervisorLimits | None = None,
         separation_of_duties: bool = False,
+        publishing: object | None = None,
         **policy_overrides: object,
     ) -> None:
         self.clock = Clock()
@@ -80,6 +82,7 @@ class World:
             router=None,
             planning_limits=RunLimits(max_llm_calls=6),
             clock=self.clock,
+            publishing=publishing,  # type: ignore[arg-type]
         )
 
     async def create(self, objective: str = OBJECTIVE, **overrides: object) -> UUID:
@@ -894,3 +897,164 @@ async def test_reminders_fire_midway_and_one_hour_before_the_window_closes_once_
         if e.kind is GoalEventKind.NEEDS_HUMAN and e.payload["reason"] == "decision_final_notice"
     ]
     assert final[0].payload["stage"] == "scope" and final[0].payload["deadline"]
+
+
+# -- P1/P2: publication is a deliverable, never assumed ----------------------------------------
+
+
+class DenyPublishing:
+    def allows(self, repository_id: str) -> bool:
+        return False
+
+
+class AllowPublishing:
+    def allows(self, repository_id: str) -> bool:
+        return True
+
+
+async def test_goals_on_a_remote_repository_are_refused_while_publication_is_disabled():
+    world = World(publishing=DenyPublishing())
+    with pytest.raises(PublishUnavailableError) as refused:
+        await world.create(decomposition=GoalDecomposition.PLAN)
+    assert refused.value.code == "publish_unavailable"
+    assert world.launcher.created == []  # nothing planned, nothing spent
+    # A repository without remote never publishes: the gate does not apply.
+    local = World(remote=False, publishing=DenyPublishing())
+    goal_id = await local.create(decomposition=GoalDecomposition.SINGLE)
+    assert (await local.goal(goal_id)).status is G.ACTIVE and len(local.launcher.created) == 1
+    # With publication enabled the remote goal is created as before.
+    allowed = World(publishing=AllowPublishing())
+    goal_id = await allowed.create(decomposition=GoalDecomposition.SINGLE)
+    assert (await allowed.goal(goal_id)).status is G.ACTIVE
+
+
+async def test_a_local_child_that_completes_is_published_for_its_goal():
+    world = World(remote=False)
+    goal_id = await world.create(decomposition=GoalDecomposition.SINGLE)
+    run_id = (await world.task(goal_id, "single")).run_id
+    assert run_id is not None
+    await world.launcher.complete_locally(run_id)
+    await world.tick(goal_id)
+    assert (await world.task(goal_id, "single")).status is T.PUBLISHED
+    assert (await world.goal(goal_id)).status is G.COMPLETED
+
+
+async def test_a_remote_child_that_completes_without_a_pull_request_is_not_published():
+    """P2 regression (goal 4c03b45d, 2026-10-31): the child ended ``completed`` with no
+    publication; the Supervisor used to call it published and then look for a merge."""
+    world = World()
+    goal_id = await world.create(decomposition=GoalDecomposition.PLAN)
+    await world.launcher.approve_plan(
+        await world.plan_run(goal_id), plan_of(("T1", []), ("T2", ["T1"]))
+    )
+    await world.tick(goal_id)
+    t1 = await world.task(goal_id, "T1")
+    assert t1.run_id is not None and t1.status is T.WAITING_HUMAN
+    await world.launcher.complete_without_publication(t1.run_id)
+    await world.tick(goal_id)
+    t1 = await world.task(goal_id, "T1")
+    assert t1.status is T.FAILED and t1.last_error_code == "publication_missing"
+    assert t1.pr_number is None and t1.merge_evidence is None
+    kinds = await world.kinds(goal_id)
+    assert GoalEventKind.MERGE_UNVERIFIED not in kinds
+    assert GoalEventKind.DEPENDENCY_MERGED not in kinds
+    assert (await world.task(goal_id, "T2")).status in (T.PENDING, T.SKIPPED)
+    assert (await world.task(goal_id, "T2")).run_id is None  # T2 never starts on its own
+    goal = await world.goal(goal_id)
+    assert goal.status in (G.BLOCKED, G.FAILED)
+    reasons = {
+        str(e.payload["reason"])
+        for e in await world.goals.list_events(goal_id)
+        if e.kind is GoalEventKind.NEEDS_HUMAN
+    }
+    assert "merge_unverified" not in reasons and "task_failed" in reasons
+    assert world.probe.calls == []  # no merge was ever probed
+
+
+async def test_a_published_task_without_a_pull_request_blocks_as_publication_missing():
+    """Legacy rows (pre-P2) may hold ``published`` without a PR; dependents must not be
+    released and the reason must say what it is, idempotently across restarts."""
+    world = World()
+    goal_id = await world.create(decomposition=GoalDecomposition.PLAN)
+    await world.launcher.approve_plan(
+        await world.plan_run(goal_id), plan_of(("T1", []), ("T2", ["T1"]))
+    )
+    await world.tick(goal_id)
+    t1 = await world.task(goal_id, "T1")
+    from app.goals.ports import TaskPatch
+
+    await world.goals.update_task(t1.id, TaskPatch(status=T.PUBLISHED), now=world.clock())
+    await world.tick(goal_id)
+    await world.tick(goal_id)
+    goal = await world.goal(goal_id)
+    assert goal.status is G.BLOCKED and goal.blocked_reasons == ["publication_missing"]
+    assert (await world.task(goal_id, "T2")).status is T.PENDING
+    events = [e for e in await world.goals.list_events(goal_id)]
+    assert [e.kind for e in events].count(GoalEventKind.PUBLICATION_MISSING) == 1
+    assert GoalEventKind.MERGE_UNVERIFIED not in [e.kind for e in events]
+    notices = [e.payload["reason"] for e in events if e.kind is GoalEventKind.NEEDS_HUMAN]
+    assert notices == ["publication_missing"]
+    restarted = GoalCoordinator(
+        goals=world.goals,
+        runs=world.runs,
+        launcher=world.launcher,
+        policies=world.policies,
+        planning_limits=RunLimits(max_llm_calls=6),
+        probe=world.probe,
+        limits=SupervisorLimits(creating_timeout_seconds=120),
+        clock=world.clock,
+        owner="coordinator-b",
+        listing=world.probe,
+    )
+    await restarted.reconcile(goal_id)
+    await restarted.wait_until_idle()
+    events = await world.goals.list_events(goal_id)
+    assert [e.payload["reason"] for e in events if e.kind is GoalEventKind.NEEDS_HUMAN] == [
+        "publication_missing"
+    ]
+    assert (await world.goal(goal_id)).blocked_reasons == ["publication_missing"]
+    assert world.probe.calls == []
+
+
+async def test_a_child_stopped_by_unavailable_publication_waits_for_the_operator_then_publishes():
+    world = World()
+    goal_id = await world.create(decomposition=GoalDecomposition.PLAN)
+    await world.launcher.approve_plan(
+        await world.plan_run(goal_id), plan_of(("T1", []), ("T2", ["T1"]))
+    )
+    await world.tick(goal_id)
+    t1 = await world.task(goal_id, "T1")
+    assert t1.run_id is not None
+    await world.launcher.publication_unavailable(t1.run_id)
+    await world.tick(goal_id)
+    await world.tick(goal_id)
+    t1 = await world.task(goal_id, "T1")
+    assert t1.status is T.WAITING_HUMAN and t1.waiting_stage == "publish"
+    goal = await world.goal(goal_id)
+    assert goal.status is G.BLOCKED and goal.blocked_reasons == ["publication_unavailable"]
+    notices = [
+        e.payload["reason"]
+        for e in await world.goals.list_events(goal_id)
+        if e.kind is GoalEventKind.NEEDS_HUMAN
+    ]
+    assert notices == ["publication_unavailable"]
+    assert (await world.task(goal_id, "T2")).status is T.PENDING
+    # It is not a pending human decision: the run has no pending stage and, hours later,
+    # no ``decision_pending`` reminder is ever sent for it.
+    row = await world.runs.get_run(t1.run_id)
+    assert row is not None and row.status is S.INTERRUPTED and row.pending_stage is None
+    world.clock.advance(hours=13)
+    await world.tick(goal_id)
+    notices = [
+        e.payload["reason"]
+        for e in await world.goals.list_events(goal_id)
+        if e.kind is GoalEventKind.NEEDS_HUMAN
+    ]
+    assert notices == ["publication_unavailable"]
+    # The operator enables publication and resumes: the child publishes, the goal goes on.
+    await world.launcher.resume(t1.run_id)
+    await world.launcher.publish(t1.run_id, pr_number=7, head_sha="h" * 40, base_sha="b" * 40)
+    await world.tick(goal_id)
+    t1 = await world.task(goal_id, "T1")
+    assert t1.status is T.PUBLISHED and t1.pr_number == 7
+    assert (await world.goal(goal_id)).blocked_reasons == []

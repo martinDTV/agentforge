@@ -219,3 +219,14 @@ def test_failure_codes_take_the_stage_from_the_error_code_or_the_recorded_decisi
     assert reminders_due(now=T0 + timedelta(minutes=59), deadline=short, **kwargs) == (True, False)
     # Without a deadline there is never a final notice; the midway reminder waits a day.
     assert reminders_due(now=T0 + timedelta(hours=25), deadline=None, **kwargs) == (True, False)
+
+
+def test_completed_counts_as_published_only_without_a_remote():
+    from app.contracts.lifecycle import RunLifecycleStatus as S
+    from app.goals import task_status_for_run
+
+    assert task_status_for_run(S.COMPLETED) is GoalTaskStatus.PUBLISHED
+    assert task_status_for_run(S.COMPLETED, remote=False) is GoalTaskStatus.PUBLISHED
+    assert task_status_for_run(S.COMPLETED, remote=True) is GoalTaskStatus.FAILED  # P2
+    assert task_status_for_run(S.PUBLISHED, remote=True) is GoalTaskStatus.PUBLISHED
+    assert task_status_for_run(S.INTERRUPTED, remote=True) is GoalTaskStatus.RUNNING
