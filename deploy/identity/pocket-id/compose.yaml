@@ -1,0 +1,31 @@
+# Pocket ID para AgentForge (H9.0) — plantilla reproducible, sin credenciales.
+# Se ejecuta en un nodo dedicado (LXC/VM de Proxmox), nunca en el Mac ni en la VM del Runner.
+# El servicio escucha solo en 127.0.0.1:1411; el TLS y el nombre público los pone
+# `tailscale serve` en el mismo nodo (ver docs/runbooks/identidad-pocket-id.md).
+services:
+  pocket-id:
+    image: ghcr.io/pocket-id/pocket-id:v2.19.1   # fijar versión; actualizar a mano tras leer el changelog
+    container_name: pocket-id
+    restart: unless-stopped
+    env_file: .env                               # copiar env.example → .env (0600) y rellenar
+    ports:
+      - "127.0.0.1:1411:1411"                    # nunca 0.0.0.0: solo el proxy local llega
+    volumes:
+      - "./data:/app/data"                       # SQLite + uploads; respaldo con `pocket-id export`
+      - "./secrets/encryption_key:/run/secrets/encryption_key:ro"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "/app/pocket-id", "healthcheck"]
+      interval: 1m30s
+      timeout: 5s
+      retries: 2
+      start_period: 10s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

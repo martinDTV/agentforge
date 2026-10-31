@@ -1,0 +1,30 @@
+# Alternativa sin contenedor para un LXC sin privilegios: binario oficial + systemd.
+# Instalar el binario en /opt/pocket-id/pocket-id (release fijada) y el .env al lado (0600).
+[Unit]
+Description=Pocket ID (OIDC con passkeys) para AgentForge
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=pocket-id
+Group=pocket-id
+WorkingDirectory=/opt/pocket-id
+EnvironmentFile=/opt/pocket-id/.env
+Environment=HOST=127.0.0.1
+ExecStart=/opt/pocket-id/pocket-id
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/pocket-id/data
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
