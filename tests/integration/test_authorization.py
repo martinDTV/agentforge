@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, inspect
 from app.infrastructure.llm.fake import FakeLLMAdapter
 from app.security import LEGACY_OWNER, LEGACY_PROJECT, AuthorizationPolicy
 from app.security.dev_keys import DevIssuer
+from tests.conftest import settle
 from tests.integration.conftest import (
     TemporaryDatabases,
     downgrade,
@@ -54,6 +55,7 @@ def test_project_isolation_and_actors_are_persisted(
         assert created.status_code == 201
         run_id = created.json()["run_id"]
         assert (created.json()["owner"], created.json()["project_id"]) == ("alice", "alpha")
+        settle(client, run_id, headers=alice)
 
         row = run_row(url, run_id)
         assert query(url, "SELECT owner_subject, project_id FROM runs WHERE id = %s", run_id) == [
@@ -76,7 +78,8 @@ def test_project_isolation_and_actors_are_persisted(
         assert approval_row(url, run_id) is None  # nothing was written by the refused attempts
 
         approved = client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}, headers=ana)
-        assert approved.status_code == 200 and approved.json()["status"] == "approved"
+        assert approved.status_code == 200
+        assert settle(client, run_id, headers=alice)["status"] == "approved"
 
     assert query(
         url,

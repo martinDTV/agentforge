@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterator
 
 import pytest
@@ -8,6 +9,7 @@ from app.infrastructure.llm.errors import LLMTimeoutError
 from app.infrastructure.llm.fake import FakeLLMAdapter
 from app.main import create_app
 from app.orchestration.limits import RunLimits
+from tests.conftest import settle
 
 RUNS = "/api/v1/runs"
 TASK = {"task": "Crear módulo de pacientes con pruebas"}
@@ -24,7 +26,8 @@ def client(fake_llm: FakeLLMAdapter) -> Iterator[TestClient]:
 def test_create_run_reaches_waiting_approval(client: TestClient):
     response = client.post(RUNS, json=TASK)
     assert response.status_code == 201
-    payload = response.json()
+    assert response.json()["status"] == "running"  # accepted; driven in the background (I0.1)
+    payload = settle(client, response.json()["run_id"])
     assert payload["status"] == "waiting_approval"
     assert payload["plan"]["summary"]
     assert payload["architecture"]["summary"]
@@ -36,10 +39,13 @@ def test_create_run_reaches_waiting_approval(client: TestClient):
 
 def test_approval_flow(client: TestClient):
     run_id = client.post(RUNS, json=TASK).json()["run_id"]
+    settle(client, run_id)
 
     result = client.post(f"{RUNS}/{run_id}/approve", json={"approved": True})
     assert result.status_code == 200
-    assert result.json()["status"] == "approved"
+    # Recorded at once; applied in the background.
+    assert result.json()["status"] in ("resume_pending", "approved")
+    assert settle(client, run_id)["status"] == "approved"
 
     again = client.post(f"{RUNS}/{run_id}/approve", json={"approved": False})
     assert again.status_code == 409
@@ -50,8 +56,10 @@ def test_approval_flow(client: TestClient):
 
 def test_rejection_flow(client: TestClient):
     run_id = client.post(RUNS, json=TASK).json()["run_id"]
+    settle(client, run_id)
     result = client.post(f"{RUNS}/{run_id}/approve", json={"approved": False})
-    assert result.json()["status"] == "rejected"
+    assert result.status_code == 200
+    assert settle(client, run_id)["status"] == "rejected"
 
 
 def test_get_unknown_run_returns_problem_details_404(client: TestClient):
@@ -80,7 +88,7 @@ def test_failed_run_is_created_and_cannot_be_approved(client: TestClient, fake_l
 
     created = client.post(RUNS, json=TASK)
     assert created.status_code == 201
-    payload = created.json()
+    payload = settle(client, created.json()["run_id"])
     assert payload["status"] == "failed"
     assert payload["error"] == {"code": "llm_timeout", "message": "sin respuesta"}
     assert payload["plan"] is None
@@ -100,7 +108,7 @@ def test_limits_are_injected_into_the_graph(
 ):
     fake_llm.register(ArchitectureReview, rejecting_review)
     with TestClient(create_app(fake_llm, RunLimits(max_revisions=1, max_llm_calls=10))) as client:
-        payload = client.post(RUNS, json=TASK).json()
+        payload = settle(client, client.post(RUNS, json=TASK).json()["run_id"])
 
     assert payload["status"] == "waiting_approval"
     assert payload["architect_approved"] is False
@@ -109,16 +117,20 @@ def test_limits_are_injected_into_the_graph(
     assert payload["architecture"]["issues"] == ["Falta manejo de errores"]
 
 
-def test_unexpected_error_returns_problem_details_500(fake_llm: FakeLLMAdapter):
+def test_unexpected_node_errors_end_the_run_failed_without_leaking(fake_llm: FakeLLMAdapter):
+    """A node that raises something unexpected fails the run in the background: the
+    response already left (I0.1), the row says ``failed`` with a stable code and the
+    exception text never reaches a client."""
     fake_llm.register_sequence(DevelopmentPlan, [RuntimeError("boom")])
     app = create_app(fake_llm, RunLimits())
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(RUNS, json=TASK)
+        assert response.status_code == 201
+        payload = settle(client, response.json()["run_id"])
 
-    assert response.status_code == 500
-    assert response.headers["content-type"] == PROBLEM_JSON
-    assert response.json()["code"] == "internal_error"
-    assert "boom" not in response.text
+    assert payload["status"] == "failed"
+    assert payload["error"]["code"] == "internal_error"
+    assert "boom" not in json.dumps(payload)
 
 
 def test_api_is_versioned(client: TestClient):

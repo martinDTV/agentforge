@@ -19,6 +19,7 @@ from app.projects import ProjectPolicyRegistry, RepositoryPolicy
 from app.security import AuthorizationPolicy, JwtVerifier, VerificationRules
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import StaticKeys
+from tests.conftest import settle
 from tests.unit.git_fixtures import make_sandbox
 
 RUNS = "/api/v1/runs"
@@ -105,7 +106,8 @@ def test_development_run_waits_for_scope_and_is_approved_by_digest(
     olivia = bearer(issuer, "olivia", ["project_operator"])
     created = client.post(RUNS, json=BODY, headers=olivia)
     assert created.status_code == 201, created.text
-    run = created.json()
+    assert created.json()["status"] == "running"  # accepted; the Scoper runs in the background
+    run = settle(client, created.json()["run_id"], headers=olivia)
     assert run["status"] == "waiting_approval" and run["pending_stage"] == "scope"
     assert run["workflow_kind"] == "development" and run["approval_deadline"]
     decisions = client.get(f"{RUNS}/{run['run_id']}/decisions", headers=olivia).json()
@@ -155,7 +157,8 @@ def test_development_run_waits_for_scope_and_is_approved_by_digest(
         headers=olivia,
     )
     assert approved.status_code == 200, approved.text
-    assert approved.json()["status"] == "completed" and approved.json()["pending_stage"] is None
+    settled = settle(client, run["run_id"], headers=olivia)
+    assert settled["status"] == "completed" and settled["pending_stage"] is None
     after = client.get(f"{RUNS}/{run['run_id']}/decisions", headers=olivia).json()
     assert after["pending"] is None
     assert [(d["stage"], d["approved"], d["decided_by"]) for d in after["decisions"]] == [
@@ -215,11 +218,16 @@ def test_waiting_run_can_be_cancelled_or_rejected_by_an_authorised_human(
 ):
     olivia = bearer(issuer, "olivia", ["project_operator"])
     run = client.post(RUNS, json=BODY, headers=olivia).json()
+    # A run being driven is not cancellable through the API (it is still ``running``).
+    driving = client.post(f"{RUNS}/{run['run_id']}/cancel", headers=olivia)
+    assert driving.status_code == 409 and driving.json()["code"] == "run_not_cancellable"
+    settle(client, run["run_id"], headers=olivia)
     victor = bearer(issuer, "victor", ["viewer"])
     assert client.post(f"{RUNS}/{run['run_id']}/cancel", headers=victor).status_code == 403
     cancelled = client.post(f"{RUNS}/{run['run_id']}/cancel", headers=olivia)
     assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelled"
     other = client.post(RUNS, json=BODY, headers=olivia).json()
+    settle(client, other["run_id"], headers=olivia)
     digest = client.get(f"{RUNS}/{other['run_id']}/decisions", headers=olivia).json()["pending"][
         "scope_digest"
     ]
@@ -228,7 +236,8 @@ def test_waiting_run_can_be_cancelled_or_rejected_by_an_authorised_human(
         json={"approved": False, "scope_digest": digest},
         headers=olivia,
     )
-    assert rejected.status_code == 200 and rejected.json()["status"] == "rejected"
+    assert rejected.status_code == 200
+    assert settle(client, other["run_id"], headers=olivia)["status"] == "rejected"
     listing = client.get(f"{RUNS}?status=cancelled", headers=olivia).json()["items"]
     assert [r["run_id"] for r in listing] == [run["run_id"]]
 

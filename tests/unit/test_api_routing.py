@@ -16,6 +16,7 @@ from app.routing import SmartRouter, TaskClassification
 from app.security import AuthorizationPolicy, JwtVerifier, VerificationRules
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import StaticKeys
+from tests.conftest import settle
 from tests.unit.git_fixtures import make_sandbox
 from tests.unit.test_api_development import scoped_llm
 from tests.unit.test_smart_router_flow import low_risk, plan, review
@@ -77,12 +78,14 @@ def bearer(issuer: DevIssuer, subject: str, roles: list[str]) -> dict[str, str]:
 def test_route_mode_is_accepted_bounded_and_reported(client: TestClient, issuer: DevIssuer):
     olivia = bearer(issuer, "olivia", ["project_operator"])
     auto = client.post(RUNS, json=BODY, headers=olivia).json()
+    auto = settle(client, auto["run_id"], headers=olivia)
     assert (
         auto["route"] == "fast"
         and auto["route_mode"] == "auto"
         and auto["pending_stage"] == "scope"
     )
     full = client.post(RUNS, json={**BODY, "route_mode": "full"}, headers=olivia).json()
+    full = settle(client, full["run_id"], headers=olivia)
     assert (
         full["route"] == "full" and full["route_mode"] == "full" and full["pending_stage"] == "plan"
     )
@@ -97,6 +100,7 @@ def test_route_mode_is_accepted_bounded_and_reported(client: TestClient, issuer:
         },
         headers=olivia,
     ).json()
+    risky = settle(client, risky["run_id"], headers=olivia)
     assert risky["route"] == "full" and risky["route_mode"] == "fast"  # mandatory rules win
     bad = client.post(RUNS, json={**BODY, "route_mode": "turbo"}, headers=olivia)
     assert bad.status_code == 422

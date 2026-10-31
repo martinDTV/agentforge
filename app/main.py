@@ -397,9 +397,16 @@ def create_app(
 
         # Terminal hooks: worktree release first, then the goal Supervisor (ADR 0012).
         terminal_hooks: list[TerminalHook] = [release_worktree]
+        # Settled hooks (I0.1): a background drive stopped (decision pending, end or
+        # failure); the Supervisor reconciles at once instead of on its next tick.
+        settled_hooks: list[TerminalHook] = []
 
         async def on_terminal(row: PersistedRun) -> None:
             for hook in terminal_hooks:
+                await hook(row)
+
+        async def on_settled(row: PersistedRun) -> None:
+            for hook in settled_hooks:
                 await hook(row)
 
         # P1: what the API may promise about publication, from configuration alone.
@@ -417,6 +424,7 @@ def create_app(
             policies=policies,
             on_terminal=on_terminal,
             publishing=publication_gate,
+            on_settled=on_settled,
         )
         recovery = RecoveryService(service)
         goal_service: GoalService | None = None
@@ -464,6 +472,7 @@ def create_app(
                 publishing=publication_gate,
             )
             terminal_hooks.append(coordinator.on_run_terminal)
+            settled_hooks.append(coordinator.on_run_settled)
         app.state.goal_service = goal_service
         app.state.goal_coordinator = coordinator
         git_tools = (

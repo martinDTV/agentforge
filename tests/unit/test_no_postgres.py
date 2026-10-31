@@ -10,6 +10,7 @@ from app.infrastructure.checkpoints import PostgresCheckpointer
 from app.infrastructure.llm.fake import FakeLLMAdapter
 from app.main import create_app
 from app.orchestration.limits import RunLimits
+from tests.conftest import settle
 
 
 @pytest.mark.anyio
@@ -43,4 +44,4 @@ def test_unit_app_checkpoints_in_memory_and_keeps_fase_2_behaviour(fake_llm: Fak
             "/api/v1/runs", json={"task": "Crear módulo de pacientes con pruebas"}
         )
         assert created.status_code == 201
-        assert created.json()["status"] == "waiting_approval"
+        assert settle(client, created.json()["run_id"])["status"] == "waiting_approval"

@@ -20,6 +20,7 @@ from app.orchestration.ports import RunProjection
 from app.security import AuthorizationPolicy, JwtVerifier, VerificationRules
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import StaticKeys
+from tests.conftest import settle
 
 RUNS = "/api/v1/runs"
 SWEEPS = "/api/v1/admin/recovery/sweeps"
@@ -67,7 +68,7 @@ def bearer(
 def create(client: TestClient, headers: dict[str, str], **body: object) -> dict[str, Any]:
     response = client.post(RUNS, json={**TASK, **body}, headers=headers)
     assert response.status_code == 201, response.text
-    return response.json()  # type: ignore[no-any-return]
+    return settle(client, response.json()["run_id"], headers=headers)  # the next stop (I0.1)
 
 
 def abandoned_run(
@@ -190,6 +191,7 @@ def test_events_need_visibility_then_audit_permission_and_paginate(
     alice = bearer(issuer, "alice", ["operator", "approver"], ["alpha"])
     run_id = create(client, alice)["run_id"]
     client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}, headers=alice)
+    settle(client, run_id, headers=alice)
 
     assert (
         client.get(
@@ -271,7 +273,8 @@ def test_resume_is_authorized_then_lease_protected_and_continues_from_the_checkp
         f"{RUNS}/{run_id}/resume", headers=bearer(issuer, "olga", ["operator"], ["alpha"])
     )
     assert ok.status_code == 200, ok.text
-    assert ok.json()["status"] == "waiting_approval"
+    olga = bearer(issuer, "olga", ["operator"], ["alpha"])
+    assert settle(client, run_id, headers=olga)["status"] == "waiting_approval"
     row = repository.runs[uuid.UUID(run_id)]
     assert row.attempt == 2 and row.lease_owner is None and row.architecture is not None
     assert (
@@ -305,6 +308,7 @@ def test_resume_respects_max_attempts_and_concurrent_resumes_have_one_winner(
             pool.map(lambda _: client.post(f"{RUNS}/{run_id}/resume", headers=headers), range(2))
         )
     assert sorted(r.status_code for r in results) == [200, 409]
+    settle(client, run_id, headers=headers)
     assert repository.runs[uuid.UUID(run_id)].attempt == 2
 
 

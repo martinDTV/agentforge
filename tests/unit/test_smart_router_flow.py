@@ -177,6 +177,7 @@ class RouterWorld:
             policies=self.policies,
             clock=lambda: self.now,
             default_route_mode=default_mode,
+            drive_mode="inline",
         )
 
     async def start(

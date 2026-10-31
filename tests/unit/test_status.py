@@ -5,10 +5,12 @@ from typing import Any
 import pytest
 from langgraph.types import Interrupt, PregelTask, StateSnapshot
 
+from app.contracts.lifecycle import RunLifecycleStatus
 from app.orchestration.status import (
     INTERNAL_ERROR_CODE,
     derive_error,
     derive_status,
+    never_started,
     run_response_from_snapshot,
 )
 
@@ -106,3 +108,52 @@ def test_terminal_states_need_the_approval_nodes_evidence():
     assert derive_status(snapshot({**TASK, "approved": True}, ("ghost",))) == "approved"
     assert derive_status(snapshot({**TASK, "approved": False}, ())) == "rejected"
     assert derive_status(snapshot(TASK, ())) == "interrupted"
+
+
+def test_completed_with_a_publication_expected_is_still_in_flight():
+    """P1 + I0.1: QA approved on a repository with a remote; until the publication plan
+    exists the run is work in progress, so a concurrent reader never projects ``completed``."""
+
+    def snap(values: dict[str, Any]) -> StateSnapshot:
+        return StateSnapshot(
+            values=values,
+            next=("prepare_publication",),
+            config={"configurable": {"thread_id": "t"}},
+            metadata={},
+            created_at=None,
+            parent_config=None,
+            tasks=(),
+            interrupts=(),
+        )
+
+    pending = {"task": "x", "completed": True, "publication_expected": True}
+    assert derive_status(snap(pending), in_flight=True) is RunLifecycleStatus.RUNNING
+    assert derive_status(snap(pending), in_flight=False) is RunLifecycleStatus.INTERRUPTED
+    local = {"task": "x", "completed": True, "publication_expected": False}
+    assert derive_status(snap(local), in_flight=True) is RunLifecycleStatus.COMPLETED
+    legacy = {"task": "x", "completed": True}
+    assert derive_status(snap(legacy)) is RunLifecycleStatus.COMPLETED
+
+
+def test_a_never_started_run_is_still_running_without_an_owner():
+    """I0.1: only the input checkpoint exists (``create`` seeded it); the sweep
+    restarts such a run by itself, so no owner does not mean ``interrupted``."""
+    seeded = snapshot(TASK, ("planner",))._replace(metadata={"source": "update", "step": 0})
+    assert never_started(seeded) is True
+    assert derive_status(seeded, in_flight=False) == "running"
+    assert derive_status(seeded, in_flight=True) == "running"
+    # One completed superstep later it is ordinary pending work again.
+    advanced = snapshot({**TASK, "plan": {"summary": "p", "tasks": []}}, ("architect",))._replace(
+        metadata={"source": "loop", "step": 1}
+    )
+    assert never_started(advanced) is False
+    assert derive_status(advanced, in_flight=False) == "interrupted"
+    # A first node that raised is a failure, never a silent restart.
+    failed = seeded._replace(
+        tasks=(PregelTask(id="t", name="planner", path=(), error=RuntimeError("boom")),)
+    )
+    assert never_started(failed) is False
+    assert derive_status(failed, in_flight=False) == "failed"
+    # Pre-I0.1 runs (input fed straight to the stream) never match.
+    legacy = snapshot(TASK, ("planner",))._replace(metadata={"source": "input", "step": -1})
+    assert never_started(legacy) is False

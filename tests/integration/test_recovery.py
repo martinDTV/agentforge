@@ -30,6 +30,7 @@ from app.orchestration.ports import LeaseToken, RunProjection
 from app.orchestration.recovery import RecoveryService
 from app.orchestration.runs import RunService
 from app.security import AuthorizationPolicy
+from tests.conftest import settle
 from tests.integration.conftest import libpq_dsn, make_app
 from tests.integration.test_business_persistence import approval_row, events, run_row
 from tests.integration.test_checkpoints import query
@@ -74,6 +75,7 @@ async def components(
             policy,
             owner=owner,
             authorization=AuthorizationPolicy(separation_of_duties=False),
+            drive_mode="inline",  # engine-level tests await the drive themselves
         )
         yield service, repository
     finally:
@@ -192,8 +194,11 @@ def test_heartbeat_renews_in_postgres_and_a_lost_lease_cancels_the_drive(
             second = query(url, "SELECT lease_expires_at FROM runs WHERE id = %s", rid)[0][0]
             assert second > first  # type: ignore[operator]
             assert client.get(f"{RUNS}/{rid}").json()["status"] == "running"
+            response = request.result(timeout=15)  # left long ago: accepted (I0.1)
+            assert response.status_code == 201 and response.json()["status"] == "running"
 
-            # Takeover, as recovery would do after expiry: the driver must stop.
+            # Takeover, as recovery would do after expiry: the detached driver must
+            # stop by itself as soon as a heartbeat sees the lost generation.
             expire_lease(url, rid)
             query(
                 url,
@@ -201,10 +206,11 @@ def test_heartbeat_renews_in_postgres_and_a_lost_lease_cancels_the_drive(
                 "'1 minute', lease_generation = lease_generation + 1 WHERE id = %s RETURNING id",
                 rid,
             )
-            response = request.result(timeout=15)
+            deadline = time.monotonic() + 10
+            while app.state.run_service.active_run_ids and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert app.state.run_service.active_run_ids == frozenset()
         gated.release.set()
-    assert response.status_code == 409
-    assert response.json()["code"] == "run_lease_lost"
     assert lease_of(url, rid) == ("intruder", 2, True)
     row = run_row(url, rid)
     # The loser never projected its (gated) planner result; the reader GET above
@@ -307,6 +313,7 @@ def test_recovery_applies_a_pending_approval_recorded_by_a_dead_process(
     url = checkpoint_database_url
     with TestClient(make_app(fake_llm, url)) as client:
         run_id = client.post(RUNS, json=TASK).json()["run_id"]
+        settle(client, run_id)
     calls_before = len(fake_llm.calls)
 
     async def _claim_and_die() -> None:
@@ -435,10 +442,9 @@ def test_attempts_exhausted_and_auto_resume_without_repeating_nodes(
     assert ("run_resumed", 2) in [e[:2] for e in events(url, recoverable)]
     assert lease_of(url, recoverable)[0] is None
     with TestClient(make_app(fake_llm, url)) as client:
-        assert (
-            client.post(f"{RUNS}/{recoverable}/approve", json={"approved": True}).json()["status"]
-            == "approved"
-        )
+        decided = client.post(f"{RUNS}/{recoverable}/approve", json={"approved": True})
+        assert decided.status_code == 200, decided.text
+        assert settle(client, recoverable)["status"] == "approved"
 
 
 # 10 --------------------------------------------------------------------------
@@ -475,13 +481,19 @@ def test_graceful_shutdown_of_the_app_cancels_and_releases_only_its_leases(
         exited_after = time.monotonic() - started
         response = request.result(timeout=15)
     assert 2.0 <= exited_after < 10, exited_after
-    assert response.status_code == 503 and response.json()["code"] == "shutting_down"
+    # The response left before the shutdown (I0.1): accepted, driven detached.
+    assert response.status_code == 201 and response.json()["status"] == "running"
     assert run_row(url, rid)["status"] == "running"  # never marked terminal
     assert lease_of(url, rid)[0] is None
     assert lease_of(url, foreign)[0] == "another-instance"  # not ours, untouched
     assert app.state.checkpoints.closed is True
-    assert sweep(url, fake_llm) == {"claimed": 1, "interrupted": 1}
-    assert run_row(url, rid)["status"] == "interrupted"
+    # Only the input checkpoint exists (the planner never completed): the sweep
+    # re-drives it from that input by itself, without a human and whatever
+    # ``auto_resume`` says; nothing is repeated because nothing happened.
+    assert sweep(url, fake_llm) == {"claimed": 1, "resumed": 1}
+    row = run_row(url, rid)
+    assert (row["status"], row["attempt"]) == ("waiting_approval", 2)
+    assert [e[:2] for e in events(url, rid)].count(("run_resumed", 2)) == 1
 
 
 # 11 --------------------------------------------------------------------------
@@ -521,6 +533,8 @@ CHILD = textwrap.dedent(
         )
         principal = DisabledAuthentication().principal()
         await service.create(os.environ["TEST_TASK"], principal, run_id=os.environ["TEST_RUN_ID"])
+        # The response has left; keep driving (and heartbeating) until SIGKILL.
+        await service.wait_until_settled(os.environ["TEST_RUN_ID"], 600)
 
     asyncio.run(main())
     """
@@ -563,21 +577,20 @@ def test_recovery_after_sigkill_of_the_driving_process(
         assert client.get(f"{RUNS}/{run_id}").json()["status"] == "running"
     assert sweep(url, fake_llm) == {"claimed": 0}
 
-    # Once the dead process' lease expires, recovery classifies it from the checkpoint.
+    # Once the dead process' lease expires, recovery classifies it from the checkpoint:
+    # only the input exists (the planner never returned), so the run is re-driven from
+    # it with the real fake, without a human and whatever ``auto_resume`` says (I0.1).
     deadline = time.monotonic() + 10
     while lease_of(url, run_id)[2] and time.monotonic() < deadline:
         time.sleep(0.2)
     report = sweep(url, fake_llm)
-    assert report == {"claimed": 1, "interrupted": 1}
-    row = run_row(url, run_id)
-    assert row["status"] == "interrupted" and row["plan"] is None and row["attempt"] == 1
-    assert lease_of(url, run_id)[0] is None
-    assert ("run_interrupted", 1) in [e[:2] for e in events(url, run_id)]
-
-    # Auto-resume re-drives it from the only checkpoint (the input) with the real fake.
-    auto = FAST.model_copy(update={"auto_resume": True, "max_attempts": 3})
-    assert sweep(url, fake_llm, auto) == {"claimed": 1, "resumed": 1}
+    assert report == {"claimed": 1, "resumed": 1}
     row = run_row(url, run_id)
     assert (row["status"], row["attempt"]) == ("waiting_approval", 2)
+    assert row["plan"] is not None and lease_of(url, run_id)[0] is None
+    trail = [e[:2] for e in events(url, run_id)]
+    assert ("run_resumed", 2) in trail and ("run_interrupted", 1) not in trail
+    assert trail.count(("run_created", 0)) == 1 and trail.count(("planner_completed", 0)) == 1
+    assert sweep(url, fake_llm) == {"claimed": 0}  # nothing left to recover
     with TestClient(make_app(fake_llm, url)) as client:
         assert client.get(f"{RUNS}/{run_id}").json()["status"] == "waiting_approval"

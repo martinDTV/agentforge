@@ -70,6 +70,17 @@ def build_projection(
     )
     if status not in _WAITING:
         pending = None
+    if pending is not None:
+        pending_stage: DecisionStage | None = pending.stage
+    elif status is _S.RESUME_PENDING:
+        # The decision was recorded and its drive is still in flight (a reader
+        # projecting meanwhile, I0.1): the stage decided stays on the row, so the
+        # drive's own final projection can still tell "paused again at the next
+        # stage" from "still at the same one". Dropping it here would leave the
+        # row ``resume_pending`` forever once the graph pauses at ``publish``.
+        pending_stage = current_stage
+    else:
+        pending_stage = None
     return RunProjection(
         status=status,
         revision=values.get("revision", 0),
@@ -79,7 +90,7 @@ def build_projection(
         architecture=values.get("architecture"),
         error=derive_error(snapshot),
         checkpoint_id=checkpoint_id_of(snapshot),
-        pending_stage=pending.stage if pending else None,
+        pending_stage=pending_stage,
         approval_deadline=pending.deadline if pending else None,
         route=values.get("route"),
         route_mode=values.get("route_mode"),

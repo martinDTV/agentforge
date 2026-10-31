@@ -6,6 +6,7 @@ request, idempotently, with no credential anywhere agents or audit can see.
 GitHub's REST API is simulated (``FakeGitHub``); its Git endpoint is a local
 repository reached over ``file://``. No network, no model, no Runner."""
 
+import asyncio
 import json
 import logging
 import uuid
@@ -27,7 +28,7 @@ from app.orchestration.exceptions import (
 from app.orchestration.graph import build_graph
 from app.orchestration.publication import PublicationGate, PublicationRuntime
 from app.orchestration.recovery import RecoveryService
-from app.orchestration.runs import RunService
+from app.orchestration.runs import DriveMode, RunService
 from app.orchestration.scoped_development import build_scoped_development_graph
 from app.security import AuthorizationPolicy, PermissionDeniedError, Principal
 from tests.unit.git_fixtures import git
@@ -107,9 +108,16 @@ class PublishWorld(MirrorWorld):
         )
         self.graph = build_scoped_development_graph(self.runtime)
 
-    def service(self, *, separation_of_duties: bool = False, gated: bool = False) -> RunService:  # type: ignore[override]
+    def service(  # type: ignore[override]
+        self,
+        *,
+        separation_of_duties: bool = False,
+        gated: bool = False,
+        drive_mode: DriveMode = "inline",
+    ) -> RunService:
         """``gated=True`` wires the production creation guard (P1) over this world's
-        publisher; by default the guard is absent so the graph-level behaviour is tested."""
+        publisher; by default the guard is absent so the graph-level behaviour is tested.
+        ``drive_mode="background"`` is what the API runs (I0.1)."""
         return RunService(
             build_graph(self.model),
             self.repository,
@@ -121,6 +129,7 @@ class PublishWorld(MirrorWorld):
             policies=self.lab.policies,
             clock=lambda: self.now,
             publishing=_LiveGate(self) if gated else None,
+            drive_mode=drive_mode,
         )
 
     def remote_heads(self) -> dict[str, str]:
@@ -295,6 +304,51 @@ async def test_an_approved_plan_is_pushed_once_as_one_draft_pull_request(
     with pytest.raises(RunAlreadyDecidedError):
         await service.approve(run_id, False, PAULA, publish_digest=digest)
     assert world.remote_heads()[branch] == publication["head_sha"]
+
+
+async def test_concurrent_publish_approvals_record_one_decision_push_once_and_open_one_pr(
+    tmp_path: Path,
+):
+    """I0.1: with the API's detached drive, racing publish approvals (same human twice,
+    another authorised human once) record exactly one decision, push one branch and
+    open one draft pull request. The guarantee is the decision CAS and the lease, not
+    the HTTP request that happened to win."""
+    world = PublishWorld(tmp_path)
+    run_id, digest = await world.up_to_publish(world.service())
+    detached = world.service(drive_mode="background")
+    pedro = human("pedro", {"project_operator"})
+
+    outcomes = await asyncio.gather(
+        detached.approve(run_id, True, PAULA, publish_digest=digest),
+        detached.approve(run_id, True, pedro, publish_digest=digest),
+        detached.approve(run_id, True, PAULA, publish_digest=digest),
+        return_exceptions=True,
+    )
+
+    assert not any(isinstance(o, BaseException) for o in outcomes), outcomes
+    assert {o.status for o in outcomes if not isinstance(o, BaseException)} <= {
+        S.RESUME_PENDING,
+        S.PUBLISHED,
+    }
+    assert await detached.wait_until_settled(run_id, 30)
+    done = await detached.get(run_id, OPERATOR)
+    assert done.status is S.PUBLISHED and done.publication is not None
+    assert done.publication["pr_number"] == 1 and len(world.lab.github.pulls) == 1
+    assert list(world.agentforge_branches()) == [f"agentforge/{run_id}"]
+    publish = [
+        d
+        for d in (await detached.decisions(run_id, OPERATOR)).decisions
+        if d.stage is DecisionStage.PUBLISH
+    ]
+    assert len(publish) == 1 and publish[0].applied_at is not None
+    assert publish[0].decided_by in ("paula", "pedro") and publish[0].scope_digest == digest
+    kinds = await world.kinds(run_id)
+    assert kinds.count(RunEventKind.APPROVAL_RECORDED) == 2  # scope + publish, once each
+    assert kinds.count(RunEventKind.BRANCH_PUSHED) == 1
+    assert kinds.count(RunEventKind.PULL_REQUEST_OPENED) == 1
+    assert [r.state.value for r in world.publications.rows].count("pushed") == 1
+    with pytest.raises(RunAlreadyDecidedError):
+        await detached.approve(run_id, False, PAULA, publish_digest=digest)
 
 
 async def test_a_plan_changed_after_preparation_is_refused_before_any_remote_operation(

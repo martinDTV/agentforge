@@ -16,6 +16,18 @@ class RunAlreadyDecidedError(ConflictError):
         super().__init__(f"La ejecución '{run_id}' ya no espera aprobación (estado: {status}).")
 
 
+class RunBusyError(ConflictError):
+    """This process is already driving the run in the background (I0.1)."""
+
+    code = "run_busy"
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(
+            f"La ejecución '{run_id}' ya está siendo conducida por este proceso; "
+            "consulta su estado."
+        )
+
+
 class RunAlreadyExistsError(ConflictError):
     code = "run_already_exists"
 

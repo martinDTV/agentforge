@@ -18,6 +18,7 @@ from app.projects import ProjectPolicyRegistry, RepositoryPolicy
 from app.security import AuthorizationPolicy, JwtVerifier, VerificationRules
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import StaticKeys
+from tests.conftest import settle
 from tests.integration.conftest import libpq_dsn
 from tests.unit.git_fixtures import make_sandbox
 
@@ -92,6 +93,8 @@ def test_governed_run_through_the_api_on_postgres(
     }
     with TestClient(app) as client:
         run = client.post(RUNS, json=body, headers=olivia).json()
+        assert run["status"] == "running"  # accepted; the Scoper runs detached (I0.1)
+        run = settle(client, run["run_id"], headers=olivia)
         assert run["status"] == "waiting_approval" and run["pending_stage"] == "scope"
         digest = client.get(f"{RUNS}/{run['run_id']}/decisions", headers=olivia).json()["pending"][
             "scope_digest"
@@ -108,7 +111,8 @@ def test_governed_run_through_the_api_on_postgres(
             headers=omar,
         )
         assert approved.status_code == 200, approved.text
-        assert approved.json()["status"] == "completed"
+        assert approved.json()["status"] in ("resume_pending", "completed")
+        assert settle(client, run["run_id"], headers=olivia)["status"] == "completed"
         decisions = client.get(f"{RUNS}/{run['run_id']}/decisions", headers=olivia).json()
         assert decisions["pending"] is None
         assert [

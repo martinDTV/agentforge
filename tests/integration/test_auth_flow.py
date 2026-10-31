@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.infrastructure.llm.fake import FakeLLMAdapter
 from app.security.dev_keys import DevIssuer
+from tests.conftest import settle
 from tests.integration.conftest import make_app
 
 RUNS = "/api/v1/runs"
@@ -24,14 +25,15 @@ def test_persistent_app_requires_tokens_and_serves_the_full_flow(
         created = client.post(RUNS, json=TASK, headers=headers)
         assert created.status_code == 201
         run_id = created.json()["run_id"]
+        assert created.json()["status"] == "running"  # accepted; the graph runs detached (I0.1)
         assert client.get(f"{RUNS}/{run_id}").status_code == 401
-        assert (
-            client.get(f"{RUNS}/{run_id}", headers=headers).json()["status"] == "waiting_approval"
-        )
+        assert settle(client, run_id, headers=headers)["status"] == "waiting_approval"
         replay = client.post(RUNS, json=TASK, headers={**headers, "Idempotency-Key": run_id})
         assert replay.status_code == 201  # new key: a new run, still authenticated
         approved = client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}, headers=headers)
-        assert approved.json()["status"] == "approved"
+        assert approved.status_code == 200
+        assert approved.json()["status"] in ("resume_pending", "approved")  # recorded; applied
+        assert settle(client, run_id, headers=headers)["status"] == "approved"
     # A second instance with a different key set rejects the old tokens.
     with TestClient(make_app(fake_llm, checkpoint_database_url, issuer=DevIssuer())) as other:
         assert other.get(f"{RUNS}/{run_id}", headers=headers).status_code == 401

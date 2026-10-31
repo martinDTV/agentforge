@@ -13,6 +13,7 @@ from app.orchestration.limits import RunLimits
 from app.security import AuthorizationPolicy, JwtVerifier, VerificationRules
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import StaticKeys
+from tests.conftest import settle
 
 RUNS = "/api/v1/runs"
 TASK = {"task": "Crear módulo de pacientes con pruebas"}
@@ -66,7 +67,7 @@ def bearer(
 def create(client: TestClient, headers: dict[str, str], **body: object) -> dict[str, object]:
     response = client.post(RUNS, json={**TASK, **body}, headers=headers)
     assert response.status_code == 201, response.text
-    return response.json()  # type: ignore[no-any-return]
+    return settle(client, response.json()["run_id"], headers=headers)  # the next stop (I0.1)
 
 
 # 1 ---------------------------------------------------------------------------
@@ -133,7 +134,8 @@ def test_approving_needs_the_permission_on_a_visible_run(client: TestClient, iss
     approved = client.post(
         f"{RUNS}/{alpha_run['run_id']}/approve", json={"approved": True}, headers=approver
     )
-    assert approved.status_code == 200 and approved.json()["status"] == "approved"
+    assert approved.status_code == 200
+    assert settle(client, alpha_run["run_id"], headers=approver)["status"] == "approved"
 
 
 # 5 ---------------------------------------------------------------------------
@@ -150,9 +152,10 @@ def test_admin_scope_is_limited_to_its_projects_unless_platform_admin(
     assert (
         client.post(
             f"{RUNS}/{alpha_run['run_id']}/approve", json={"approved": False}, headers=platform
-        ).json()["status"]
-        == "rejected"
+        ).status_code
+        == 200
     )
+    assert settle(client, alpha_run["run_id"], headers=platform)["status"] == "rejected"
     # Global scope still has to name a project to create.
     assert client.post(RUNS, json=TASK, headers=platform).status_code == 403
     assert create(client, platform, project_id="gamma")["project_id"] == "gamma"
@@ -216,11 +219,9 @@ def test_actors_are_recorded_on_creation_and_approval(
 ):
     created = create(client, bearer(issuer, "alice", ["operator"], ["alpha"]))
     rid = uuid.UUID(created["run_id"])
-    client.post(
-        f"{RUNS}/{rid}/approve",
-        json={"approved": True},
-        headers=bearer(issuer, "ana", ["approver"], ["alpha"]),
-    )
+    ana = bearer(issuer, "ana", ["approver"], ["alpha"])
+    client.post(f"{RUNS}/{rid}/approve", json={"approved": True}, headers=ana)
+    settle(client, str(rid), headers=ana)
     decision = repository.approvals[rid]
     assert decision.decided_by == "ana" and decision.applied_at is not None
     actors = {e.kind.value: e.actor_subject for e in repository.events[rid]}

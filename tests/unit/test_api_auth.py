@@ -12,6 +12,7 @@ from app.orchestration.limits import RunLimits
 from app.security import JwtVerifier, VerificationRules
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import StaticKeys
+from tests.conftest import settle
 
 RUNS = "/api/v1/runs"
 TASK = {"task": "Crear módulo de pacientes con pruebas"}
@@ -93,8 +94,10 @@ def test_a_valid_token_allows_the_full_flow(client: TestClient, issuer: DevIssue
     assert created.status_code == 201
     run_id = created.json()["run_id"]
     assert client.get(f"{RUNS}/{run_id}", headers=headers).status_code == 200
+    settle(client, run_id, headers=headers)
     approved = client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}, headers=headers)
-    assert approved.json()["status"] == "approved"
+    assert approved.status_code == 200
+    assert settle(client, run_id, headers=headers)["status"] == "approved"
     # Existing error contract is intact behind authentication.
     missing = client.get(f"{RUNS}/{uuid.uuid4()}", headers=headers)
     assert missing.status_code == 404 and missing.json()["code"] == "run_not_found"

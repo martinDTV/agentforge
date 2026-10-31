@@ -133,6 +133,7 @@ class World:
             policies=self.policies,
             on_terminal=on_terminal,
             clock=lambda: self.now,
+            drive_mode="inline",
         )
 
 

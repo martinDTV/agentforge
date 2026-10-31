@@ -24,6 +24,7 @@ from app.security import AuthorizationPolicy, JwtVerifier, VerificationRules
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import StaticKeys
 from app.workspaces import WorktreeManager
+from tests.conftest import settle
 from tests.unit.git_fixtures import git
 from tests.unit.test_api_development import scoped_llm
 from tests.unit.test_mirror_service import PROJECT, REPO, Lab
@@ -126,6 +127,7 @@ def test_publication_needs_its_own_decision_digest_and_a_distinct_human(
     victor = bearer(issuer, "victor", ["viewer"])
     run = client.post(RUNS, json=BODY, headers=olivia).json()
     run_id = run["run_id"]
+    settle(client, run_id, headers=olivia)
     scope = client.get(f"{RUNS}/{run_id}/decisions", headers=victor).json()["pending"]
     approved = client.post(
         f"{RUNS}/{run_id}/approve",
@@ -133,7 +135,7 @@ def test_publication_needs_its_own_decision_digest_and_a_distinct_human(
         headers=omar,
     )
     assert approved.status_code == 200, approved.text
-    body = approved.json()
+    body = settle(client, run_id, headers=omar)
     assert body["status"] == "waiting_approval" and body["pending_stage"] == "publish"
     assert body["publication"]["state"] == "prepared"
     decisions = client.get(f"{RUNS}/{run_id}/decisions", headers=victor).json()
@@ -186,7 +188,7 @@ def test_publication_needs_its_own_decision_digest_and_a_distinct_human(
         headers=paula,
     )
     assert published.status_code == 200, published.text
-    final = published.json()
+    final = settle(client, run_id, headers=paula)
     assert final["status"] == "published" and final["pending_stage"] is None
     publication = final["publication"]
     assert publication["state"] == "published" and publication["pr_number"] == 1

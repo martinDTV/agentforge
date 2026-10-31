@@ -119,6 +119,24 @@ def publication_pending(values: dict[str, Any]) -> bool:
     return decided is True and values.get("published") is not True
 
 
+def never_started(snapshot: StateSnapshot) -> bool:
+    """Only the input checkpoint exists: no node ever completed for this run.
+
+    ``RunService.create`` writes the graph input as a checkpoint
+    (``as_node=START``) before anything runs (I0.1); that checkpoint has
+    ``source == "update"`` at step 0 with the first node still pending. Such a
+    run produced no side effect (no model call, no write, no sandbox program),
+    so re-driving it from that input is always safe.
+    """
+    metadata = snapshot.metadata or {}
+    return (
+        bool(snapshot.next)
+        and metadata.get("source") == "update"
+        and int(metadata.get("step", 0) or 0) <= 0
+        and not any(task.error is not None for task in snapshot.tasks)
+    )
+
+
 def derive_status(snapshot: StateSnapshot, *, in_flight: bool = False) -> RunLifecycleStatus:
     values = snapshot.values
     if derive_error(snapshot) is not None:
@@ -132,6 +150,14 @@ def derive_status(snapshot: StateSnapshot, *, in_flight: bool = False) -> RunLif
     if values.get("publication_interrupted") is True or publication_pending(values):
         return RunLifecycleStatus.RUNNING if in_flight else RunLifecycleStatus.INTERRUPTED
     if values.get("completed") is True:
+        if values.get("publication_expected") is True:
+            # Governed development on a repository with a remote (P1): QA approved, but
+            # the deliverable is the publication that follows. Between the QA superstep
+            # and ``prepare_publication`` nothing positive about the publication exists
+            # yet, so the run is still work in progress, never ``completed``. A
+            # concurrent reader (the API polled during a background drive, I0.1) must
+            # not project a terminal row that the drive could then no longer advance.
+            return RunLifecycleStatus.RUNNING if in_flight else RunLifecycleStatus.INTERRUPTED
         return RunLifecycleStatus.COMPLETED
     approved = values.get("approved")
     if approved is True:
@@ -140,6 +166,12 @@ def derive_status(snapshot: StateSnapshot, *, in_flight: bool = False) -> RunLif
         return RunLifecycleStatus.REJECTED
     if has_pending_interrupt(snapshot):
         return RunLifecycleStatus.WAITING_APPROVAL
+    if never_started(snapshot):
+        # Accepted and checkpointed, not yet driven (the process died between the
+        # response and the first node, or shut down before it): the recovery sweep
+        # restarts it by itself, so it is still ``running`` for the platform, never
+        # ``interrupted``, which would wait for a human ``resume``.
+        return RunLifecycleStatus.RUNNING
     return RunLifecycleStatus.RUNNING if in_flight else RunLifecycleStatus.INTERRUPTED
 
 

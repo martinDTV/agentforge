@@ -24,6 +24,7 @@ from app.infrastructure.llm.fake import FakeLLMAdapter
 from app.orchestration.graph import build_graph, build_state_graph
 from app.orchestration.runs import RunService
 from app.security.tokens import DisabledAuthentication
+from tests.conftest import settle
 from tests.integration.conftest import (
     CHECKPOINTS_APP_NAME as APP_NAME,
 )
@@ -64,7 +65,9 @@ def test_run_survives_restart_and_pending_approval_resumes_on_a_second_instance(
 ):
     url = checkpoint_database_url
     with TestClient(make_app(fake_llm, url)) as first:
-        created = first.post(RUNS, json=TASK).json()
+        accepted = first.post(RUNS, json=TASK).json()
+        assert accepted["status"] == "running"  # accepted; driven detached (I0.1)
+        created = settle(first, accepted["run_id"])
     run_id = created["run_id"]
     assert created["status"] == "waiting_approval"
 
@@ -72,7 +75,7 @@ def test_run_survives_restart_and_pending_approval_resumes_on_a_second_instance(
         assert second.get(f"{RUNS}/{run_id}").json() == created
         approved = second.post(f"{RUNS}/{run_id}/approve", json={"approved": True})
         assert approved.status_code == 200
-        assert approved.json()["status"] == "approved"
+        assert settle(second, run_id)["status"] == "approved"
 
     with TestClient(make_app(fake_llm, url)) as third:
         assert third.get(f"{RUNS}/{run_id}").json()["status"] == "approved"
@@ -85,6 +88,7 @@ def test_run_survives_restart_and_pending_approval_resumes_on_a_second_instance(
 def test_thread_id_is_exactly_the_run_id(client: TestClient, checkpoint_database_url: str):
     run_id = client.post(RUNS, json=TASK).json()["run_id"]
     uuid.UUID(run_id)  # well-formed
+    settle(client, run_id)
 
     rows = query(
         checkpoint_database_url,
@@ -117,7 +121,9 @@ def test_thread_id_is_exactly_the_run_id(client: TestClient, checkpoint_database
 
 def test_checkpoint_rows_never_contain_pickle(client: TestClient, checkpoint_database_url: str):
     run_id = client.post(RUNS, json=TASK).json()["run_id"]
+    settle(client, run_id)
     client.post(f"{RUNS}/{run_id}/approve", json={"approved": True})
+    settle(client, run_id)
     blob_types = {
         row[0]
         for row in query(
@@ -145,6 +151,7 @@ def test_encrypted_checkpoints_hide_content_and_stay_readable_with_the_key(
     url = checkpoint_database_url
     with TestClient(make_app(fake_llm, url, key=KEY)) as encrypted:
         run_id = encrypted.post(RUNS, json=TASK).json()["run_id"]
+        settle(encrypted, run_id)
     blobs = query(url, "SELECT blob FROM checkpoint_blobs WHERE thread_id = %s", run_id)
     writes = query(url, "SELECT blob FROM checkpoint_writes WHERE thread_id = %s", run_id)
     needle = sample_plan.summary.encode()
@@ -204,7 +211,7 @@ def test_incomplete_checkpoint_reads_as_interrupted_not_waiting_approval(
         denied = client.post(f"{RUNS}/{run_id}/approve", json={"approved": True})
         assert denied.status_code == 409 and "interrupted" in denied.json()["detail"]
         # A real interrupt is still reported as such.
-        live = client.post(RUNS, json=TASK).json()
+        live = settle(client, client.post(RUNS, json=TASK).json()["run_id"])
         assert live["status"] == "waiting_approval"
 
 
@@ -236,7 +243,8 @@ def test_recovery_continues_from_the_last_checkpoint_without_repeating_the_plann
 
     with TestClient(make_app(fake_llm, url)) as client:
         approved = client.post(f"{RUNS}/{run_id}/approve", json={"approved": True})
-        assert approved.json()["status"] == "approved"
+        assert approved.status_code == 200, approved.text
+        assert settle(client, run_id)["status"] == "approved"
     assert ArchitectureReview in {schema for _, _, schema in fake_llm.calls}
 
 
@@ -259,11 +267,14 @@ def test_shutdown_waits_and_closes_every_connection(
     url = fresh_checkpoint_database_url
     app = make_app(fake_llm, url)
     with TestClient(app) as client:
-        client.post(RUNS, json=TASK)
+        settle(client, client.post(RUNS, json=TASK).json()["run_id"])
         assert connections(url, APP_NAME) >= 1
         assert connections(url, "agentforge") >= 1
         checkpoints = app.state.checkpoints
         assert checkpoints.closed is False
+        deadline = time.monotonic() + 5  # a finished task is forgotten on the next loop turn
+        while app.state.run_service.active_run_ids and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert app.state.run_service.active_run_ids == frozenset()
     assert checkpoints.closed is True
     assert connections(url, APP_NAME) == 0

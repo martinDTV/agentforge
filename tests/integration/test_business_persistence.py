@@ -18,6 +18,7 @@ from app.infrastructure.llm.fake import FakeLLMAdapter
 from app.orchestration.graph import build_graph
 from app.orchestration.ports import RunEvent
 from app.orchestration.runs import RunService
+from tests.conftest import settle
 from tests.integration.conftest import TemporaryDatabases, libpq_dsn, make_app
 from tests.integration.test_checkpoints import query
 
@@ -87,7 +88,9 @@ def test_run_is_persisted_in_runs_and_readable_from_another_instance(
 ):
     url = checkpoint_database_url
     with TestClient(make_app(fake_llm, url)) as first:
-        created = first.post(RUNS, json=TASK).json()
+        accepted = first.post(RUNS, json=TASK).json()
+        assert accepted["status"] == "running" and accepted["plan"] is None  # accepted (I0.1)
+        created = settle(first, accepted["run_id"])
     run_id = created["run_id"]
     row = run_row(url, run_id)
     assert row["status"] == "waiting_approval"
@@ -113,9 +116,12 @@ def test_errors_and_final_results_are_persisted(
     url = checkpoint_database_url
     with TestClient(make_app(fake_llm, url)) as client:
         ok = client.post(RUNS, json=TASK).json()
+        settle(client, ok["run_id"])
         client.post(f"{RUNS}/{ok['run_id']}/approve", json={"approved": True})
+        settle(client, ok["run_id"])
         fake_llm.register_sequence(DevelopmentPlan, [LLMTimeoutError("sin respuesta")])
         failed = client.post(RUNS, json=TASK).json()
+        settle(client, failed["run_id"])
 
     approved = run_row(url, ok["run_id"])
     assert approved["status"] == "approved" and approved["error_code"] is None
@@ -149,7 +155,9 @@ def test_audit_trail_of_the_planner_architect_cycle(
     fake_llm.register_sequence(ArchitectureReview, [rejecting_review, sample_review])
     with TestClient(make_app(fake_llm, url)) as client:
         run_id = client.post(RUNS, json=TASK).json()["run_id"]
+        settle(client, run_id)
         client.post(f"{RUNS}/{run_id}/approve", json={"approved": True})
+        settle(client, run_id)
 
     trail = events(url, run_id)
     assert [e[:2] for e in trail] == [
@@ -194,6 +202,7 @@ def test_retrying_event_writes_does_not_duplicate_rows(
     url = checkpoint_database_url
     with TestClient(make_app(fake_llm, url)) as client:
         run_id = client.post(RUNS, json=TASK).json()["run_id"]
+        settle(client, run_id)
         for _ in range(3):
             client.get(f"{RUNS}/{run_id}")
     before = events(url, run_id)
@@ -272,6 +281,7 @@ def test_decision_is_durable_before_resume_and_survives_a_crash(
     app = make_app(fake_llm, url)
     with TestClient(app, raise_server_exceptions=False) as client:
         run_id = client.post(RUNS, json=TASK).json()["run_id"]
+        settle(client, run_id)
         calls_before = len(fake_llm.calls)
         service = app.state.run_service
 
@@ -280,12 +290,15 @@ def test_decision_is_durable_before_resume_and_survives_a_crash(
 
         original = service._apply_decision
         service._apply_decision = crash  # type: ignore[method-assign]
-        assert client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}).status_code == 500
+        # The decision is durable before the response; applying it fails in the
+        # background (I0.1), which the response cannot report: the row says so.
+        recorded = client.post(f"{RUNS}/{run_id}/approve", json={"approved": True})
+        assert recorded.status_code == 200 and recorded.json()["status"] == "resume_pending"
+        assert client.get(f"{RUNS}/{run_id}").json()["status"] == "resume_pending"
         service._apply_decision = original  # type: ignore[method-assign]
 
         assert approval_row(url, run_id) == (True, False)
         assert run_row(url, run_id)["status"] == "resume_pending"
-        assert client.get(f"{RUNS}/{run_id}").json()["status"] == "resume_pending"
         # Repeating the same decision is accepted idempotently; the opposite is refused.
         assert client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}).status_code == 200
         assert client.post(f"{RUNS}/{run_id}/approve", json={"approved": False}).status_code == 409
@@ -322,6 +335,7 @@ def test_concurrent_duplicate_and_contradictory_approvals(
     url = checkpoint_database_url
     with TestClient(make_app(fake_llm, url)) as client:
         run_id = client.post(RUNS, json=TASK).json()["run_id"]
+        settle(client, run_id)
         calls_before = len(fake_llm.calls)
         decisions = [True, False, True, False, True, False]
 
@@ -333,6 +347,7 @@ def test_concurrent_duplicate_and_contradictory_approvals(
 
         with ThreadPoolExecutor(max_workers=len(decisions)) as pool:
             results = list(pool.map(approve, decisions))
+        settle(client, run_id)
 
     recorded = approval_row(url, run_id)
     assert recorded is not None and recorded[1] is True
@@ -340,7 +355,8 @@ def test_concurrent_duplicate_and_contradictory_approvals(
     final = "approved" if winner else "rejected"
     for status_code, decision, outcome in results:
         if decision == winner:
-            assert (status_code, outcome) == (200, final)
+            # Recorded (resume_pending) or already applied by the background drive.
+            assert status_code == 200 and outcome in ("resume_pending", final)
         else:
             assert (status_code, outcome) == (409, "run_already_decided")
     assert run_row(url, run_id)["status"] == final
@@ -359,6 +375,7 @@ def test_postgres_outage_becomes_503_problem_details(
     url = fresh_checkpoint_database_url
     with TestClient(make_app(fake_llm, url), raise_server_exceptions=False) as client:
         run_id = client.post(RUNS, json=TASK).json()["run_id"]
+        settle(client, run_id)  # the drive must be over before the outage starts
         temporary_databases.set_allow_connections(url, False)
         try:
             for response in (
@@ -381,9 +398,9 @@ def test_postgres_outage_becomes_503_problem_details(
         while (status := client.get(f"{RUNS}/{run_id}").status_code) != 200:
             assert status == 503 and time.monotonic() < deadline, status
             time.sleep(0.5)
-        assert client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}).json()[
-            "status"
-        ] == ("approved")
+        recovered = client.post(f"{RUNS}/{run_id}/approve", json={"approved": True})
+        assert recovered.status_code == 200, recovered.text
+        assert settle(client, run_id)["status"] == "approved"
 
 
 # 10 --------------------------------------------------------------------------
@@ -415,7 +432,10 @@ def test_human_decision_is_reflected_in_row_approval_and_events(
     url = checkpoint_database_url
     with TestClient(make_app(fake_llm, url)) as client:
         run_id = client.post(RUNS, json=TASK).json()["run_id"]
-        final = client.post(f"{RUNS}/{run_id}/approve", json={"approved": decision}).json()
+        settle(client, run_id)
+        decided = client.post(f"{RUNS}/{run_id}/approve", json={"approved": decision})
+        assert decided.status_code == 200, decided.text
+        final = settle(client, run_id)
     expected = "approved" if decision else "rejected"
     assert final["status"] == expected
     assert run_row(url, run_id)["status"] == expected
