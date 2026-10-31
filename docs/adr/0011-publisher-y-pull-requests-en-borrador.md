@@ -211,3 +211,20 @@ Matriz de aceptación del Paso 3 con evidencia real, ADR 0011 a `accepted`, READ
 3. Política por defecto ante avance de la rama base: estricta (`max_base_behind = 0`, propuesta) o tolerante.
 4. Resultado tras `push` exitoso y PR imposible: dejar la rama y marcar reintentable (propuesta) o exigir borrado manual documentado.
 5. Idioma y prefijo del título del PR (`[AgentForge]`, cuerpo en español, propuesta).
+
+## Nota de estabilización P1 (2026-10-31)
+
+Incidente: con `GITHUB_WRITE_ENABLED=false`, una ejecución gobernada sobre `agentforge-sandbox-demo`
+terminó `completed` tras QA sin plan de publicación (la hija T1 del objetivo `4c03b45d`), estado
+terminal que `resume` no acepta; el trabajo quedó en el worktree con retención de una hora.
+Decisión: publicar es el entregable de toda ejecución con remoto. (1) `RunService.create` y
+`GoalService.create` rechazan con `409 publish_unavailable` cuando `PublicationAvailability`
+(`PublicationGate(PublicationRuntime | None)`) no permite el repositorio; la comprobación lee solo
+configuración, nunca crea tokens. (2) Si el Publisher desaparece con la ejecución en marcha,
+`prepare_publication` persiste `publication = {state: unavailable, retryable: true}` a través del
+repositorio de ejecuciones (`DevelopmentRuntime.runs`) y devuelve `publication_interrupted`, de
+modo que la ejecución queda `interrupted`; `UNAVAILABLE → PREPARED` es ahora una transición legal,
+`claim_interrupted_publications` no la selecciona (nada se reintenta solo) y `resume` la reconduce a
+`prepare_publication` (`as_node="qa"`) únicamente si la publicación ya está habilitada. Las
+ejecuciones de repositorios sin remoto no cambian.
+

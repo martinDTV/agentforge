@@ -95,18 +95,35 @@ aplica. En la ruta `full` la primera decisión es el plan (`stage: plan`), con e
 
 ## 4. Aprobar la publicación
 
-Tras Developer y QA llega "Plan de publicación listo para aprobar". Publicar requiere que la
-API haya arrancado con escritura habilitada, solo como variables del proceso:
+**La escritura en GitHub se habilita antes de crear la tarea o el objetivo, no al aprobar la
+publicación.** Una ejecución sobre un repositorio con remoto solo tiene un resultado posible, el
+Pull Request, así que la API rechaza crearla (`409 publish_unavailable`) si esta instancia no puede
+publicar en ese repositorio. Habilita la publicación solo como variables del proceso:
 
 ```bash
 GITHUB_WRITE_ENABLED=true PUBLISH_ALLOWED_REPOSITORIES='["sandbox-github"]' \
   uv run python -m scripts.agentforge_dev up
+```
+
+Con la escritura habilitada los tokens de instalación se crean únicamente en el momento de publicar
+y se revocan al terminar; tu aprobación `publish` sigue siendo obligatoria. Tras Developer y QA
+llega "Plan de publicación listo para aprobar":
+
+```bash
 uv run python -m scripts.agentforge approve <run_id>   # etapa publish, digest de publicación
 ```
 
 Resultado: una rama `agentforge/<run_id>` y un Pull Request en borrador; AgentForge nunca
 fusiona ni toca `main`. Con `AUTHZ_SEPARATION_OF_DUTIES=true` quien aprueba no puede ser quien
 creó la ejecución; en `ENVIRONMENT=local` la misma persona puede aprobar alcance y publicación.
+
+Si la publicación deja de estar disponible mientras una ejecución ya está en marcha (reinicio sin
+la bandera, repositorio retirado de la lista), la ejecución **no termina** `completed`: queda
+`interrupted` con `publication.state = unavailable`, conserva su worktree durante la retención de
+interrumpidas (7 días por defecto) y el barrido de recuperación no la toca. Habilita la publicación,
+arranca de nuevo y reanúdala con `POST /api/v1/runs/<run_id>/resume` (requiere `repos:publish`):
+preparará el plan de publicación y volverá a pedirte la decisión `publish`. En un objetivo, la tarea
+aparece como `waiting_human` en etapa `publish` con el motivo `publication_unavailable`.
 
 ## 5. Consultar resultados
 
