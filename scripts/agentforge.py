@@ -5,7 +5,7 @@
     uv run python -m scripts.agentforge runs [--status waiting_approval] [--project P]
     uv run python -m scripts.agentforge show <run_id>
     uv run python -m scripts.agentforge pending <run_id>      # what is waiting and its digest
-    uv run python -m scripts.agentforge approve <run_id>      # shows the proposal, asks, approves
+    uv run python -m scripts.agentforge approve <run_id> [--wait S]  # shows, asks, records
     uv run python -m scripts.agentforge reject <run_id>
     uv run python -m scripts.agentforge events <run_id>
     uv run python -m scripts.agentforge goal "Objetivo de alto nivel" \\
@@ -23,6 +23,12 @@ The identity is ``AGENTFORGE_SUBJECT`` (default: the OS user) with the
 ``AUTH_MODE=oidc`` the token comes from the local development issuer (``.local/``)
 and is never printed. Approving requires typing the first eight characters of the
 digest shown, so the decision is bound to that exact proposal.
+
+``task`` answers as soon as the run is accepted and ``approve``/``reject`` as soon as
+the decision is recorded (I0.1): the platform drives the graph detached from the
+request. ``--wait S`` follows the run with ``GET`` for up to ``S`` seconds; it never
+repeats a ``POST``. A lost answer is not a lost decision: check with ``show`` or
+``pending`` before deciding again (the same decision replays idempotently).
 """
 
 import argparse
@@ -30,6 +36,7 @@ import getpass
 import json
 import os
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -74,6 +81,29 @@ def _fail(response: httpx.Response) -> int:
         body = {"detail": response.text[:300]}
     print(json.dumps({"http": response.status_code, **body}, ensure_ascii=False, indent=1))
     return 1
+
+
+SETTLING = ("running", "resume_pending")  # accepted or recorded; driven detached (I0.1)
+
+
+def _follow(
+    client: httpx.Client, run_id: str, headers: dict[str, str], seconds: float
+) -> dict[str, Any] | None:
+    """Read the run until it leaves ``running``/``resume_pending`` or ``seconds`` pass.
+
+    Read-only and bounded: it never repeats a POST. Returns the last run read, or
+    ``None`` when a read failed (the caller prints the HTTP problem instead).
+    """
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        r = client.get(f"/runs/{run_id}", headers=headers)
+        if r.status_code != 200:
+            _fail(r)
+            return None
+        run: dict[str, Any] = r.json()
+        if run.get("status") not in SETTLING or time.monotonic() >= deadline:
+            return run
+        time.sleep(2.0)
 
 
 def _summary(run: dict[str, Any]) -> dict[str, Any]:
@@ -184,6 +214,12 @@ def run(argv: Sequence[str] | None = None, *, client: httpx.Client | None = None
     task.add_argument("text")
     task.add_argument("--repository", default=_env("AGENTFORGE_REPOSITORY"))
     task.add_argument("--mode", choices=["auto", "fast", "full"], default=None)
+    task.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        help="seconds to follow the run to its first stop (0 = return once accepted)",
+    )
     runs = sub.add_parser("runs", help="list runs")
     runs.add_argument("--status", default=None)
     runs.add_argument("--limit", type=int, default=20)
@@ -195,6 +231,12 @@ def run(argv: Sequence[str] | None = None, *, client: httpx.Client | None = None
             p.add_argument("--digest", default=None, help="full digest, non-interactive")
             p.add_argument(
                 "--reason", default=None, help="motivo formal de la decisión (se registra)"
+            )
+            p.add_argument(
+                "--wait",
+                type=float,
+                default=120.0,
+                help="seconds to follow the run after the decision is recorded (0 = none)",
             )
     goal = sub.add_parser("goal", help="create a goal (Fase 8)")
     goal.add_argument("text")
@@ -230,7 +272,15 @@ def run(argv: Sequence[str] | None = None, *, client: httpx.Client | None = None
             r = client.post("/runs", json=body, headers=h)
             if r.status_code != 201:
                 return _fail(r)
-            print(json.dumps(_summary(r.json()), ensure_ascii=False, indent=1))
+            run = r.json()  # accepted and durable; the Scoper runs detached (I0.1)
+            if args.wait > 0 and run.get("status") in SETTLING:
+                followed = _follow(client, run["run_id"], h, args.wait)
+                if followed is None:
+                    return 1
+                run = followed
+            print(json.dumps(_summary(run), ensure_ascii=False, indent=1))
+            if run.get("status") in SETTLING:
+                print("Aceptada; la plataforma la conduce en segundo plano: sigue con `show`.")
             return 0
         if args.command == "goal":
             if not args.project or not args.repository:
@@ -363,7 +413,15 @@ def run(argv: Sequence[str] | None = None, *, client: httpx.Client | None = None
         r = client.post(f"/runs/{args.run_id}/approve", json=payload, headers=h)
         if r.status_code != 200:
             return _fail(r)
-        print(json.dumps(_summary(r.json()), ensure_ascii=False, indent=1))
+        run = r.json()  # recorded (``resume_pending``); applied detached (I0.1)
+        if args.wait > 0 and run.get("status") in SETTLING:
+            followed = _follow(client, args.run_id, h, args.wait)
+            if followed is None:
+                return 1
+            run = followed
+        print(json.dumps(_summary(run), ensure_ascii=False, indent=1))
+        if run.get("status") in SETTLING:
+            print("Decisión registrada; se aplica en segundo plano: sigue con `show`.")
         return 0
     finally:
         if own_client:
