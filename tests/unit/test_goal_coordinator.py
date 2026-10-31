@@ -1039,6 +1039,18 @@ async def test_a_child_stopped_by_unavailable_publication_waits_for_the_operator
     ]
     assert notices == ["publication_unavailable"]
     assert (await world.task(goal_id, "T2")).status is T.PENDING
+    # It is not a pending human decision: the run has no pending stage and, hours later,
+    # no ``decision_pending`` reminder is ever sent for it.
+    row = await world.runs.get_run(t1.run_id)
+    assert row is not None and row.status is S.INTERRUPTED and row.pending_stage is None
+    world.clock.advance(hours=13)
+    await world.tick(goal_id)
+    notices = [
+        e.payload["reason"]
+        for e in await world.goals.list_events(goal_id)
+        if e.kind is GoalEventKind.NEEDS_HUMAN
+    ]
+    assert notices == ["publication_unavailable"]
     # The operator enables publication and resumes: the child publishes, the goal goes on.
     await world.launcher.resume(t1.run_id)
     await world.launcher.publish(t1.run_id, pr_number=7, head_sha="h" * 40, base_sha="b" * 40)

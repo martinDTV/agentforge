@@ -521,8 +521,10 @@ async def test_a_verified_run_that_cannot_publish_stops_resumable_and_publishes_
     ]
     assert RunEventKind.RUN_INTERRUPTED in kinds and RunEventKind.RUN_RESUMED in kinds
     assert RunEventKind.PUBLICATION_PREPARED in kinds
-    # Still nothing remote until a human approves the publication.
+    # Still nothing remote until a human approves the publication: no branch, no pull
+    # request and no write token were ever requested (read tokens serve the mirror only).
     assert world.agentforge_branches() == {} and world.lab.github.pulls == {}
+    assert all("write" not in i["permissions"].values() for i in world.lab.github.tokens.values())
     assert world.model.calls, "Developer and QA ran exactly once; the resume cost no model call"
     calls_before = len(world.model.calls)
     digest = (await service.decisions(run_id, OPERATOR)).pending
