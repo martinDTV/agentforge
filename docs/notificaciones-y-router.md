@@ -116,6 +116,17 @@ publicada y dependencia fusionada. Cada objetivo tiene su propio hilo
 (`<agentforge.goal.<id>.thread@…>`); los correos de sus ejecuciones hijas siguen llegando como
 hasta ahora.
 
+### Caducidades y último aviso (H2)
+
+Cuando una decisión caduca, el correo nombra la etapa real (`alcance`, `publicación` o `plan`)
+tomada del evento `run_expired` o del código `expired:<etapa>` de la ejecución. En los objetivos,
+además del recordatorio a mitad de la ventana, llega un correo "Última llamada" a
+`final_notice_seconds` del cierre (una hora por defecto, configurable por objetivo) cuando la
+ventana es lo bastante larga para distinguirlo del primero. Cada aviso se envía una sola vez,
+también tras reinicios, porque su ordinal en `goal_events` es único por tarea, motivo y etapa.
+Un plan descartado por la compuerta determinista (H1) produce el correo de objetivo fallido con
+el motivo "plan inválido según las restricciones de la plataforma".
+
 ### Diseño de los correos
 
 Asunto: `[AgentForge] <qué ocurrió> — <proyecto>`, sin hashes ni identificadores largos
