@@ -130,7 +130,18 @@ def settle(
         assert response.status_code == 200, response.text
         payload: dict[str, Any] = response.json()
         if payload["status"] not in SETTLING_STATUSES:
-            return payload
+            break
         if time.monotonic() > deadline:
             raise AssertionError(f"run {run_id} did not settle: {payload['status']}")
         time.sleep(0.02)
+    # The status is projected before the background task writes its last audit rows
+    # (``approval_applied``) and fires the settled hook. When the client exposes the
+    # app, also wait for that task to be gone, so a read of events or hooks' effects
+    # right after ``settle`` is not a race.
+    service = getattr(getattr(getattr(client, "app", None), "state", None), "run_service", None)
+    if service is not None:
+        while run_id in service.active_run_ids:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"run {run_id} settled but its task is still active")
+            time.sleep(0.01)
+    return payload
