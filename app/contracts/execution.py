@@ -172,11 +172,21 @@ class EventPage(BaseModel):
 
 
 class SweepResult(BaseModel):
-    """Outcome of one synchronous recovery sweep."""
+    """Outcome of one recovery sweep.
+
+    Classification is synchronous: ``claimed``, ``outcomes`` and ``errors`` describe
+    what the sweep decided. ``launched`` (I0.2) counts the re-drives handed to a
+    background task under the lease the sweep took; those runs are still moving when
+    the response leaves and ``GET /runs/{id}`` shows where they stop.
+    """
 
     claimed: int
     outcomes: dict[str, int]
     errors: int
+    launched: int = Field(
+        default=0,
+        description="Reconducciones lanzadas en segundo plano bajo su lease (no terminadas)",
+    )
     projects: list[str] | None = Field(
         default=None, description="Proyectos barridos; null = todos (projects:all)"
     )

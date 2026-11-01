@@ -290,6 +290,7 @@ async def test_the_sweep_launches_recovered_drives_and_returns(
     report = await asyncio.wait_for(RecoveryService(survivor).sweep(), 5)
 
     assert report.claimed == 1 and report.outcomes == {"resumed": 1}
+    assert report.launched == 1  # launched, not finished
     await asyncio.to_thread(gated.entered.wait, 10)
     assert not gated.release.is_set()  # the model is still "thinking"
     assert str(rid) in survivor.active_run_ids
@@ -374,7 +375,8 @@ async def test_inline_recovery_still_returns_after_the_drive(
         authorization=LENIENT,
         drive_mode="inline",
     )
-    assert (await RecoveryService(inline).sweep()).outcomes == {"resumed": 1}
+    report = await RecoveryService(inline).sweep()
+    assert report.outcomes == {"resumed": 1} and report.launched == 0  # awaited inline
     assert inline.active_run_ids == frozenset()
     assert repo.runs[rid].status is S.WAITING_APPROVAL  # already there when sweep returns
 

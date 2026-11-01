@@ -1,9 +1,10 @@
 """Administrative operations (``recovery:sweep``).
 
-The sweep runs *inside* the request and the response carries the real
-report: no 202 backed only by an in-memory task. The work is bounded by
-``RECOVERY_BATCH_SIZE`` and may include LLM calls when auto-resume is on, so
-clients should allow a long timeout; the periodic sweeper keeps running
+The sweep classifies *inside* the request and the response carries the real
+report of that classification, bounded by ``RECOVERY_BATCH_SIZE``. Re-drives
+are not awaited (I0.2): each is launched as a tracked task under the lease the
+sweep took and counted in ``launched``; it is durable because the lease and the
+checkpoint are, not because of the task. The periodic sweeper keeps running
 regardless of this endpoint.
 """
 
@@ -27,7 +28,8 @@ async def run_recovery_sweep(
     project_id: Annotated[str | None, Query(pattern=PROJECT_ID_PATTERN)] = None,
 ) -> SweepResult:
     """Run one recovery sweep now, limited to the caller's projects unless it
-    holds ``projects:all``. Synchronous; returns what actually happened.
+    holds ``projects:all``. Classification is synchronous; ``launched`` counts the
+    re-drives started in the background (follow them with ``GET /runs/{id}``).
     ``409 sweep_in_progress`` when this instance is already sweeping."""
     scope: AccessScope = recovery.service.authorization.sweep_scope(principal).narrowed_to(
         project_id
@@ -38,5 +40,6 @@ async def run_recovery_sweep(
         claimed=report.claimed,
         outcomes=report.outcomes,
         errors=report.errors,
+        launched=report.launched,
         projects=None if scope.projects is None else sorted(scope.projects),
     )

@@ -35,11 +35,17 @@ from app.orchestration.runs import RecoveryOutcome, RunService
 logger = logging.getLogger(__name__)
 
 
+_LAUNCHED = frozenset({RecoveryOutcome.RESUMED, RecoveryOutcome.APPROVAL_APPLIED})
+
+
 class RecoveryReport(BaseModel):
     claimed: int = 0
     outcomes: dict[str, int] = Field(default_factory=dict)
     errors: int = 0
     expired: int = 0  # waiting runs whose decision window passed (Fase 7)
+    # Re-drives handed to a background task (I0.2): counted in ``outcomes`` as
+    # ``resumed``/``approval_applied`` but not finished when the sweep returns.
+    launched: int = 0
 
     def add(self, outcome: RecoveryOutcome) -> None:
         self.outcomes[outcome.value] = self.outcomes.get(outcome.value, 0) + 1
@@ -125,7 +131,10 @@ class RecoveryService:
         report.claimed = len(claimed)
         for row, lease in claimed:
             try:
-                report.add(await service.recover(row, lease, actor=actor))
+                outcome = await service.recover(row, lease, actor=actor)
+                report.add(outcome)
+                if outcome in _LAUNCHED and service.drive_mode == "background":
+                    report.launched += 1
             except (LeaseLostError, ShuttingDownError):
                 report.add(RecoveryOutcome.SKIPPED)
             except DatabaseUnavailableError as exc:
@@ -141,9 +150,10 @@ class RecoveryService:
                     pass
         if report.touched:
             logger.info(
-                "Barrido de recuperación: %d reclamados, %s, %d errores",
+                "Barrido de recuperación: %d reclamados, %s, %d lanzados, %d errores",
                 report.claimed,
                 report.outcomes or "sin cambios",
+                report.launched,
                 report.errors,
             )
         return report

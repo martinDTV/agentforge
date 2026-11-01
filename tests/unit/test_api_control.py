@@ -379,6 +379,7 @@ def test_sweep_is_synchronous_permissioned_and_scoped(
         "claimed": 1,
         "outcomes": {"interrupted": 1},
         "errors": 0,
+        "launched": 0,  # classified only; nothing was driven
         "projects": ["alpha"],
     }
     # Synchronous: the row is already updated when the response arrives.
@@ -430,6 +431,7 @@ def test_manual_sweep_launches_recovered_drives_and_answers_at_once(
             swept = pool.submit(lambda: client.post(SWEEPS, headers=root)).result(timeout=10)
         assert swept.status_code == 200, swept.text
         assert swept.json()["claimed"] == 1 and swept.json()["outcomes"] == {"resumed": 1}
+        assert swept.json()["launched"] == 1  # launched, not finished (I0.2)
         assert gated.entered.wait(10) and not gated.release.is_set()
         row = repository.runs[uuid.UUID(run_id)]
         assert row.status is S.RUNNING and row.lease_owner == app.state.run_service.owner
