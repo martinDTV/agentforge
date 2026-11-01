@@ -109,6 +109,15 @@ Hasta la 1.0-estabilización, `POST /runs`, `POST /approve` y `POST /resume` con
 
 Límites conocidos: el barrido periódico sigue reconduciendo dentro de su propia tarea (un run reanudado ocupa el barrido hasta su siguiente parada) y el barrido manual sigue siendo síncrono; una cola de trabajo separada del proceso web queda fuera de esta iteración (I0.2+).
 
+## Actualización I0.2 (2026-10-31): barrido no bloqueante y modelo fuera del bucle de eventos
+
+Dos restos de la conducción síncrona quedaban tras I0.1:
+
+- **El barrido conducía dentro de su propia tarea.** `recover` esperaba `_apply_decision`, `_restart_from_input` o `_redrive` hasta la siguiente parada del run, de modo que un lote con una reconducción ocupaba el barrido periódico durante minutos y el barrido manual (`POST /admin/recovery/sweeps`) retenía la petición. Ahora `recover` clasifica, toma las decisiones durables (intento, estado, evento `run_resumed`) y entrega la conducción a `_launch_recovery`, que en modo `background` la lanza como tarea rastreada bajo el lease que el barrido tomó, igual que `create`, `approve` y `resume`, y en modo `inline` la espera. El informe del barrido conserva sus claves (`resumed`, `approval_applied`): en la API significan "lanzada"; el estado final se lee con `GET /runs/{id}`. Si este proceso ya conduce ese run (`run_busy`), el lease se libera al instante y el informe cuenta `skipped`. El apagado cancela también estas tareas y libera sus leases; el siguiente barrido continúa desde el checkpoint.
+- **El clasificador del Smart Router corría sobre el bucle de eventos.** `router_node` es `async` y llamaba a `SmartRouter.decide` (una llamada síncrona a `LLMPort`) directamente; mientras el modelo respondía, ninguna petición de la API avanzaba. Ahora se ejecuta con `asyncio.to_thread`, como el Scoper, Developer, QA, el Publisher y la sonda de GitHub. Planner y Architect son nodos síncronos que LangGraph ya ejecuta en su executor; el gateway de herramientas ya usaba `to_thread`; el worker de correo también.
+
+Sin cambios de contrato, presupuesto, identidad, concurrencia ni Publisher; sin tablas ni servicios nuevos. Pruebas: el barrido devuelve `resumed` mientras el planificador sigue bloqueado y otras operaciones (lecturas, otro barrido, una creación) avanzan; un segundo conductor en el mismo proceso se rechaza y libera el lease; el apagado cancela una reconducción lanzada por el barrido y el siguiente barrido la retoma; la API responde `GET /health/live` y `GET /runs/{id}` mientras el clasificador bloquea; el modo `inline` sigue siendo síncrono.
+
 ## Consequences
 
 - Reiniciar, matar o escalar el proceso deja de perder decisiones ni ejecuciones: todo lo que estaba a medias se clasifica desde el checkpoint en el siguiente barrido.
