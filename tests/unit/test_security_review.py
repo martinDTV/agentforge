@@ -26,6 +26,7 @@ from app.security import AuthorizationPolicy, JwtVerifier, VerificationRules
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import StaticKeys
 from app.settings import get_environment
+from tests.conftest import settle
 from tests.unit.test_api_control import abandoned_run, bearer
 
 T = TypeVar("T", bound=BaseModel)
@@ -239,26 +240,38 @@ class GatedLLM:
 def test_manual_sweeps_fail_fast_while_another_sweep_runs(
     fake_llm: FakeLLMAdapter, issuer: DevIssuer, repository: InMemoryRunRepository
 ):
-    gated = GatedLLM(fake_llm)
+    """The per-instance sweep lock answers ``409`` at once while another sweep holds it.
+    Since I0.2 a sweep returns as soon as its batch is classified (the re-drives run
+    detached), so the slow part here is claiming the batch itself."""
     policy = RecoveryPolicy(
         lease_ttl_seconds=5, heartbeat_seconds=1, auto_resume=True, max_attempts=3
     )
-    app = make_app(gated, issuer, repository, policy=policy)
+    app = make_app(fake_llm, issuer, repository, policy=policy)
     root = bearer(issuer, "root", ["platform_admin"], [])
+    entered, release = threading.Event(), threading.Event()
+    original = repository.claim_expired_leases
+
+    async def slow_claim(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await asyncio.to_thread(release.wait, 15)  # claiming the batch takes a while
+        return await original(*args, **kwargs)
+
+    repository.claim_expired_leases = slow_claim  # type: ignore[method-assign]
     with TestClient(app) as client:
-        abandoned_run(app, repository, fake_llm, owner="alice", project="alpha")
+        run_id = abandoned_run(app, repository, fake_llm, owner="alice", project="alpha")
         with ThreadPoolExecutor(max_workers=1) as pool:
             long_sweep = pool.submit(
                 lambda: client.post("/api/v1/admin/recovery/sweeps", headers=root)
             )
-            assert gated.entered.wait(15)  # the first sweep is re-driving a run
+            assert entered.wait(15)  # the first sweep holds the lock
             assert app.state.recovery.sweeping is True
             busy = client.post("/api/v1/admin/recovery/sweeps", headers=root)
             assert busy.status_code == 409 and busy.json()["code"] == "sweep_in_progress"
-            gated.release.set()
+            release.set()
             done = long_sweep.result(timeout=15)
         assert done.status_code == 200 and done.json()["outcomes"] == {"resumed": 1}
         assert app.state.recovery.sweeping is False
+        settle(client, run_id, headers=root)  # the re-drive the sweep launched (I0.2)
         assert client.post("/api/v1/admin/recovery/sweeps", headers=root).json()["claimed"] == 0
 
 

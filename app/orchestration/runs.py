@@ -153,6 +153,9 @@ class CreateResult(BaseModel):
 
 class RecoveryOutcome(StrEnum):
     REPROJECTED = "reprojected"  # checkpoint had moved on; the row just caught up
+    # In background mode (the API, I0.2) ``approval_applied`` and ``resumed`` mean the
+    # drive was *launched* under the lease the sweep took; it finishes on its own and
+    # projects the row as any other drive. Inline mode awaits it before returning.
     APPROVAL_APPLIED = "approval_applied"  # recorded decision applied to the graph
     INTERRUPTED = "interrupted"  # pending work, left recoverable (auto-resume off)
     RESUMED = "resumed"  # re-driven from the last checkpoint
@@ -731,11 +734,19 @@ class RunService:
         """
         rid = row.id
         async with self._lock(rid):
+            if self._busy(rid):
+                # This process still runs a task for the run (its lease expired or was
+                # lost and the task has not noticed yet): never two drivers here, and no
+                # attempt is spent. The lease goes back so the next sweep looks again.
+                await self._repository.release_lease(rid, lease)
+                return RecoveryOutcome.SKIPPED
             snapshot = await self._reader_for(row.workflow_kind).aget_state(_config(rid))
             if row.status is _S.RESUME_PENDING:
                 decision = await self._repository.get_pending_decision(rid)
                 if decision is not None:
-                    await self._apply_decision(rid, decision, lease)
+                    work = self._apply_decision(rid, decision, lease)
+                    if not await self._launch_recovery(rid, work, lease):
+                        return RecoveryOutcome.SKIPPED
                     return RecoveryOutcome.APPROVAL_APPLIED
                 await self._project(rid, lease=lease, release=True)
                 return RecoveryOutcome.REPROJECTED
@@ -759,9 +770,11 @@ class RunService:
                 attempt = await self._repository.bump_attempt(rid, lease)
                 if attempt is None:
                     raise LeaseLostError(str(rid))
-                await self._restart_from_input(
+                work = self._restart_from_input(
                     rid, row, snapshot, lease, actor=actor, attempt=attempt
                 )
+                if not await self._launch_recovery(rid, work, lease):
+                    return RecoveryOutcome.SKIPPED
                 return RecoveryOutcome.RESUMED
 
             if row.workflow_kind is WorkflowKind.DEVELOPMENT:
@@ -780,7 +793,9 @@ class RunService:
                     attempt = await self._repository.bump_attempt(rid, lease)
                     if attempt is None:
                         raise LeaseLostError(str(rid))
-                    await self._redrive(rid, row, snapshot, lease, actor=actor, attempt=attempt)
+                    work = self._redrive(rid, row, snapshot, lease, actor=actor, attempt=attempt)
+                    if not await self._launch_recovery(rid, work, lease):
+                        return RecoveryOutcome.SKIPPED
                     return RecoveryOutcome.RESUMED
                 # Writes, billable calls and sandbox programs with unknown
                 # outcome are never repeated implicitly (ADR 0008).
@@ -797,8 +812,24 @@ class RunService:
             attempt = await self._repository.bump_attempt(rid, lease)
             if attempt is None:
                 raise LeaseLostError(str(rid))
-            await self._redrive(rid, row, snapshot, lease, actor=actor, attempt=attempt)
+            work = self._redrive(rid, row, snapshot, lease, actor=actor, attempt=attempt)
+            if not await self._launch_recovery(rid, work, lease):
+                return RecoveryOutcome.SKIPPED
             return RecoveryOutcome.RESUMED
+
+    async def _launch_recovery(
+        self, rid: UUID, work: Coroutine[Any, Any, None], lease: LeaseToken
+    ) -> bool:
+        """Start a recovery drive: awaited in inline mode, a tracked background task in
+        background mode (I0.2), so a sweep classifies its whole batch and returns while
+        the drives run under the leases it took. False when this process already
+        drives the run (the lease is released at once so the next sweep sees it)."""
+        try:
+            await self._dispatch(rid, work, purpose="recover")
+        except RunBusyError:
+            await self._repository.release_lease(rid, lease)
+            return False
+        return True
 
     async def _redrive(
         self,
@@ -919,6 +950,11 @@ class RunService:
     def _lock(self, rid: UUID) -> asyncio.Lock:
         return self._locks.setdefault(str(rid), asyncio.Lock())
 
+    def _busy(self, rid: UUID) -> bool:
+        """A background task of this process is still working on ``rid`` (I0.2)."""
+        current = self._launched.get(str(rid))
+        return current is not None and not current.done()
+
     @asynccontextmanager
     async def _driving(self, rid: UUID, task: asyncio.Task[None]) -> AsyncIterator[None]:
         key = str(rid)
@@ -952,8 +988,7 @@ class RunService:
             await work
             return
         key = str(rid)
-        current = self._launched.get(key)
-        if current is not None and not current.done():
+        if self._busy(rid):
             work.close()
             raise RunBusyError(key)
         task = asyncio.create_task(

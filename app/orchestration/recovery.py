@@ -14,6 +14,12 @@ run from its checkpoint:
 - pending work, attempts exhausted        -> ``failed`` / ``abandoned``
 
 Nothing in ``running`` is ever marked failed just for being in ``running``.
+
+The sweep classifies every claimed run and, when a run has to be driven, launches
+the drive the way the service is configured (I0.2): as a tracked background task
+in the API (``drive_mode="background"``), so a sweep returns as soon as its batch
+is classified and never holds other sweeps or requests; awaited inline for
+operator scripts and tests. The lease and heartbeat are the same either way.
 """
 
 import asyncio
