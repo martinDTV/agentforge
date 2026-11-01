@@ -1,7 +1,10 @@
 """route_mode through the API and the route in the response (fakes only)."""
 
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -106,3 +109,75 @@ def test_route_mode_is_accepted_bounded_and_reported(client: TestClient, issuer:
     assert bad.status_code == 422
     shown = client.get(f"{RUNS}/{auto['run_id']}", headers=olivia).json()
     assert shown["route"] == "fast" and shown["route_mode"] == "auto"
+
+
+class GatedClassifier:
+    """Blocks the classification call until released; signals entry first."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def generate_structured(self, system_prompt: str, user_prompt: str, schema: Any) -> Any:
+        if schema is TaskClassification:
+            self.entered.set()
+            assert self.release.wait(10), "la prueba no liberó al clasificador"
+        return self.inner.generate_structured(system_prompt, user_prompt, schema)
+
+
+def test_the_api_answers_while_the_classifier_is_thinking(
+    fake_llm: FakeLLMAdapter, issuer: DevIssuer, tmp_path: Path
+):
+    """I0.2: a synchronous model call inside the router must not hold the event loop;
+    liveness and run reads are served while it runs (bounded, no fixed sleeps)."""
+    from app.contracts.planning import ArchitectureReview, DevelopmentPlan
+
+    box = make_sandbox(tmp_path, project=PROJECT, repository=REPO)
+    llm = scoped_llm(fake_llm)
+    llm.register(TaskClassification, low_risk())
+    llm.register(DevelopmentPlan, plan())
+    llm.register(ArchitectureReview, review(True))
+    gated = GatedClassifier(llm)
+    verifier = JwtVerifier(
+        StaticKeys(issuer.jwks), VerificationRules(issuer=issuer.issuer, audience=issuer.audience)
+    )
+    app = create_app(
+        gated,
+        RunLimits(),
+        repository=InMemoryRunRepository(),
+        token_verifier=verifier,
+        authorization=AuthorizationPolicy(separation_of_duties=False),
+        tool_audit=InMemoryToolInvocationRepository(),
+        worktrees=box.manager,
+        sandbox=FakeSandbox(),
+        projects=ProjectPolicyRegistry(
+            [
+                RepositoryPolicy(
+                    repository_id=REPO, project_id=PROJECT, writable_globs=["src/**", "tests/**"]
+                )
+            ]
+        ),
+        router=SmartRouter(gated),
+    )
+    headers = bearer(issuer, "olivia", ["project_operator"])
+    body = {
+        "task": "Añade greet en src/app.py y pruebas",
+        "project_id": PROJECT,
+        "workflow_kind": "development",
+        "repository_id": REPO,
+    }
+    with TestClient(app) as client:
+        created = client.post(RUNS, json=body, headers=headers)
+        assert created.status_code == 201 and created.json()["status"] == "running"
+        run_id = created.json()["run_id"]
+        assert gated.entered.wait(10)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            live = pool.submit(lambda: client.get("/health/live")).result(timeout=5)
+            detail = pool.submit(lambda: client.get(f"{RUNS}/{run_id}", headers=headers)).result(
+                timeout=5
+            )
+        assert live.status_code == 200 and detail.json()["status"] == "running"
+        assert not gated.release.is_set()
+        gated.release.set()
+        assert settle(client, run_id, headers=headers)["status"] == "waiting_approval"

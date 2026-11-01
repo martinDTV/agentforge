@@ -295,7 +295,11 @@ def build_scoped_development_graph(
                 )
                 calls = 0
             else:
-                decision = runtime.router.decide(
+                # The classifier is one synchronous model call (``LLMPort``): off the
+                # event loop, like every other agent call, so the API keeps answering
+                # while the model works (I0.2).
+                decision = await asyncio.to_thread(
+                    runtime.router.decide,
                     state["task"],
                     mode=mode,
                     allow_fast=policy.allow_fast_route,

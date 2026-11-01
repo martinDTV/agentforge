@@ -1,12 +1,15 @@
-"""Control API: scoped listing, paginated audit, manual resume, synchronous sweeps."""
+"""Control API: scoped listing, paginated audit, manual resume, sweeps that classify
+synchronously and launch any re-drive as a background task (I0.2)."""
 
 import asyncio
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from langgraph.graph import START
 
 from app.contracts.lifecycle import RunLifecycleStatus
 from app.contracts.planning import DevelopmentPlan
@@ -93,6 +96,47 @@ def abandoned_run(
     asyncio.run(_make())
     repository.expire_lease(rid)
     return str(rid)
+
+
+def never_started_run(
+    app: Any, repository: InMemoryRunRepository, *, owner: str, project: str
+) -> str:
+    """Row accepted by a dead process with only its input checkpoint, lease expired."""
+    rid = uuid.uuid4()
+
+    async def _make() -> None:
+        await repository.create_run(
+            rid,
+            TASK["task"],
+            owner="dead-process",
+            ttl_seconds=60,
+            owner_subject=owner,
+            project_id=project,
+        )
+        await app.state.run_service.graph.aupdate_state(
+            {"configurable": {"thread_id": str(rid)}},
+            {"task": TASK["task"], "workflow_kind": "planning"},
+            as_node=START,
+        )
+
+    asyncio.run(_make())
+    repository.expire_lease(rid)
+    return str(rid)
+
+
+class GatedLLM:
+    """Blocks the planner until released; signals entry first."""
+
+    def __init__(self, inner: FakeLLMAdapter) -> None:
+        self.inner = inner
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def generate_structured(self, system_prompt: str, user_prompt: str, schema: Any) -> Any:
+        if schema is DevelopmentPlan:
+            self.entered.set()
+            assert self.release.wait(15), "la prueba no liberó al planner"
+        return self.inner.generate_structured(system_prompt, user_prompt, schema)
 
 
 def interrupted_run(
@@ -335,6 +379,7 @@ def test_sweep_is_synchronous_permissioned_and_scoped(
         "claimed": 1,
         "outcomes": {"interrupted": 1},
         "errors": 0,
+        "launched": 0,  # classified only; nothing was driven
         "projects": ["alpha"],
     }
     # Synchronous: the row is already updated when the response arrives.
@@ -360,3 +405,40 @@ def test_sweep_is_synchronous_permissioned_and_scoped(
         ]
         == 0
     )
+
+
+def test_manual_sweep_launches_recovered_drives_and_answers_at_once(
+    fake_llm: FakeLLMAdapter, issuer: DevIssuer, repository: InMemoryRunRepository
+):
+    """I0.2: the sweep classifies, launches the drive under the lease it took and
+    returns; the drive finishes on its own and the API keeps answering meanwhile."""
+    gated = GatedLLM(fake_llm)
+    verifier = JwtVerifier(
+        StaticKeys(issuer.jwks), VerificationRules(issuer=issuer.issuer, audience=issuer.audience)
+    )
+    app = create_app(
+        gated,
+        RunLimits(),
+        repository=repository,
+        token_verifier=verifier,
+        authorization=AuthorizationPolicy(separation_of_duties=False),
+        policy=RecoveryPolicy(lease_ttl_seconds=5, heartbeat_seconds=1, max_attempts=3),
+    )
+    root = bearer(issuer, "root", ["platform_admin"], [])
+    with TestClient(app) as client:
+        run_id = never_started_run(app, repository, owner="alice", project="alpha")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            swept = pool.submit(lambda: client.post(SWEEPS, headers=root)).result(timeout=10)
+        assert swept.status_code == 200, swept.text
+        assert swept.json()["claimed"] == 1 and swept.json()["outcomes"] == {"resumed": 1}
+        assert swept.json()["launched"] == 1  # launched, not finished (I0.2)
+        assert gated.entered.wait(10) and not gated.release.is_set()
+        row = repository.runs[uuid.UUID(run_id)]
+        assert row.status is S.RUNNING and row.lease_owner == app.state.run_service.owner
+        assert row.attempt == 2
+        # Nothing free for a second sweep; reads keep working while the model "thinks".
+        assert client.post(SWEEPS, headers=root).json()["claimed"] == 0
+        assert client.get(f"{RUNS}/{run_id}", headers=root).json()["status"] == "running"
+        gated.release.set()
+        assert settle(client, run_id, headers=root)["status"] == "waiting_approval"
+        assert repository.runs[uuid.UUID(run_id)].lease_owner is None

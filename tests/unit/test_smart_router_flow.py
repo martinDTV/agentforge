@@ -4,9 +4,12 @@ any write, mandatory rules over a requested fast mode, classifier failure, recov
 of the chosen route from the checkpoint, and the notifications every transition
 leaves in the outbox."""
 
+import asyncio
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,7 +40,7 @@ from app.notifications import (
     NotificationWorker,
 )
 from app.orchestration.graph import build_graph
-from app.orchestration.runs import RunService
+from app.orchestration.runs import DriveMode, RunService
 from app.orchestration.scoped_development import DevelopmentRuntime, build_scoped_development_graph
 from app.projects import ProjectPolicyRegistry, RepositoryPolicy
 from app.routing import SmartRouter, TaskClassification
@@ -165,7 +168,9 @@ class RouterWorld:
         )
         self.graph = build_scoped_development_graph(self.runtime)
 
-    def service(self, *, default_mode: RouteMode = RouteMode.AUTO) -> RunService:
+    def service(
+        self, *, default_mode: RouteMode = RouteMode.AUTO, drive_mode: DriveMode = "inline"
+    ) -> RunService:
         return RunService(
             build_graph(self.model),
             self.repository,
@@ -177,7 +182,7 @@ class RouterWorld:
             policies=self.policies,
             clock=lambda: self.now,
             default_route_mode=default_mode,
-            drive_mode="inline",
+            drive_mode=drive_mode,
         )
 
     async def start(
@@ -201,6 +206,41 @@ class RouterWorld:
 
     async def mails(self) -> list[NotificationKind]:
         return [i.kind for i in sorted(await self.outbox.list_items(limit=200), key=lambda i: i.id)]
+
+
+class GatedClassifier:
+    """Blocks the classification call until released; signals entry first."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def generate_structured(self, system_prompt: str, user_prompt: str, schema: Any) -> Any:
+        if schema is TaskClassification:
+            self.entered.set()
+            assert self.release.wait(10), "la prueba no liberó al clasificador"
+        return self.inner.generate_structured(system_prompt, user_prompt, schema)
+
+
+async def test_the_service_keeps_answering_while_the_classifier_thinks(tmp_path: Path):
+    """I0.2: the classifier is one synchronous model call; it runs off the event loop
+    like every other agent call, so reads and other work proceed meanwhile."""
+    world = RouterWorld(tmp_path)
+    gated = GatedClassifier(world.model)
+    world.runtime.router = SmartRouter(gated, clock=lambda: world.now)
+    service = world.service(drive_mode="background")
+    run_id = await world.start(service)
+    await asyncio.wait_for(asyncio.to_thread(gated.entered.wait, 10), 12)
+
+    assert not gated.release.is_set()
+    assert (await asyncio.wait_for(service.get(run_id, OPERATOR), 2)).status == "running"
+    assert (await asyncio.wait_for(service.decisions(run_id, OPERATOR), 2)).pending is None
+
+    gated.release.set()
+    assert await service.wait_until_settled(run_id, 20)
+    assert (await service.get(run_id, OPERATOR)).status == "waiting_approval"
+    assert world.model.calls[0][2] is TaskClassification
 
 
 async def test_a_small_task_takes_the_fast_route_and_is_notified_at_each_transition(tmp_path: Path):
