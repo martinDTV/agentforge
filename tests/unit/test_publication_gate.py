@@ -18,6 +18,7 @@ from app.projects import ProjectPolicyRegistry, RepositoryPolicy
 from app.security import AuthorizationPolicy
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import JwtVerifier, StaticKeys, VerificationRules
+from tests.conftest import settle
 from tests.unit.git_fixtures import make_sandbox
 from tests.unit.test_api_development import BODY, RUNS, bearer, scoped_llm
 from tests.unit.test_mirror_service import remote_spec
@@ -91,7 +92,9 @@ def test_local_repositories_are_not_gated_and_still_complete(
     for client in _client(fake_llm, issuer, tmp_path / "local", remote=False, gate=Deny()):
         response = client.post(RUNS, json=body, headers=headers)
         assert response.status_code == 201, response.text
-        assert response.json()["status"] == "waiting_approval"
+        assert settle(client, response.json()["run_id"], headers=headers)["status"] == (
+            "waiting_approval"
+        )
 
 
 def test_the_gate_answers_from_configuration_only():

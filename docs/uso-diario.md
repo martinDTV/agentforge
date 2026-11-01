@@ -50,6 +50,11 @@ Modos de ruta:
 Equivalente HTTP: `POST /api/v1/runs` con `task`, `project_id`, `workflow_kind: development`,
 `repository_id` y opcionalmente `route_mode`.
 
+La respuesta llega en cuanto la ejecución es durable (`201`, `status: running`): el Scoper corre
+en segundo plano, separado de la petición, y la siguiente parada (`waiting_approval` en etapa
+`scope`) se ve con `show <run_id>`, `runs --status waiting_approval` o por correo. `task --wait 90`
+sigue la ejecución con `GET` hasta esa parada durante como mucho 90 s; nunca repite la creación.
+
 ## 2b. Asignar un objetivo (Fase 8)
 
 En lugar de crear cada tarea a mano, describe el objetivo y deja que el Supervisor lo
@@ -92,6 +97,13 @@ uv run python -m scripts.agentforge reject  <run_id> --reason "por qué"   # el 
 
 La aprobación viaja con el digest exacto mostrado: si la propuesta cambia, la decisión no
 aplica. En la ruta `full` la primera decisión es el plan (`stage: plan`), con el mismo mando.
+
+`approve` y `reject` responden en cuanto la decisión está registrada (`status: resume_pending`);
+Developer, QA y la preparación de la publicación siguen en segundo plano. Por defecto el mando
+sigue la ejecución con `GET` hasta 120 s (`--wait 0` para volver de inmediato) y, si no terminó,
+lo dice: continúa con `show <run_id>`. Si la respuesta se perdió (tiempo de espera del cliente),
+la decisión puede estar registrada igualmente: mira `pending <run_id>` antes de repetir; repetir
+la misma decisión es idempotente y la contraria responde `409`.
 
 ## 4. Aprobar la publicación
 
@@ -182,5 +194,11 @@ decisiones, eventos y publicaciones no se tocan. El respaldo del 2026-10-27 est�
 - Un correo no llega: `scripts.notifications list --status failed --status dead` y
   `scripts.notifications requeue <id>`; el fallo del correo nunca afecta a la ejecución.
 - Una aprobación devuelve 409: la propuesta cambió o caducó; vuelve a `pending`.
+- Una aprobación o una tarea "no respondió a tiempo": la decisión o la ejecución puede estar
+  registrada igualmente (la API las persiste antes de responder). `show`/`pending` antes de repetir;
+  nunca crees otra tarea para "ver si avanza".
+- Una ejecución aceptada que sigue `running` sin lease tras un reinicio: el barrido de
+  recuperación la reanuda solo desde su checkpoint de entrada en el siguiente tic; no hace falta
+  `resume`.
 - Publicación `interrupted`: `POST /api/v1/runs/<id>/resume` o espera al barrido; nunca se
   repite la aprobación.

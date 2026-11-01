@@ -1,13 +1,15 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from functools import partial
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.graph import START
 from langgraph.types import Command, StateSnapshot
 from pydantic import BaseModel, ConfigDict
 
@@ -40,6 +42,7 @@ from app.orchestration.exceptions import (
     RepositoryNotAuthorizedError,
     RepositoryRequiredError,
     RunAlreadyDecidedError,
+    RunBusyError,
     RunNotCancellableError,
     RunNotFoundError,
     RunNotResumableError,
@@ -65,6 +68,7 @@ from app.orchestration.status import (
     checkpoint_id_of,
     derive_status,
     has_pending_interrupt,
+    never_started,
     pending_decision,
 )
 from app.projects import PolicyError, ProjectPolicyRegistry
@@ -75,6 +79,14 @@ logger = logging.getLogger(__name__)
 ABANDONED_CODE = "abandoned"
 _S = RunLifecycleStatus
 _WAITING = frozenset({_S.WAITING_APPROVAL, _S.RESUME_PENDING})
+
+# How a use case hands the graph to the engine (I0.1). ``background``: the row and
+# the input checkpoint are written, a tracked task drives the graph and the HTTP
+# response leaves at once; this is what the API runs. ``inline``: the caller awaits
+# the whole drive (operator scripts and orchestration tests that assert on the
+# settled outcome). Durability never depends on the mode: in both, a crash after
+# the response leaves a lease that expires and a checkpoint recovery can resume.
+DriveMode = Literal["background", "inline"]
 
 
 _RESUMABLE_PUBLICATION_STATES = frozenset(
@@ -216,6 +228,8 @@ class RunService:
         clock: Callable[[], datetime] | None = None,
         default_route_mode: RouteMode = RouteMode.AUTO,
         publishing: PublicationAvailability | None = None,
+        drive_mode: DriveMode = "background",
+        on_settled: TerminalHook | None = None,
     ) -> None:
         # ``graph`` reads any run's checkpoint (every workflow shares RunState);
         # ``graphs`` says which compiled graph may *drive* each workflow kind.
@@ -226,6 +240,10 @@ class RunService:
         )
         self._policies = policies
         self._on_terminal = on_terminal
+        # Called when a background drive stops for any reason (a human decision, the
+        # end, a failure), with the row as it reads then; the goal Supervisor uses it
+        # to reconcile at once instead of waiting for its next tick. Best effort.
+        self._on_settled = on_settled
         self._publishing = publishing
         self._default_route_mode = default_route_mode
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -235,7 +253,12 @@ class RunService:
         # on and nothing is granted beyond what the principal's roles map to.
         self._authz = authorization or AuthorizationPolicy()
         self._owner = owner or new_owner_id()
+        self._drive_mode: DriveMode = drive_mode
         self._drives: dict[str, asyncio.Task[None]] = {}
+        # Background use-case tasks (create/approve/resume) by run id, from the moment
+        # they are scheduled until they finish: ``shutdown`` cancels them and
+        # ``wait_until_settled`` awaits them.
+        self._launched: dict[str, asyncio.Task[None]] = {}
         self._idle = asyncio.Event()
         self._idle.set()
         self._locks: dict[str, asyncio.Lock] = {}
@@ -268,8 +291,12 @@ class RunService:
         return self._accepting
 
     @property
+    def drive_mode(self) -> DriveMode:
+        return self._drive_mode
+
+    @property
     def active_run_ids(self) -> frozenset[str]:
-        return frozenset(self._drives)
+        return frozenset(self._drives) | frozenset(self._launched)
 
     async def wait_until_idle(self, timeout: float) -> bool:
         try:
@@ -277,6 +304,19 @@ class RunService:
         except TimeoutError:
             return False
         return True
+
+    async def wait_until_settled(self, run_id: str, timeout: float | None = None) -> bool:
+        """Wait for the background work this process scheduled for ``run_id``.
+
+        True when nothing is pending for the run in this process (the drive
+        finished or was never scheduled here); False on timeout. Tests and the
+        operator CLI use it; the API never does.
+        """
+        task = self._launched.get(str(_parse(run_id)))
+        if task is None:
+            return True
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        return bool(done)
 
     # -- use cases --------------------------------------------------------------
 
@@ -357,8 +397,14 @@ class RunService:
                 response=await self.get(str(outcome.run.id), principal), created=False
             )
         assert outcome.lease is not None
+        # The whole input becomes the first checkpoint before any node runs: a crash
+        # between this response and the first node leaves a run that recovery can
+        # re-drive from exactly this input (``never_started``), for every workflow.
+        await self._seed(rid, graph_input, graph)
         async with self._lock(rid):
-            await self._drive(rid, graph_input, outcome.lease, graph=graph)
+            await self._dispatch(
+                rid, self._drive(rid, None, outcome.lease, graph=graph), purpose="create"
+            )
         return CreateResult(response=await self.get(str(rid), principal), created=True)
 
     async def get(self, run_id: str, principal: Principal) -> RunResponse:
@@ -462,7 +508,11 @@ class RunService:
             assert claim.lease is not None and claim.existing is not None
             # The decision (and who made it) is durable from this point; applying
             # it may still fail and be finished later by apply_pending_approval.
-            await self._apply_decision(rid, claim.existing, claim.lease, actor=principal.subject)
+            await self._dispatch(
+                rid,
+                self._apply_decision(rid, claim.existing, claim.lease, actor=principal.subject),
+                purpose="approve",
+            )
         return await self.get(run_id, principal)
 
     async def cancel(self, run_id: str, principal: Principal) -> RunResponse:
@@ -620,7 +670,11 @@ class RunService:
                 raise RunNotResumableError(run_id, "otro proceso la está reanudando")
             claimed, lease = acquired
             snapshot = await self._reader_for(claimed.workflow_kind).aget_state(_config(rid))
-            await self._redrive(rid, claimed, snapshot, lease, actor=principal.subject)
+            await self._dispatch(
+                rid,
+                self._redrive(rid, claimed, snapshot, lease, actor=principal.subject),
+                purpose="resume",
+            )
         return await self.get(run_id, principal)
 
     async def _visible_row(self, rid: UUID, principal: Principal) -> PersistedRun:
@@ -693,6 +747,22 @@ class RunService:
                 await self._backfill_audit(rid)
                 await self._project(rid, lease=lease, release=True)
                 return RecoveryOutcome.REPROJECTED
+
+            if has_checkpoint and never_started(snapshot):
+                # Accepted, checkpointed, never started (the process died between the
+                # response and the first node, I0.1): nothing happened yet, so the run
+                # is re-driven from its own input, whatever the workflow and without
+                # waiting for a human; attempts still bound it.
+                if row.attempt >= self._policy.max_attempts:
+                    await self._fail_abandoned(rid, snapshot, lease, row.attempt)
+                    return RecoveryOutcome.ABANDONED
+                attempt = await self._repository.bump_attempt(rid, lease)
+                if attempt is None:
+                    raise LeaseLostError(str(rid))
+                await self._restart_from_input(
+                    rid, row, snapshot, lease, actor=actor, attempt=attempt
+                )
+                return RecoveryOutcome.RESUMED
 
             if row.workflow_kind is WorkflowKind.DEVELOPMENT:
                 if _publication_unavailable(row):
@@ -776,6 +846,24 @@ class RunService:
         graph_input: Any = None if has_checkpoint else {"task": row.task}
         await self._drive(rid, graph_input, lease, graph=self._graph_for(row.workflow_kind))
 
+    async def _restart_from_input(
+        self,
+        rid: UUID,
+        row: PersistedRun,
+        snapshot: StateSnapshot,
+        lease: LeaseToken,
+        *,
+        actor: str | None,
+        attempt: int,
+    ) -> None:
+        """Drive a never-started run from its input checkpoint (see ``never_started``)."""
+        graph = self._graph_for(row.workflow_kind)
+        await self._project_status(rid, snapshot, _S.RUNNING, lease)
+        await self._record(
+            rid, [RunEvent(kind=RunEventKind.RUN_RESUMED, ordinal=attempt)], actor=actor
+        )
+        await self._drive(rid, None, lease, actor=actor, graph=graph)
+
     async def _fail_development_interrupted(self, row: PersistedRun, lease: LeaseToken) -> None:
         error = RunError(
             code="development_interrupted",
@@ -807,9 +895,11 @@ class RunService:
         drained = await self.wait_until_idle(grace_seconds)
         cancelled: list[str] = []
         if not drained:
-            for run_id, task in list(self._drives.items()):
+            pending = {**self._launched, **self._drives}
+            for run_id, task in pending.items():
                 task.cancel()
-                cancelled.append(run_id)
+                if run_id not in cancelled:
+                    cancelled.append(run_id)
             await self.wait_until_idle(5.0)
         try:
             released = await self._repository.release_leases_owned_by(self._owner)
@@ -833,13 +923,95 @@ class RunService:
     async def _driving(self, rid: UUID, task: asyncio.Task[None]) -> AsyncIterator[None]:
         key = str(rid)
         self._drives[key] = task
-        self._idle.clear()
+        self._refresh_idle()
         try:
             yield
         finally:
             self._drives.pop(key, None)
-            if not self._drives:
-                self._idle.set()
+            self._refresh_idle()
+
+    def _refresh_idle(self) -> None:
+        if self._drives or self._launched:
+            self._idle.clear()
+        else:
+            self._idle.set()
+
+    async def _seed(self, rid: UUID, graph_input: dict[str, Any], graph: RunGraph) -> None:
+        """Persist the run's input as its first checkpoint, before any node runs."""
+        await graph.aupdate_state(_config(rid), graph_input, as_node=START)
+
+    async def _dispatch(self, rid: UUID, work: Coroutine[Any, Any, None], *, purpose: str) -> None:
+        """Run ``work`` (a drive) inline, or schedule it as a tracked background task.
+
+        The row, its lease and the checkpoint already exist when this is called:
+        the task is an optimisation of latency, never the record of the work. If
+        this process dies before or during the task, the lease expires and the
+        recovery sweep continues from the checkpoint.
+        """
+        if self._drive_mode == "inline":
+            await work
+            return
+        key = str(rid)
+        current = self._launched.get(key)
+        if current is not None and not current.done():
+            work.close()
+            raise RunBusyError(key)
+        task = asyncio.create_task(
+            self._supervise(rid, work, purpose), name=f"run-{purpose}-{key[:8]}"
+        )
+        self._launched[key] = task
+        self._refresh_idle()
+        task.add_done_callback(partial(self._forget, key))
+
+    def _forget(self, key: str, task: asyncio.Task[None]) -> None:
+        if self._launched.get(key) is task:
+            self._launched.pop(key, None)
+        self._refresh_idle()
+
+    async def _supervise(self, rid: UUID, work: Coroutine[Any, Any, None], purpose: str) -> None:
+        """Body of a background use-case task: outcomes land in the row and the audit,
+        never in an HTTP response, so every failure is logged here and the row is left
+        for the reader (``failed`` with its code) or for recovery (lease expiry)."""
+        if not self._accepting:
+            work.close()
+            logger.warning(
+                "Conducción (%s) de %s no iniciada: el servicio se apaga; la recuperación la "
+                "retomará desde su checkpoint",
+                purpose,
+                rid,
+            )
+            return
+        try:
+            await work
+        except asyncio.CancelledError:
+            raise
+        except LeaseLostError as exc:
+            logger.warning("Conducción (%s) de %s detenida: %s", purpose, rid, exc.detail)
+            return
+        except ShuttingDownError:
+            logger.info("Conducción (%s) de %s cancelada por el apagado", purpose, rid)
+            return
+        except DatabaseUnavailableError as exc:
+            logger.warning(
+                "Conducción (%s) de %s interrumpida sin base de datos: %s",
+                purpose,
+                rid,
+                exc.message,
+            )
+            return
+        except Exception:
+            logger.exception("Conducción (%s) de %s falló", purpose, rid)
+        await self._settled(rid)
+
+    async def _settled(self, rid: UUID) -> None:
+        if self._on_settled is None:
+            return
+        try:
+            row = await self._repository.get_run(rid)
+            if row is not None:
+                await self._on_settled(row)
+        except Exception:  # best effort by contract, like the terminal hook
+            logger.exception("El gancho de asentamiento de %s falló", rid)
 
     async def _drive(
         self,

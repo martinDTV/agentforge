@@ -8,6 +8,7 @@ from app.infrastructure.db import Database, SchemaMismatchError
 from app.infrastructure.llm.fake import FakeLLMAdapter
 from app.main import create_app
 from app.orchestration.limits import RunLimits
+from tests.conftest import settle
 from tests.integration.conftest import TemporaryDatabases
 
 READY = "/health/ready"
@@ -31,7 +32,8 @@ def test_ready_is_ok_against_a_migrated_database(
         # Fase 2 behaviour is intact with a database attached.
         created = client.post(RUNS, json={"task": "Crear módulo de pacientes con pruebas"})
         assert created.status_code == 201
-        assert created.json()["status"] == "waiting_approval"
+        assert created.json()["status"] == "running"  # accepted; driven detached (I0.1)
+        assert settle(client, created.json()["run_id"])["status"] == "waiting_approval"
 
 
 def test_startup_fails_fast_when_the_schema_is_not_at_head(

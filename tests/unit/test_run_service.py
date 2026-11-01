@@ -37,6 +37,7 @@ def make_service(
         build_graph(llm, limits),  # type: ignore[arg-type]
         repository or InMemoryRunRepository(),
         authorization=LENIENT,
+        drive_mode="inline",
     )
 
 

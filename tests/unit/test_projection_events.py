@@ -2,7 +2,7 @@
 
 from langgraph.types import Interrupt
 
-from app.contracts.lifecycle import RunEventKind, RunLifecycleStatus
+from app.contracts.lifecycle import DecisionStage, RunEventKind, RunLifecycleStatus
 from app.orchestration.events import events_from_update, revision_from_update, transition_events
 from app.orchestration.projection import build_projection, projection_differs, resolve_status
 from tests.unit.test_status import snapshot
@@ -32,6 +32,42 @@ def test_build_projection_reads_counters_results_and_checkpoint_id():
     assert (projection.revision, projection.llm_calls) == (1, 4)
     assert projection.plan == PLAN and projection.checkpoint_id == "cp-9"
     assert projection.error is None
+
+
+def test_resume_pending_keeps_the_decided_stage_while_its_drive_is_in_flight():
+    """I0.1: a reader projecting during the background drive of a recorded scope
+    decision must not drop the stage; otherwise the drive's own final projection
+    cannot tell "paused again at publish" from "still at scope" and the row stays
+    ``resume_pending`` forever."""
+    mid_drive = snapshot({"task": "t", "revision": 1, "llm_calls": 3}, ("developer",))
+    reader = build_projection(
+        mid_drive, current=S.RESUME_PENDING, in_flight=True, current_stage=DecisionStage.SCOPE
+    )
+    assert reader.status is S.RESUME_PENDING and reader.pending_stage is DecisionStage.SCOPE
+    assert reader.approval_deadline is None and reader.llm_calls == 3
+
+    paused_at_publish = snapshot(
+        {"task": "t", "revision": 1, "llm_calls": 3},
+        ("approve_publish",),
+        interrupts=(Interrupt(value={"kind": "approve_publish", "digest": "d" * 64}, id="i"),),
+    )
+    final = build_projection(
+        paused_at_publish,
+        current=S.RESUME_PENDING,
+        in_flight=False,
+        current_stage=DecisionStage.SCOPE,
+    )
+    assert final.status is S.WAITING_APPROVAL and final.pending_stage is DecisionStage.PUBLISH
+    # The same pause seen against the same stage is not forward progress.
+    same_stage = build_projection(
+        paused_at_publish,
+        current=S.RESUME_PENDING,
+        in_flight=False,
+        current_stage=DecisionStage.PUBLISH,
+    )
+    assert (
+        same_stage.status is S.RESUME_PENDING and same_stage.pending_stage is DecisionStage.PUBLISH
+    )
 
 
 def test_projection_differs_detects_checkpoint_drift_only_when_present():

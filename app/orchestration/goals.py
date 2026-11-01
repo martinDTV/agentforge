@@ -307,6 +307,15 @@ class GoalCoordinator:
 
     async def on_run_terminal(self, row: PersistedRun) -> None:
         """``RunService`` terminal hook: a child or a plan run ended."""
+        await self._kick_for_run(row)
+
+    async def on_run_settled(self, row: PersistedRun) -> None:
+        """``RunService`` settled hook (I0.1): a background drive of a child or a plan
+        run stopped (a decision is pending, it ended or it failed). Same reaction as a
+        terminal row: reconcile that goal now; the reconciliation reads the truth."""
+        await self._kick_for_run(row)
+
+    async def _kick_for_run(self, row: PersistedRun) -> None:
         task = await self._goals.find_task_by_run(row.id)
         if task is not None:
             self.kick(task.goal_id)

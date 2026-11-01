@@ -65,7 +65,12 @@ def make(
 ) -> tuple[RunService, InMemoryRunRepository]:
     repo = repository or InMemoryRunRepository()
     return RunService(
-        build_graph(llm), repo, policy or FAST, owner=owner, authorization=LENIENT
+        build_graph(llm),
+        repo,
+        policy or FAST,
+        owner=owner,
+        authorization=LENIENT,
+        drive_mode="inline",
     ), repo
 
 
@@ -239,7 +244,11 @@ async def test_recovery_from_scratch_when_the_owner_died_before_any_checkpoint(
 
     resuming, _ = make(fake_llm, FAST.model_copy(update={"auto_resume": True}), repo)
     resuming = RunService(
-        service.graph, repo, FAST.model_copy(update={"auto_resume": True}), authorization=LENIENT
+        service.graph,
+        repo,
+        FAST.model_copy(update={"auto_resume": True}),
+        authorization=LENIENT,
+        drive_mode="inline",
     )
     assert (await RecoveryService(resuming).sweep()).outcomes == {"resumed": 1}
     assert repo.runs[rid].status is S.WAITING_APPROVAL and repo.runs[rid].attempt == 2
@@ -277,7 +286,14 @@ async def test_recovery_applies_a_decision_recorded_by_a_dead_process(fake_llm: 
 async def test_two_concurrent_sweepers_never_share_a_run(fake_llm: FakeLLMAdapter):
     policy = FAST.model_copy(update={"batch_size": 2})
     service_a, repo = make(fake_llm, policy, owner="sweeper-a")
-    service_b = RunService(service_a.graph, repo, policy, owner="sweeper-b", authorization=LENIENT)
+    service_b = RunService(
+        service_a.graph,
+        repo,
+        policy,
+        owner="sweeper-b",
+        authorization=LENIENT,
+        drive_mode="inline",
+    )
     rids = [await abandoned_after_planner(service_a, repo, fake_llm) for _ in range(4)]
 
     reports = await asyncio.gather(
@@ -396,8 +412,10 @@ async def test_graceful_shutdown_drains_cancels_and_releases_only_its_leases(
     row = repo.runs[rid]
     assert row.status is S.RUNNING and row.lease_owner is None  # not marked terminal
     assert repo.runs[other].lease_owner == "someone-else"  # untouched
-    # A reader (or recovery) sees pending work with no owner: recoverable.
-    assert (await service.get(str(rid), ADMIN)).status == "interrupted"
+    # No node completed before the cancel: only the input checkpoint exists, so a
+    # reader still sees ``running`` (the sweep restarts it by itself, I0.1), never
+    # ``interrupted``, which would wait for a human ``resume``.
+    assert (await service.get(str(rid), ADMIN)).status == "running"
 
 
 async def test_shutdown_with_nothing_running_is_a_clean_drain(fake_llm: FakeLLMAdapter):

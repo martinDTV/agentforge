@@ -100,6 +100,7 @@ async def test_a_development_run_is_persisted_end_to_end(
             repository,
             RecoveryPolicy(),
             authorization=AuthorizationPolicy(separation_of_duties=False),
+            drive_mode="inline",
             workflow_kind=WorkflowKind.DEVELOPMENT,
             policies=ProjectPolicyRegistry(
                 [
@@ -176,6 +177,7 @@ async def test_an_abandoned_development_run_is_failed_never_redriven(
             RecoveryPolicy(auto_resume=True, max_attempts=3),
             owner="sweeper",
             authorization=AuthorizationPolicy(separation_of_duties=False),
+            drive_mode="inline",
         )
         acquired = await repository.acquire_lease(
             run_id, owner="sweeper", ttl_seconds=30, from_statuses=frozenset({S.RUNNING})
@@ -212,6 +214,7 @@ async def test_recovery_reads_a_development_checkpoint_with_the_planning_graph(
             RecoveryPolicy(auto_resume=True, max_attempts=3),
             owner="sweeper",
             authorization=AuthorizationPolicy(separation_of_duties=False),
+            drive_mode="inline",
         )
 
         async def abandoned_row(run_id: uuid.UUID) -> None:

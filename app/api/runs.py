@@ -127,8 +127,14 @@ async def create_run(
     response: Response,
     idempotency_key: IdempotencyKey = None,
 ) -> RunResponse:
-    """Create a run in one of the caller's projects. A run that fails inside
-    the graph is still created (201) and reports ``status == "failed"``."""
+    """Create a run in one of the caller's projects.
+
+    The response leaves as soon as the run is durable (row, lease and input
+    checkpoint): ``201`` with ``status == "running"`` while the graph is driven in
+    the background. Follow it with ``GET /runs/{run_id}``: ``waiting_approval`` when
+    a decision is pending, ``failed`` with ``error.code`` when a node failed,
+    ``interrupted`` when no process drives it (recovery resumes it). A replayed
+    ``Idempotency-Key`` returns the existing run with ``200``."""
     outcome = await service.create(
         body.task,
         principal,
@@ -233,7 +239,8 @@ async def resume_run(
 ) -> RunResponse:
     """Re-drive an ``interrupted`` run from its last checkpoint (``runs:resume``).
 
-    Synchronous like creation: returns the run once it reached its next stop.
+    Takes the run's lease and returns ``status == "running"`` while the graph is
+    driven in the background; follow it with ``GET /runs/{run_id}``.
     409 ``run_not_resumable`` when it is not interrupted, another process holds
     its lease, or it exhausted its attempts."""
     return await service.resume(run_id, principal)

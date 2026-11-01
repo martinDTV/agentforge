@@ -7,6 +7,8 @@ run from its checkpoint:
 
 - finished or paused but never projected  -> re-project (+ backfill audit)
 - decision recorded but not applied       -> apply it (no LLM cost)
+- accepted but never started (only the     -> re-drive from that input, whatever
+  input checkpoint exists, I0.1)             ``auto_resume`` says; attempts still bound it
 - pending work, attempts left             -> ``interrupted`` (default) or re-drive
                                              when ``auto_resume`` is on
 - pending work, attempts exhausted        -> ``failed`` / ``abandoned``

@@ -12,6 +12,7 @@ from app.infrastructure.llm.fake import FakeLLMAdapter
 from app.orchestration.graph import build_state_graph
 from app.security import AuthorizationPolicy
 from app.security.dev_keys import DevIssuer
+from tests.conftest import settle
 from tests.integration.conftest import libpq_dsn, make_app
 from tests.integration.test_business_persistence import run_row
 from tests.integration.test_checkpoints import query
@@ -64,6 +65,8 @@ def test_keyset_listing_matches_the_database_order_and_scope(
     ) as client:
         alpha_ids = [client.post(RUNS, json=TASK, headers=alice).json()["run_id"] for _ in range(7)]
         beta_ids = [client.post(RUNS, json=TASK, headers=carol).json()["run_id"] for _ in range(2)]
+        for run_id, headers in [(r, alice) for r in alpha_ids] + [(r, carol) for r in beta_ids]:
+            settle(client, run_id, headers=headers)
 
         seen: list[str] = []
         cursor: str | None = None
@@ -111,7 +114,9 @@ def test_event_pages_are_persisted_with_actors(
         )
     ) as client:
         run_id = client.post(RUNS, json=TASK, headers=alice).json()["run_id"]
+        settle(client, run_id, headers=alice)
         client.post(f"{RUNS}/{run_id}/approve", json={"approved": True}, headers=alice)
+        settle(client, run_id, headers=alice)
         kinds: list[str] = []
         cursor: str | None = None
         pages = 0
@@ -150,7 +155,9 @@ def test_manual_resume_continues_from_the_checkpoint_with_one_winner(
             results = list(pool.map(lambda _: client.post(f"{RUNS}/{run_id}/resume"), range(2)))
         assert sorted(r.status_code for r in results) == [200, 409]
         winner = next(r for r in results if r.status_code == 200).json()
-        assert winner["status"] == "waiting_approval"
+        # Re-driven detached (I0.1): the response says so and GET follows it.
+        assert winner["status"] in ("running", "waiting_approval")
+        assert settle(client, run_id)["status"] == "waiting_approval"
     row = run_row(url, run_id)
     assert (row["status"], row["attempt"], row["architecture"] is not None) == (
         "waiting_approval",

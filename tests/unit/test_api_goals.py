@@ -17,6 +17,7 @@ from app.projects import ProjectPolicyRegistry, RepositoryPolicy
 from app.security import AuthorizationPolicy, JwtVerifier, VerificationRules
 from app.security.dev_keys import DevIssuer
 from app.security.tokens import StaticKeys
+from tests.conftest import settle
 from tests.unit.git_fixtures import make_sandbox
 from tests.unit.test_api_development import scoped_llm
 
@@ -118,7 +119,8 @@ def test_a_single_goal_runs_one_child_whose_approval_stays_human(
         json={"approved": True, "stage": "scope", "scope_digest": digest},
         headers=olivia,
     )
-    assert approved.status_code == 200 and approved.json()["status"] == "completed"
+    assert approved.status_code == 200
+    assert settle(client, task["run_id"], headers=olivia)["status"] == "completed"
     goal = wait_for(client, goal_id, olivia, lambda g: g["status"] == "completed")
     assert goal["tasks"][0]["status"] == "published"
     assert goal["usage"]["tasks_created"] == 1 and goal["usage"]["llm_calls_used"] >= 3

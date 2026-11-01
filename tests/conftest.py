@@ -6,6 +6,10 @@ PostgreSQL and is run explicitly. Neither may ever reach Vertex AI: the
 autouse guard below makes constructing the real client fail loudly.
 """
 
+import time
+from collections.abc import Mapping
+from typing import Any
+
 import anthropic
 import pytest
 
@@ -98,3 +102,35 @@ def fake_llm(sample_plan: DevelopmentPlan, sample_review: ArchitectureReview) ->
     adapter.register(DevelopmentPlan, sample_plan)
     adapter.register(ArchitectureReview, sample_review)
     return adapter
+
+
+# --- I0.1: background drives ---------------------------------------------------------
+
+SETTLING_STATUSES = frozenset({"running", "resume_pending"})
+
+
+def settle(
+    client: Any,
+    run_id: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    timeout: float = 30.0,
+    runs_path: str = "/api/v1/runs",
+) -> dict[str, Any]:
+    """Follow a run through ``GET /runs/{id}`` until its background drive stops.
+
+    ``create``, ``approve`` and ``resume`` answer as soon as the work is durable
+    (I0.1); API tests that assert on the next stop poll with this helper. The
+    deadline is a safety net, never a fixed sleep: the loop returns on the first
+    settled read.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        response = client.get(f"{runs_path}/{run_id}", headers=headers)
+        assert response.status_code == 200, response.text
+        payload: dict[str, Any] = response.json()
+        if payload["status"] not in SETTLING_STATUSES:
+            return payload
+        if time.monotonic() > deadline:
+            raise AssertionError(f"run {run_id} did not settle: {payload['status']}")
+        time.sleep(0.02)

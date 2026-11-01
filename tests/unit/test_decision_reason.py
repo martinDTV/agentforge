@@ -13,6 +13,7 @@ from app.contracts.execution import Approval
 from app.contracts.goals import GoalDecomposition, GoalEventKind
 from app.contracts.lifecycle import DecisionStage, RunEventKind
 from scripts import agentforge as cli
+from tests.conftest import settle
 from tests.unit.goal_fixtures import plan_of
 from tests.unit.test_api_development import BODY, RUNS, bearer, client, issuer  # noqa: F401
 from tests.unit.test_goal_coordinator import World
@@ -31,6 +32,7 @@ def test_api_records_and_lists_the_reason(client: TestClient, issuer):  # noqa: 
     olivia = bearer(issuer, "olivia", ["project_operator"])
     run = client.post(RUNS, json=BODY, headers=olivia).json()
     run_id = run["run_id"]
+    settle(client, run_id, headers=olivia)
     digest = client.get(f"{RUNS}/{run_id}/decisions", headers=olivia).json()["pending"][
         "scope_digest"
     ]
@@ -44,7 +46,8 @@ def test_api_records_and_lists_the_reason(client: TestClient, issuer):  # noqa: 
         },
         headers=olivia,
     )
-    assert rejected.status_code == 200 and rejected.json()["status"] == "rejected"
+    assert rejected.status_code == 200
+    assert settle(client, run_id, headers=olivia)["status"] == "rejected"
     decisions = client.get(f"{RUNS}/{run_id}/decisions", headers=olivia).json()["decisions"]
     assert decisions[0]["stage"] == "scope" and decisions[0]["approved"] is False
     assert decisions[0]["reason"] == "El alcance no incluye las pruebas de aceptación"

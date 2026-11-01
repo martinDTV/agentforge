@@ -799,6 +799,8 @@ async def run_development(
         authorization=AuthorizationPolicy(separation_of_duties=False),
         workflow_kind=WorkflowKind.DEVELOPMENT,
         policies=policies,
+        # The operator waits for the outcome in this terminal: inline drive (I0.1).
+        drive_mode="inline",
     )
     summary = json.dumps(
         {

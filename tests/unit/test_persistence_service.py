@@ -58,6 +58,13 @@ class GraphProxy:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
 
+    async def aupdate_state(self, *args: Any, **kwargs: Any) -> Any:
+        # The input checkpoint is written before anything runs (I0.1): a checkpointer
+        # outage must surface right there, before any background task exists.
+        if self.fail_all_with is not None:
+            raise self.fail_all_with
+        return await self.inner.aupdate_state(*args, **kwargs)
+
     def astream(self, graph_input: Any, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         if self.fail_all_with is not None:
             raise self.fail_all_with
@@ -73,7 +80,8 @@ def make(
 ) -> tuple[RunService, InMemoryRunRepository, GraphProxy]:
     repository = InMemoryRunRepository()
     proxy = GraphProxy(build_graph(llm, limits))
-    return RunService(proxy, repository, authorization=LENIENT), repository, proxy  # type: ignore[arg-type]
+    service = RunService(proxy, repository, authorization=LENIENT, drive_mode="inline")  # type: ignore[arg-type]
+    return service, repository, proxy
 
 
 # 1. creation and persistent read --------------------------------------------
@@ -91,7 +99,12 @@ async def test_row_exists_as_running_before_the_first_llm_call(fake_llm: FakeLLM
                 seen["events"] = [e.kind for e in repository.events[row.id]]
             return fake_llm.generate_structured(system_prompt, user_prompt, schema)
 
-    service = RunService(build_graph(Observer()), repository, authorization=LENIENT)  # type: ignore[arg-type]
+    service = RunService(
+        build_graph(Observer()),  # type: ignore[arg-type]
+        repository,
+        authorization=LENIENT,
+        drive_mode="inline",
+    )
     created = (await service.create(TASK, ADMIN)).response
     assert seen == {"status": S.RUNNING, "events": [RunEventKind.RUN_CREATED]}
     row = repository.runs[uuid.UUID(created.run_id)]

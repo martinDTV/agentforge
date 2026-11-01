@@ -135,6 +135,7 @@ class MirrorWorld:
             },
             policies=self.lab.policies,
             clock=lambda: self.now,
+            drive_mode="inline",
         )
 
     async def start(self, service: RunService) -> str:

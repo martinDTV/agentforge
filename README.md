@@ -98,7 +98,7 @@ Reglas:
 |---|---|---|
 | `GET /api/v1/runs` | cualquier principal autenticado, dentro de su ámbito | Lista ejecuciones visibles, más recientes primero. Filtros `status`, `project_id`, `owner`, `mine`. Quien no tiene `runs:read` ve solo las suyas |
 | `GET /api/v1/runs/{id}/events` | ejecución visible y `runs:audit:read` | Traza de auditoría, más antigua primero, con `actor` por evento |
-| `POST /api/v1/runs/{id}/resume` | ejecución visible y `runs:resume` | Reanuda una ejecución `interrupted` desde su último checkpoint, bajo lease y contando intento. Síncrono: responde cuando alcanza su siguiente parada. `409 run_not_resumable` si no está interrumpida, otro proceso la tiene o agotó `MAX_RUN_ATTEMPTS` |
+| `POST /api/v1/runs/{id}/resume` | ejecución visible y `runs:resume` | Reanuda una ejecución `interrupted` desde su último checkpoint, bajo lease y contando intento. Responde `200` con `status: running` en cuanto el lease y el intento están registrados; la conducción sigue separada de la petición (I0.1) y `GET` muestra la siguiente parada. `409 run_not_resumable` si no está interrumpida, otro proceso la tiene o agotó `MAX_RUN_ATTEMPTS` |
 | `POST /api/v1/admin/recovery/sweeps` | `recovery:sweep` | Ejecuta un barrido de recuperación **síncrono** y devuelve el informe real: reclamados, resultados y errores. Limitado a los proyectos del principal salvo `projects:all`; `project_id` lo acota más |
 
 Paginación keyset: `limit` entre 1 y 100 y un `cursor` opaco en `next_cursor`. El cursor es una posición, no una capacidad: el ámbito del principal se reaplica en cada página, va ligado a los filtros y al sujeto de la consulta y se valida estrictamente; un cursor ajeno o manipulado responde `400 invalid_cursor`. Las listas ordenan por `(created_at, id)` descendente y los eventos por `id` ascendente, estables bajo escrituras concurrentes.
@@ -180,7 +180,7 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/runs \
   -d '{"task":"Diseña el módulo de pacientes en FastAPI con pruebas unitarias"}'
 ```
 
-Copia el `run_id` que devuelve la API (código `201`). Opcionalmente envía `Idempotency-Key: <clave>` (hasta 128 caracteres): repetir la misma clave con la misma tarea devuelve la ejecución existente con `200` y `Idempotency-Replayed: true`, sin ejecutar nada; la misma clave con otra tarea responde `409 idempotency_key_reused`. La clave es global al despliegue y queda ligada al run aunque este falle.
+La API responde `201` con `status: running` **en cuanto la ejecución es durable** (fila, lease y el checkpoint de entrada), sin esperar al grafo: desde entonces la conduce una tarea del proceso, separada de la petición, y `GET /api/v1/runs/{run_id}` muestra dónde se detuvo (`waiting_approval`, `failed`, …). Si el proceso muere entre la respuesta y el primer nodo, el barrido de recuperación la reanuda solo desde ese checkpoint de entrada; nada se pierde ni se repite (ADR 0004, I0.1). Copia el `run_id`. Opcionalmente envía `Idempotency-Key: <clave>` (hasta 128 caracteres): repetir la misma clave con la misma tarea devuelve la ejecución existente con `200` y `Idempotency-Replayed: true`, sin ejecutar nada; la misma clave con otra tarea responde `409 idempotency_key_reused`. La clave es global al despliegue y queda ligada al run aunque este falle.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/v1/runs/TU_RUN_ID
@@ -190,6 +190,8 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/runs/TU_RUN_ID/approve \
   -H 'Content-Type: application/json' \
   -d '{"approved":true}'
 ```
+
+`POST /approve` responde `200` con `status: resume_pending` en cuanto la decisión está registrada (única por etapa, con quién la tomó); aplicarla al grafo ocurre en segundo plano y `GET` muestra el resultado (`approved`, `rejected`, la siguiente etapa o `completed`/`published`). Una respuesta perdida no es una decisión perdida: consulta `GET /runs/{id}/decisions` antes de repetir; la misma decisión se repite de forma idempotente (`200`) y la contraria responde `409`. Los clientes (`scripts.agentforge`, la skill `/agentforge`) siguen la ejecución con `GET` durante un tiempo acotado y nunca repiten el `POST`.
 
 El grafo ejecuta `planner -> architect -> approval` con retroalimentación:
 
@@ -216,10 +218,10 @@ Estados:
 
 | `status` | Significado |
 |---|---|
-| `running` | Algún proceso tiene un lease vigente sobre el run y está conduciendo el grafo |
+| `running` | Algún proceso tiene un lease vigente sobre el run y está conduciendo el grafo; o la ejecución fue aceptada (solo existe su checkpoint de entrada) y la reanudará el barrido por sí mismo, sin intervención humana |
 | `waiting_approval` | Pausa real en el nodo de aprobación humana |
 | `resume_pending` | La decisión humana ya está registrada en la base de datos pero su aplicación al grafo aún no se confirmó. Repetir la misma decisión devuelve `200`; la contraria, `409` |
-| `interrupted` | Hay trabajo pendiente, no hay interrupción y ningún lease vigente: el proceso que lo conducía desapareció. Recuperable desde el último checkpoint; el barrido lo reanuda solo si `RECOVERY_AUTO_RESUME=true` y quedan intentos |
+| `interrupted` | Hay trabajo pendiente tras al menos un nodo completado, no hay interrupción y ningún lease vigente: el proceso que lo conducía desapareció. Recuperable desde el último checkpoint; el barrido lo reanuda solo si `RECOVERY_AUTO_RESUME=true` y quedan intentos. Una ejecución que nunca llegó a su primer nodo no es `interrupted`: sigue `running` y el barrido la reanuda siempre (acotado por `MAX_RUN_ATTEMPTS`) |
 | `approved` / `rejected` | Decisión humana aplicada. Terminal |
 | `completed` | Un flujo sin decisión humana final (`development`) cumplió su criterio de éxito: QA aprobó con `ruff check`, `ruff format --check` y `pytest` en cero. Terminal |
 | `cancelled` | Un humano con `runs:cancel` retiró una ejecución que esperaba una decisión o estaba interrumpida. Terminal |
@@ -235,9 +237,9 @@ Códigos de `error.code`:
 | `llm_request_rejected` | El proveedor rechazó la solicitud (credenciales, modelo, política de la organización) |
 | `llm_malformed_output` | La respuesta no cumple el contrato Pydantic tras los intentos de reparación |
 | `llm_budget_exceeded` | Un nodo intentó llamar al LLM con el presupuesto del run agotado |
-| `internal_error` | Excepción inesperada dentro del grafo (también produce un `500`) |
+| `internal_error` | Excepción inesperada dentro del grafo; la respuesta HTTP ya se había emitido (`201`/`200`) y el fallo queda en la fila, nunca en el cliente |
 
-Un run que falla dentro del grafo se crea igualmente (`201`) con `status: "failed"`; se puede consultar con `GET` pero no aprobar.
+Un run que falla dentro del grafo se crea igualmente (`201`, `status: "running"`) y `GET` lo muestra después como `status: "failed"` con su `error.code`; se puede consultar pero no aprobar.
 
 ### Errores HTTP
 
@@ -259,6 +261,7 @@ Los errores se devuelven como [RFC 9457 Problem Details](https://www.rfc-editor.
 | `503` | `shutting_down` | La instancia está en apagado ordenado y ya no acepta trabajo nuevo. Lleva `Retry-After` |
 | `409` | `run_lease_lost` | Otro proceso tomó la ejecución mientras esta instancia la conducía; el run sigue vivo en manos del nuevo propietario |
 | `409` | `idempotency_key_reused` | Misma `Idempotency-Key` con una tarea distinta |
+| `409` | `run_busy` | Este proceso ya conduce esa ejecución en segundo plano (p. ej. dos `resume` seguidos antes de que el primero avance); consulta con `GET` |
 | `500` | `internal_error` | Error inesperado |
 
 ## Sin gasto en modelo externo
