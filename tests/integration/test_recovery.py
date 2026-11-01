@@ -400,9 +400,10 @@ def test_idempotency_key_under_concurrency_creates_one_run(
         assert statuses == [200, 200, 200, 200, 200, 201]
         assert len({run_id for _, run_id, _ in results}) == 1
         assert all(replayed == "true" for code, _, replayed in results if code == 200)
-        assert len(fake_llm.calls) - calls_before == 2
         run_id = results[0][1]
-        assert client.get(f"{RUNS}/{run_id}").json()["status"] == "waiting_approval"
+        # The replays answer while the single drive may still be running (I0.1).
+        assert settle(client, run_id)["status"] == "waiting_approval"
+        assert len(fake_llm.calls) - calls_before == 2
 
         conflict = client.post(
             RUNS,
